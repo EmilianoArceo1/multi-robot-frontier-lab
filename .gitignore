@@ -1,0 +1,54 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Testing / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary outputs
+*.log
+logs/
+outputs/
+runs/
+tmp/
+temp/
+
+# Local secrets/config
+.env
+.env.*
+secrets/
+*.secret
+
+# Large media
+*.mp4
+*.avi
+*.mov
+*.gif
+
+# Temporary scripts
+tmp_*.py
+*_tmp.py

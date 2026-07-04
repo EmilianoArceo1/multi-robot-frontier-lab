@@ -1,0 +1,43 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": -8.0,
+    "y": 0.0,
+    "theta": 0.0,
+    "v": 0.0,
+    "max_speed": 1.2,
+    "max_acceleration": 2.0,
+    "max_angular_speed": 2.5,
+    "goal_tolerance": 0.25
+  },
+  "goal": {
+    "x": 8.0,
+    "y": 0.0
+  },
+  "map": {
+    "grid_resolution": 0.5,
+    "obstacles": [
+      [-1.0, -3.0, 2.0, 6.0]
+    ]
+  },
+  "planner": {
+    "type": "A*"
+  },
+  "sensor": {
+    "type": "LiDAR",
+    "range": 2.5
+  },
+  "simulation": {
+    "agent_mode": "Single Robot Mode",
+    "show_goal_preview": true,
+    "show_path": true,
+    "show_vision": true
+  }
+}

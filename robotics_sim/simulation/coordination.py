@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Iterable
+from typing import Iterable, Protocol
 
 from robotics_sim.planning.exploration_planners import (
     DEFAULT_EXPLORATION_PLANNER,
@@ -49,6 +49,46 @@ class CoordinationResult:
     targets: tuple[tuple[float, float] | None, ...]
     reasons: tuple[str, ...]
     strategy: str
+
+@dataclass(frozen=True)
+class CoordinationRequest:
+    """Stable request object consumed by coordination algorithms.
+
+    This keeps the public engine-facing call signature intact while giving this
+    module an internal plugin boundary.  Future coordinators should consume this
+    request instead of depending on engine, Qt, canvas, or RobotAgent objects.
+    """
+
+    planner_name: str
+    robot_states: list[RobotCoordinationState]
+    existing_targets: list[tuple[float, float] | None]
+    robots_to_assign: list[int]
+    invalidated_targets_by_robot: list[list[tuple[float, float]]] | None
+    explored_points: list[tuple[float, float]]
+    mapped_obstacle_points: list[tuple[float, float]]
+    bounds: tuple[float, float, float, float]
+    resolution: float
+    final_goal_xy: tuple[float, float] | None = None
+    ipp_distance_penalty: float = 0.5
+    target_exclusion_radius: float = 1.5
+    dynamic_obstacle_margin: float = 0.5
+    route_points_by_robot: list[list[tuple[float, float]]] | None = None
+    explored_points_by_robot: list[list[tuple[float, float]]] | None = None
+
+
+class CoordinationAlgorithm(Protocol):
+    """Internal interface implemented by coordination algorithms.
+
+    The simulator-facing host remains MultiRobotCoordinator.  Algorithm
+    implementations only receive a CoordinationRequest and return the legacy
+    CoordinationResult that engine.py already understands.
+    """
+
+    name: str
+
+    def assign(self, request: CoordinationRequest) -> CoordinationResult:
+        ...
+
 
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -866,6 +906,86 @@ def _noic_score_components(
     return score, components
 
 
+class LegacyNoicCoordinatorAlgorithm:
+    """Current NOIC/coordinated-frontier behavior behind an algorithm boundary.
+
+    This class intentionally preserves the existing behavior and output format.
+    It is the first internal algorithm implementation consumed by
+    MultiRobotCoordinator, which now acts as a host instead of owning the whole
+    coordination strategy directly.
+    """
+
+    name = NOIC_COORDINATOR
+
+    def assign(self, request: CoordinationRequest) -> CoordinationResult:
+        count = len(request.robot_states)
+        targets: list[tuple[float, float] | None] = [
+            _normalize_target(request.existing_targets[index])
+            if index < len(request.existing_targets)
+            else None
+            for index in range(count)
+        ]
+        reasons: list[str] = [
+            "kept existing target" if targets[index] is not None else "no target assigned yet"
+            for index in range(count)
+        ]
+
+        assign_set = {int(index) for index in request.robots_to_assign if 0 <= int(index) < count}
+        if not assign_set:
+            return CoordinationResult(tuple(targets), tuple(reasons), self.name)
+
+        planner_res = assign_frontier_viewpoints(
+            robot_states=request.robot_states,
+            existing_targets=targets,
+            robots_to_assign=sorted(assign_set),
+            invalidated_targets_by_robot=request.invalidated_targets_by_robot,
+            explored_points=request.explored_points,
+            mapped_obstacle_points=request.mapped_obstacle_points,
+            bounds=request.bounds,
+            resolution=request.resolution,
+            final_goal_xy=request.final_goal_xy or (0.0, 0.0),
+            ipp_distance_penalty=request.ipp_distance_penalty,
+            target_exclusion_radius=request.target_exclusion_radius,
+            dynamic_obstacle_margin=request.dynamic_obstacle_margin,
+            route_points_by_robot=request.route_points_by_robot,
+            explored_points_by_robot=request.explored_points_by_robot,
+        )
+
+        assigned_indices: set[int] = set()
+        for idx, assignment in enumerate(planner_res.assignments):
+            if idx in assign_set and assignment is not None:
+                targets[idx] = assignment.target
+                reasons[idx] = (
+                    f"{self.name}: asignación coordinada; {assignment.reason}; "
+                    f"info_gain={assignment.information_gain:.1f}; dist={assignment.distance:.1f}; "
+                    f"map_overlap={assignment.other_map_ratio:.2f}; "
+                    f"route_overlap={assignment.route_overlap_ratio:.2f}"
+                )
+                assigned_indices.add(idx)
+
+        # Tactical hold: if the modern planner rejects every candidate for a robot,
+        # keep it idle instead of forcing duplicated sensing or route conflicts.
+        for idx in sorted(assign_set - assigned_indices):
+            targets[idx] = None
+            if idx < len(planner_res.reasons) and planner_res.reasons[idx] != "no target assigned yet":
+                reasons[idx] = (
+                    f"{self.name}: En espera (HOLD) para evitar solapamiento de visión "
+                    f"o rutas cruzadas; {planner_res.reasons[idx]}"
+                )
+            else:
+                reasons[idx] = (
+                    f"{self.name}: En espera (HOLD) para evitar solapamiento de visión "
+                    f"o rutas cruzadas"
+                )
+
+        return CoordinationResult(tuple(targets), tuple(reasons), self.name)
+
+
+COORDINATION_ALGORITHM_REGISTRY: dict[str, type[CoordinationAlgorithm]] = {
+    NOIC_COORDINATOR: LegacyNoicCoordinatorAlgorithm,
+}
+
+
 class MultiRobotCoordinator:
     """Assign frontier targets to multiple robots.
 
@@ -894,6 +1014,8 @@ class MultiRobotCoordinator:
 
     def __init__(self, strategy: str = DEFAULT_COORDINATOR):
         self.strategy = strategy if strategy in COORDINATOR_OPTIONS else DEFAULT_COORDINATOR
+        algorithm_cls = COORDINATION_ALGORITHM_REGISTRY[self.strategy]
+        self.algorithm: CoordinationAlgorithm = algorithm_cls()
 
     def assign_frontiers(
         self,
@@ -914,72 +1036,31 @@ class MultiRobotCoordinator:
         route_points_by_robot: list[list[tuple[float, float]]] | None = None,
         explored_points_by_robot: list[list[tuple[float, float]]] | None = None,
     ) -> CoordinationResult:
-        """Assign coordinated frontier targets through the modern shared-map pipeline.
+        """Assign coordinated frontier targets through the active algorithm.
 
-        This method intentionally avoids the older private strategy redirects.  The
-        engine now sends both the shared explored map and the per-robot explored
-        footprints, so assign_frontier_viewpoints can penalize teammate map
-        overlap instead of scoring duplicated sensing as free.
+        The public signature stays compatible with engine.py.  Internally the
+        arguments are normalized into CoordinationRequest and passed to the
+        selected CoordinationAlgorithm.  For now, the only registered algorithm
+        is the current NOIC/coordinated-frontier behavior.
         """
-        count = len(robot_states)
-        targets: list[tuple[float, float] | None] = [
-            _normalize_target(existing_targets[index]) if index < len(existing_targets) else None
-            for index in range(count)
-        ]
-        reasons: list[str] = [
-            "kept existing target" if targets[index] is not None else "no target assigned yet"
-            for index in range(count)
-        ]
-
-        assign_set = {int(index) for index in robots_to_assign if 0 <= int(index) < count}
-        if not assign_set:
-            return CoordinationResult(tuple(targets), tuple(reasons), self.strategy)
-
-        planner_res = assign_frontier_viewpoints(
+        request = CoordinationRequest(
+            planner_name=planner_name,
             robot_states=robot_states,
-            existing_targets=targets,
-            robots_to_assign=sorted(assign_set),
+            existing_targets=existing_targets,
+            robots_to_assign=robots_to_assign,
             invalidated_targets_by_robot=invalidated_targets_by_robot,
             explored_points=explored_points,
             mapped_obstacle_points=mapped_obstacle_points,
             bounds=bounds,
             resolution=resolution,
-            final_goal_xy=final_goal_xy or (0.0, 0.0),
+            final_goal_xy=final_goal_xy,
             ipp_distance_penalty=ipp_distance_penalty,
             target_exclusion_radius=target_exclusion_radius,
             dynamic_obstacle_margin=dynamic_obstacle_margin,
             route_points_by_robot=route_points_by_robot,
             explored_points_by_robot=explored_points_by_robot,
         )
-
-        assigned_indices: set[int] = set()
-        for idx, assignment in enumerate(planner_res.assignments):
-            if idx in assign_set and assignment is not None:
-                targets[idx] = assignment.target
-                reasons[idx] = (
-                    f"{self.strategy}: asignación coordinada; {assignment.reason}; "
-                    f"info_gain={assignment.information_gain:.1f}; dist={assignment.distance:.1f}; "
-                    f"map_overlap={assignment.other_map_ratio:.2f}; "
-                    f"route_overlap={assignment.route_overlap_ratio:.2f}"
-                )
-                assigned_indices.add(idx)
-
-        # Tactical hold: if the modern planner rejects every candidate for a robot,
-        # keep it idle instead of forcing duplicated sensing or route conflicts.
-        for idx in sorted(assign_set - assigned_indices):
-            targets[idx] = None
-            if idx < len(planner_res.reasons) and planner_res.reasons[idx] != "no target assigned yet":
-                reasons[idx] = (
-                    f"{self.strategy}: En espera (HOLD) para evitar solapamiento de visión "
-                    f"o rutas cruzadas; {planner_res.reasons[idx]}"
-                )
-            else:
-                reasons[idx] = (
-                    f"{self.strategy}: En espera (HOLD) para evitar solapamiento de visión "
-                    f"o rutas cruzadas"
-                )
-
-        return CoordinationResult(tuple(targets), tuple(reasons), self.strategy)
+        return self.algorithm.assign(request)
 
     def _invalidated_for(self, invalidated_targets_by_robot, index: int) -> list[tuple[float, float]]:
         if not invalidated_targets_by_robot or index >= len(invalidated_targets_by_robot):

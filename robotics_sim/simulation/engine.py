@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import math
 import os
 import time
@@ -38,10 +39,19 @@ from robotics_sim.simulation.navigation_modes import (
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
+from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
+from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
 from robotics_sim.simulation.coordination import (
     MultiRobotCoordinator,
     RobotCoordinationState,
+    map_robot_commands_by_id,
+    runtime_profile_for_strategy,
+    select_runtime_control_source,
+    select_runtime_path_source,
 )
+from robotics_sim.simulation.plugin_loader import PluginLoadError
+
+_LOGGER = logging.getLogger(__name__)
 
 try:
     from robotics_sim.planning.planner_registry import compute_planned_waypoints
@@ -1059,6 +1069,24 @@ class SimulationControllerMixin:
                 )
         return False, ""
 
+    def coordinator_runtime_profile(self):
+        """Return the selected coordinator plugin's runtime profile, memoized.
+
+        This is read from the per-frame multi-robot loop (path/control source
+        selection), so it is cached per coordinator_type instead of re-running
+        plugin discovery every frame.
+        """
+        strategy = str(self.config.coordinator_type)
+        if getattr(self, "_cached_runtime_profile_strategy", None) != strategy:
+            try:
+                self._cached_runtime_profile = runtime_profile_for_strategy(strategy)
+            except PluginLoadError:
+                self._cached_runtime_profile = build_runtime_profile(
+                    PluginMetadata(name=strategy, version="", description="", capabilities=())
+                )
+            self._cached_runtime_profile_strategy = strategy
+        return self._cached_runtime_profile
+
     def multi_robot_coordination_states(self) -> list[RobotCoordinationState]:
         """Return plain robot state packets for the coordinator."""
         states: list[RobotCoordinationState] = []
@@ -1069,6 +1097,7 @@ class SimulationControllerMixin:
                     safety_radius=float(self.safety_radius_for_robot(robot)),
                     sensor_range=float(getattr(robot, "vision", self.config.vision)),
                     vision_model=str(self.config.vision_model),
+                    theta=float(robot.theta),
                 )
             )
         return states
@@ -1141,9 +1170,35 @@ class SimulationControllerMixin:
             dynamic_obstacle_margin=self.multi_dynamic_target_margin(),
             route_points_by_robot=self.multi_active_route_points_by_robot(),
             explored_points_by_robot=explored_points_by_robot,
+            goal_tolerance=float(self.config.goal_tolerance),
         )
 
-        self.multi_exploration_targets = list(result.targets)
+        if not hasattr(self, "multi_robot_commands_by_id"):
+            self.multi_robot_commands_by_id = {}
+        commands_by_id = map_robot_commands_by_id(result.commands)
+        self.multi_robot_commands_by_id.update(commands_by_id)
+
+        # Preference order: command.target (richer, plugin-authoritative) ->
+        # result.targets[index] (plain legacy field) -> the target the robot
+        # already had. The third tier matters because a plugin only returns an
+        # entry for the robots it was asked to (re)assign this call;
+        # result.targets is None for every other robot, and blindly assigning
+        # list(result.targets) would wipe out targets that were not part of
+        # this batch.
+        previous_targets = list(self.multi_exploration_targets)
+        updated_targets: list[tuple[float, float] | None] = []
+        for index in range(len(result.targets)):
+            command = commands_by_id.get(index)
+            if command is not None and command.target is not None:
+                updated_targets.append(command.target)
+            elif result.targets[index] is not None:
+                updated_targets.append(result.targets[index])
+            elif index < len(previous_targets):
+                updated_targets.append(previous_targets[index])
+            else:
+                updated_targets.append(None)
+        self.multi_exploration_targets = updated_targets
+
         registry = self.ensure_runtime_robot_registry()
         registry.sync_exploration_targets_from_legacy_list(self.multi_exploration_targets)
         self.robot_agents = registry.agents
@@ -1315,28 +1370,44 @@ class SimulationControllerMixin:
         robot_index: int,
         force_new_exploration_target: bool = False,
     ) -> tuple[bool, str, list[tuple[float, float]]]:
-        """Compute one robot's route with the shared planner and dynamic robot obstacles."""
-        planner_kwargs, goal_reason = self.build_planner_kwargs_for_multi_robot(
-            robot_index,
-            force_new_exploration_target=force_new_exploration_target,
-        )
-        if bool(planner_kwargs.get("__hold__", False)):
-            return False, goal_reason, []
+        """Compute one robot's route.
 
-        goal_xy = tuple(planner_kwargs["goal_xy"])
+        If the selected coordinator plugin owns PATH_PLANNING and supplied a
+        usable command.path for this robot, that path is authoritative and the
+        external A*/Direct planner below is never invoked. Otherwise (this is
+        the case for MMPF and NOIC legacy today, since neither declares
+        PATH_PLANNING) the external planner runs exactly as before.
+        """
 
-        if self.config.planner_type == "Direct":
-            return True, f"direct route; {goal_reason}", [goal_xy]
+        def _legacy_route() -> tuple[bool, str, list[tuple[float, float]]]:
+            planner_kwargs, goal_reason = self.build_planner_kwargs_for_multi_robot(
+                robot_index,
+                force_new_exploration_target=force_new_exploration_target,
+            )
+            if bool(planner_kwargs.get("__hold__", False)):
+                return False, goal_reason, []
 
-        if compute_planned_waypoints is None:
-            return False, "planner package is not available", []
+            goal_xy = tuple(planner_kwargs["goal_xy"])
 
-        success, reason, waypoints = self.call_compute_planned_waypoints(
-            planner_kwargs,
-            path_simplifier=self.config.path_simplifier,
-        )
+            if self.config.planner_type == "Direct":
+                return True, f"direct route; {goal_reason}", [goal_xy]
 
-        return success, f"{goal_reason}; {reason}", waypoints
+            if compute_planned_waypoints is None:
+                return False, "planner package is not available", []
+
+            success, reason, waypoints = self.call_compute_planned_waypoints(
+                planner_kwargs,
+                path_simplifier=self.config.path_simplifier,
+            )
+
+            return success, f"{goal_reason}; {reason}", waypoints
+
+        profile = self.coordinator_runtime_profile()
+        command = getattr(self, "multi_robot_commands_by_id", {}).get(int(robot_index))
+        success, reason, waypoints = select_runtime_path_source(profile, command, _legacy_route)
+        if profile.owns_path_planning and "fallback" in reason:
+            self.log_console_message(f"R{int(robot_index) + 1}: {reason}")
+        return success, reason, waypoints
 
     def segment_clear_for_robot_against_points(
         self,
@@ -1805,13 +1876,39 @@ class SimulationControllerMixin:
         """Return a multi-line, copyable summary of the exact run configuration."""
         cfg = self.config
         mode = "Multiple Robot Mode" if multi else "Single Robot Mode"
+        try:
+            profile = runtime_profile_for_strategy(cfg.coordinator_type)
+        except PluginLoadError:
+            profile = None
+
+        if profile is not None and profile.owns_target_generation:
+            exploration_lines = [
+                f"Exploration source: {cfg.coordinator_type}",
+                f"Legacy frontier service (fallback only): {cfg.exploration_planner}",
+            ]
+        else:
+            exploration_lines = [f"Exploration planner: {cfg.exploration_planner}"]
+
         lines = [
             "=== Simulation started ===",
             f"Mode: {mode}",
             f"Planner: {cfg.planner_type}",
             f"Path simplifier: {cfg.path_simplifier}",
-            f"Exploration planner: {cfg.exploration_planner}",
+            *exploration_lines,
             f"Multi-robot coordinator: {cfg.coordinator_type}",
+        ]
+        if profile is not None:
+            lines.append(
+                "Algorithm runtime profile: "
+                f"owns_target_generation={profile.owns_target_generation}, "
+                f"owns_task_allocation={profile.owns_task_allocation}, "
+                f"owns_path_planning={profile.owns_path_planning}, "
+                f"owns_control={profile.owns_control}, "
+                f"uses_legacy_frontier_service={profile.uses_legacy_frontier_service}, "
+                f"uses_external_path_planner={profile.uses_external_path_planner}, "
+                f"uses_external_motion_controller={profile.uses_external_motion_controller}"
+            )
+        lines += [
             f"Vision model: {cfg.vision_model}",
             f"Sensor range: {float(cfg.vision):.2f} m",
             f"Grid resolution: {float(cfg.grid_resolution):.2f} m/cell",
@@ -2344,6 +2441,21 @@ class SimulationControllerMixin:
         exploration modes, the shared final goal is ignored and each robot gets
         a frontier target instead.
         """
+        return self._assign_route_to_multi_robot_with_corridor_validation(
+            robot_index,
+            reason=reason,
+            force_new_exploration_target=force_new_exploration_target,
+            remaining_corridor_retries=1,
+        )
+
+    def _assign_route_to_multi_robot_with_corridor_validation(
+        self,
+        robot_index: int,
+        *,
+        reason: str,
+        force_new_exploration_target: bool,
+        remaining_corridor_retries: int,
+    ) -> bool:
         if not (0 <= int(robot_index) < len(self.robots)):
             return False
 
@@ -2380,6 +2492,57 @@ class SimulationControllerMixin:
                 self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
                 return held
             waypoints = [self.final_goal_xy()]
+
+        # Validate the FULL corridor against teammates before this route is
+        # allowed to become ACTIVE. This runs earlier and stricter than the
+        # per-frame movement safety veto (segment_violates_other_robot_clearance
+        # in the movement loop), which only checks the immediate next segment
+        # once a route is already active -- that veto remains as a final
+        # backstop, it is just no longer the first place a conflict is caught.
+        # Direct is included: a single-segment route is still a full corridor.
+        if self.is_exploration_mode():
+            corridor_check = validate_multi_robot_corridor(
+                start=(float(robot.x), float(robot.y)),
+                waypoints=waypoints,
+                ego_safety_radius=float(self.safety_radius_for_robot(robot)),
+                other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
+                other_routes=[
+                    route
+                    for j, route in enumerate(self.multi_active_route_points_by_robot())
+                    if j != robot_index
+                ],
+                margin=self.multi_dynamic_target_margin(),
+            )
+            if not corridor_check.is_valid:
+                self.log_console_message(
+                    f"R{robot_index + 1}: route candidate rejected: reason={corridor_check.reason_code}; "
+                    f"{corridor_check.detail}"
+                )
+                self.invalidate_current_multi_frontier(robot_index, corridor_check.detail)
+                self.log_console_message(
+                    f"R{robot_index + 1}: target_blacklisted_after_route_rejection"
+                )
+
+                if remaining_corridor_retries > 0:
+                    self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
+                    retry_reason = f"retry after {corridor_check.reason_code}"
+                    if reason:
+                        retry_reason = f"{reason}; {retry_reason}"
+                    return self._assign_route_to_multi_robot_with_corridor_validation(
+                        robot_index,
+                        reason=retry_reason,
+                        force_new_exploration_target=True,
+                        remaining_corridor_retries=remaining_corridor_retries - 1,
+                    )
+
+                held = self.hold_multi_robot_position(
+                    robot_index,
+                    f"no safe corridor available after retry; {corridor_check.detail}",
+                )
+                self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
+                return held
+
+            _LOGGER.debug("R%d: route_accepted_after_corridor_validation", robot_index + 1)
 
         self.set_robot_goal_or_waypoints(robot, waypoints)
         self.set_multi_route_state(robot_index, self.ROUTE_STATE_ACTIVE, route_reason)
@@ -2481,6 +2644,7 @@ class SimulationControllerMixin:
         self.last_sensor_update_pose = None
 
         self.multi_path_points = [[(float(robot.x), float(robot.y))] for robot in self.robots]
+        self.multi_robot_commands_by_id = {}
         self.multi_exploration_targets = [None for _ in self.robots]
         self.multi_invalidated_exploration_targets = [[] for _ in self.robots]
         self.multi_planned_path_points = [[] for _ in self.robots]
@@ -3547,7 +3711,22 @@ class SimulationControllerMixin:
                     )
                     return
 
-            control = self.nominal_control_safe(blocked=False)
+            # nominal_control_safe() also advances the robot's state machine
+            # (active waypoint, ARRIVED/BLOCKED mode), so it always runs even
+            # when a plugin owns CONTROL -- only the resulting control vector
+            # may be replaced below. The safety veto further down (predicted
+            # collision check) still runs on whatever control is used here, so
+            # a CONTROL-owning plugin cannot bypass it.
+            legacy_control = self.nominal_control_safe(blocked=False)
+            control_profile = self.coordinator_runtime_profile()
+            robot_command = getattr(self, "multi_robot_commands_by_id", {}).get(index)
+            control, control_reason = select_runtime_control_source(
+                control_profile, robot_command, legacy_control
+            )
+            if control_profile.owns_control:
+                _LOGGER.debug("R%d control source: %s", index + 1, control_reason)
+            control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
+
             prediction_report = self.predicted_motion_report(
                 control=control,
                 dt=dt,

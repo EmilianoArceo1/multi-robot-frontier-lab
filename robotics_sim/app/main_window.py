@@ -43,7 +43,10 @@ from robotics_sim.app.widgets import (
 )
 from robotics_sim.app.simulation_canvas import SimulationCanvas
 from robotics_sim.app.config_panel import build_config_panel as build_right_config_panel
+from robotics_sim.simulation.coordination import runtime_profile_for_strategy
+from robotics_sim.simulation.gui_policy import compute_gui_control_policy
 from robotics_sim.simulation.navigation_modes import is_exploration_planner
+from robotics_sim.simulation.plugin_loader import PluginLoadError
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 
 try:
@@ -492,6 +495,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.coordinator_field.setVisible(is_multi_robot_mode and uses_frontier_exploration)
         self.exploration_cooldown_field.setVisible(uses_frontier_exploration)
         self.ipp_lambda_field.setVisible(uses_ipp_lite)
+        self.apply_algorithm_ownership_gui_policy()
 
         if hasattr(self, "multi_robot_card"):
             self.multi_robot_card.setVisible(is_multi_robot_mode)
@@ -516,6 +520,46 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             self.robot_card.setVisible(not is_multi_robot_mode or same_config)
         if hasattr(self, "dynamics_card"):
             self.dynamics_card.setVisible(not is_multi_robot_mode or same_config)
+
+    def apply_algorithm_ownership_gui_policy(self) -> None:
+        """
+        Grey out (not hide) controls the selected plugin already owns.
+
+        This does not decide plugin behavior -- robotics_sim.simulation.
+        gui_policy.compute_gui_control_policy() is the pure, Qt-free source of
+        truth. This method only applies that decision to widgets, so a plugin
+        declaring TARGET_GENERATION does not leave "FoV-aware directional
+        frontier" looking like the active exploration algorithm.
+        """
+        if not hasattr(self, "coordinator_combo"):
+            return
+
+        try:
+            profile = runtime_profile_for_strategy(self.coordinator_combo.currentText())
+        except PluginLoadError:
+            return
+
+        policy = compute_gui_control_policy(profile)
+        # A locked (running) configuration always wins over the ownership
+        # policy: set_configuration_locked() disables these same widgets and
+        # then calls update_relevant_parameter_visibility(), so re-enabling a
+        # plugin-owned-but-otherwise-allowed control here would unlock it
+        # mid-run.
+        not_locked = not getattr(self, "running", False)
+
+        self.exploration_planner_field.setEnabled(policy.exploration_planner_enabled and not_locked)
+        self.exploration_planner_field.setToolTip(policy.exploration_planner_reason)
+        if hasattr(self.exploration_planner_field, "field_label"):
+            base_text = getattr(self.exploration_planner_field, "field_label_base_text", "Exploration Planner")
+            label_text = (
+                base_text
+                if policy.exploration_planner_enabled
+                else f"{base_text} (provided by algorithm / fallback service)"
+            )
+            self.exploration_planner_field.field_label.setText(label_text)
+        self.planner_combo.setEnabled(policy.path_planner_enabled and not_locked)
+        self.path_simplifier_field.setEnabled(policy.path_simplifier_enabled and not_locked)
+        self.control_combo.setEnabled(policy.control_enabled and not_locked)
 
     def set_configuration_locked(self, locked: bool) -> None:
         """

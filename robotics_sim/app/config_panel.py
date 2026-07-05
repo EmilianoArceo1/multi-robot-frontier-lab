@@ -116,6 +116,12 @@ def labeled_combo(label: str, combo: QComboBox):
     layout.addWidget(lbl)
     layout.addWidget(combo)
 
+    # Stashed so callers can update the visible label later (e.g. marking
+    # "Exploration Planner" as algorithm-provided/fallback) without needing to
+    # change this helper's signature or rebuild the widget tree.
+    box.field_label = lbl
+    box.field_label_base_text = label
+
     return box
 
 # ========================================================
@@ -217,12 +223,12 @@ def build_config_panel(window):
         1,
     )
     options_grid.addWidget(
-        labeled_combo("Planner", window.planner_combo),
+        labeled_combo("Path Planner Service", window.planner_combo),
         2,
         0,
     )
     options_grid.addWidget(
-        labeled_combo("Control", window.control_combo),
+        labeled_combo("Motion/Control Service", window.control_combo),
         2,
         1,
     )
@@ -258,7 +264,7 @@ def build_config_panel(window):
     )
 
     window.coordinator_field = labeled_combo(
-        "Multi-Robot Coordinator",
+        "Algorithm",
         window.coordinator_combo,
     )
     options_grid.addWidget(

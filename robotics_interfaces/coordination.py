@@ -59,6 +59,7 @@ class CoordinationRequest:
     """
 
     robot_states: tuple[RobotCoordinationState, ...]
+    robots_to_assign: tuple[int, ...] = ()
     proposals_by_robot: Mapping[int, tuple[CandidateProposal, ...]] = field(default_factory=dict)
     existing_targets_by_robot: Mapping[int, Point2D | None] = field(default_factory=dict)
     blocked_targets_by_robot: Mapping[int, tuple[Point2D, ...]] = field(default_factory=dict)

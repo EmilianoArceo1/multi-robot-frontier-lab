@@ -23,6 +23,7 @@ class ExplorationCandidate:
     safety_cost: float = 0.0
     overlap_cost: float = 0.0
     heading_cost: float = 0.0
+    heading_rad: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property

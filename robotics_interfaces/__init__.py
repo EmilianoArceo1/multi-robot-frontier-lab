@@ -13,8 +13,13 @@ from robotics_interfaces.plugins import (
     PluginContractError,
     PluginFactory,
     PluginMetadata,
+    PluginRuntimeProfile,
+    build_runtime_profile,
+    declares_capability,
+    plugin_owns,
     validate_coordination_plugin,
 )
+from robotics_interfaces.commands import RobotCommand, RobotCommandStatus
 
 __all__ = [
     "AssignmentStatus",
@@ -27,7 +32,17 @@ __all__ = [
     "PluginContractError",
     "PluginFactory",
     "PluginMetadata",
+    "PluginRuntimeProfile",
     "Point2D",
+    "RobotCommand",
+    "RobotCommandStatus",
     "RobotCoordinationState",
+    "build_runtime_profile",
+    "declares_capability",
+    "plugin_owns",
     "validate_coordination_plugin",
 ]
+
+from robotics_interfaces.observations import WorldSnapshot
+from robotics_interfaces.proposals import ExplorationCandidate
+from robotics_interfaces.services import CoordinationServices, FrontierProvider

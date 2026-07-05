@@ -10,6 +10,7 @@ from robotics_interfaces.observations import (
     WorldBounds,
     WorldSnapshot,
 )
+from robotics_interfaces.commands import RobotCommand
 from robotics_interfaces.proposals import CandidateProposal, ExplorationCandidate
 from robotics_interfaces.services import CoordinationServices
 
@@ -58,7 +59,10 @@ class CoordinationResult:
     """Output contract from coordination plugins.
 
     targets/reasons are kept for current runtime adapters. assignments is the
-    richer representation that new code should use.
+    richer representation that new code should use. commands is optional and
+    only meaningful once a runtime consumer is ready to read path/control_xy
+    (see robotics_interfaces.plugins.PluginRuntimeProfile) — a plugin that only
+    owns target generation/task allocation can leave path/control_xy unset.
     """
 
     targets: tuple[Point2D | None, ...] = ()
@@ -66,3 +70,4 @@ class CoordinationResult:
     strategy: str = ""
     assignments: tuple[CoordinationAssignment, ...] = ()
     debug: Mapping[str, Any] = field(default_factory=dict)
+    commands: tuple[RobotCommand, ...] = ()

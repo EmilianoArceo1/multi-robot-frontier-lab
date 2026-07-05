@@ -3,93 +3,66 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Literal
 
-Point2D = tuple[float, float]
+from robotics_interfaces.observations import (
+    Point2D,
+    RobotCoordinationState,
+    RobotTeamSnapshot,
+    WorldBounds,
+    WorldSnapshot,
+)
+from robotics_interfaces.proposals import CandidateProposal, ExplorationCandidate
+from robotics_interfaces.services import CoordinationServices
+
 AssignmentStatus = Literal["ASSIGNED", "HOLD", "FAILED"]
 
 
 @dataclass(frozen=True)
-class RobotCoordinationState:
-    """Simulator-independent robot state exposed to coordination plugins.
-
-    This mirrors the minimum data the current simulator coordinator already
-    needs, but it stays outside robotics_sim so future algorithms can be tested
-    without importing engine, Qt, canvas, RobotAgent, or GUI objects.
-    """
-
-    robot_id: int
-    xy: Point2D
-    safety_radius: float
-    sensor_range: float
-    vision_model: str
-    theta: float = 0.0
-    current_target: Point2D | None = None
-    is_active: bool = True
-
-
-@dataclass(frozen=True)
-class CandidateProposal:
-    """Candidate target/viewpoint proposed before team-level coordination.
-
-    A plugin may receive proposals from the simulator, generate its own, or use
-    this type internally to expose debug information and unit-test behavior.
-    """
-
-    robot_id: int
-    target: Point2D
-    score: float
-    information_gain: float = 0.0
-    travel_cost: float = 0.0
-    overlap_cost: float = 0.0
-    safety_cost: float = 0.0
-    heading_cost: float = 0.0
-    reason: str = ""
-
-
-@dataclass(frozen=True)
 class CoordinationRequest:
-    """Input contract sent by the simulator host to a coordination plugin.
+    """Input contract for coordination plugins.
 
-    Keep this as a data snapshot. Do not pass mutable simulator objects such as
-    RobotAgent, MainWindow, canvas items, engine instances, or Qt objects.
-    
-    The `shared` mapping is intentionally available as an escape hatch while
-    the simulator is being refactored. It lets the current runtime pass legacy
-    read-only objects during migration without expanding the core contract too
-    aggressively.
+    The request supports three levels of algorithm independence:
+    1. use explicit proposals_by_robot,
+    2. ask services.frontier_provider for candidates,
+    3. use world + robot_states to generate candidates internally.
+
+    shared remains only as a compatibility escape hatch for legacy adapters.
     """
 
     robot_states: tuple[RobotCoordinationState, ...]
     robots_to_assign: tuple[int, ...] = ()
-    proposals_by_robot: Mapping[int, tuple[CandidateProposal, ...]] = field(default_factory=dict)
+    world: WorldSnapshot | None = None
+    proposals_by_robot: Mapping[
+        int,
+        tuple[ExplorationCandidate | CandidateProposal, ...],
+    ] = field(default_factory=dict)
     existing_targets_by_robot: Mapping[int, Point2D | None] = field(default_factory=dict)
     blocked_targets_by_robot: Mapping[int, tuple[Point2D, ...]] = field(default_factory=dict)
     route_points_by_robot: tuple[tuple[Point2D, ...], ...] = ()
-    time_s: float = 0.0
+    services: CoordinationServices | None = None
+    parameters: Mapping[str, Any] = field(default_factory=dict)
     shared: Mapping[str, Any] = field(default_factory=dict)
+    time_s: float = 0.0
 
 
 @dataclass(frozen=True)
 class CoordinationAssignment:
-    """One plugin decision for one robot."""
-
     robot_id: int
     status: AssignmentStatus
     target: Point2D | None
     reason: str = ""
-    proposal: CandidateProposal | None = None
+    proposal: CandidateProposal | ExplorationCandidate | None = None
 
 
 @dataclass(frozen=True)
 class CoordinationResult:
-    """Output contract returned by coordination plugins.
+    """Output contract from coordination plugins.
 
-    `targets` and `reasons` intentionally match the shape expected by the
-    current simulator runtime, making migration from the legacy coordinator
-    incremental.
+    targets/reasons are kept for current runtime adapters. assignments is the
+    richer representation that new code should use.
     """
 
-    targets: tuple[Point2D | None, ...]
-    reasons: tuple[str, ...]
-    strategy: str
+    targets: tuple[Point2D | None, ...] = ()
+    reasons: tuple[str, ...] = ()
+    strategy: str = ""
     assignments: tuple[CoordinationAssignment, ...] = ()
     debug: Mapping[str, Any] = field(default_factory=dict)

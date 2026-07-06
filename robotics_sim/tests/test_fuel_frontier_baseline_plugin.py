@@ -65,6 +65,26 @@ class FakeFrontierInformationService:
         return self.clusters
 
 
+class FakeTeamFrontierProvider:
+    def __init__(self, candidates_by_robot):
+        self.candidates_by_robot = dict(candidates_by_robot)
+        self.calls = 0
+
+    def candidates_for_team(self, request):
+        self.calls += 1
+        return self.candidates_by_robot
+
+
+class FakeFrontierProvider:
+    def __init__(self, candidates_by_robot):
+        self.candidates_by_robot = dict(candidates_by_robot)
+        self.calls = []
+
+    def candidates_for_robot(self, robot, world, blocked_targets=()):
+        self.calls.append(robot.robot_id)
+        return self.candidates_by_robot.get(robot.robot_id, ())
+
+
 def test_fuel_frontier_baseline_does_not_import_robotics_sim():
     source = Path("algorithms/fuel_frontier_baseline/plugin.py").read_text(encoding="utf-8")
     assert "robotics_sim" not in source
@@ -114,7 +134,7 @@ def test_fuel_frontier_baseline_returns_robot_command_with_heading():
     assert command.metadata["cluster_id"] == "frontier-a"
 
 
-def test_fuel_frontier_baseline_uses_frontier_information_service_viewpoints():
+def test_fuel_uses_frontier_information_service_when_available():
     plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
     service = FakeFrontierInformationService(
         clusters=(
@@ -216,6 +236,131 @@ def test_fuel_frontier_baseline_rejects_near_frontier():
 
     assert result.targets == ((2.0, 0.0),)
     assert result.debug["per_robot"][0]["rejected"]["too_close_to_robot"] == 1
+
+
+def test_fuel_falls_back_to_team_frontier_provider_when_no_clusters():
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    empty_frontier_service = FakeFrontierInformationService(clusters=())
+    team_provider = FakeTeamFrontierProvider(
+        candidates_by_robot={
+            0: (ExplorationCandidate(target=(3.0, 0.0), source="team", information_gain=6.0),),
+        }
+    )
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        world=_world(),
+        services=SimpleNamespace(
+            frontier_information_service=empty_frontier_service,
+            team_frontier_provider=team_provider,
+        ),
+        parameters={"grid_resolution": 0.5, "goal_tolerance": 0.25},
+    )
+
+    result = plugin.assign(request)
+
+    assert empty_frontier_service.calls == [0]
+    assert team_provider.calls == 1
+    assert result.targets == ((3.0, 0.0),)
+    assert result.debug["per_robot"][0]["candidate_source"] == "team_frontier_provider"
+
+
+def test_fuel_falls_back_to_frontier_provider_when_no_team_candidates():
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    team_provider = FakeTeamFrontierProvider(candidates_by_robot={})
+    single_provider = FakeFrontierProvider(
+        candidates_by_robot={
+            0: (ExplorationCandidate(target=(2.0, 1.0), source="single", information_gain=4.0),),
+        }
+    )
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        world=_world(),
+        services=SimpleNamespace(
+            frontier_information_service=None,
+            team_frontier_provider=team_provider,
+            frontier_provider=single_provider,
+        ),
+        parameters={"grid_resolution": 0.5, "goal_tolerance": 0.25},
+    )
+
+    result = plugin.assign(request)
+
+    assert team_provider.calls == 1
+    assert single_provider.calls == [0]
+    assert result.targets == ((2.0, 1.0),)
+    assert result.debug["per_robot"][0]["candidate_source"] == "frontier_provider"
+
+
+def test_fuel_generates_bootstrap_targets_when_no_frontiers_exist():
+    """No proposals, no services, no map data (t=0) -- FUEL must still move
+    the team instead of holding forever, or it never senses anything new."""
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    request = CoordinationRequest(
+        robot_states=(
+            _robot(0, 0.0, 0.0),
+            _robot(1, 0.5, 0.0),
+            _robot(2, 0.0, 0.5),
+        ),
+        robots_to_assign=(0, 1, 2),
+        parameters={"grid_resolution": 0.5, "goal_tolerance": 0.25},
+    )
+
+    result = plugin.assign(request)
+
+    assert all(status.status == "ASSIGNED" for status in result.assignments)
+    assert all(
+        reason == "bootstrap exploration target while waiting for frontier clusters"
+        for reason in result.reasons
+    )
+    assert len(set(result.targets)) == 3  # distinct targets, no collapse
+    for robot_id, debug in result.debug["per_robot"].items():
+        assert debug["candidate_source"] == "bootstrap"
+
+    for robot_id, target in zip((0, 1, 2), result.targets):
+        start = {0: (0.0, 0.0), 1: (0.5, 0.0), 2: (0.0, 0.5)}[robot_id]
+        distance = ((target[0] - start[0]) ** 2 + (target[1] - start[1]) ** 2) ** 0.5
+        assert distance >= max(1.5, 0.75 * 2.5) - 1e-6
+
+
+def test_fuel_returns_commands_for_all_active_robots():
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    request = CoordinationRequest(
+        robot_states=(
+            _robot(0, 0.0, 0.0),
+            _robot(1, 3.0, 0.0),
+            _robot(2, 0.0, 3.0),
+        ),
+        # No robots_to_assign given -> every active robot must be handled.
+        parameters={"grid_resolution": 0.5, "goal_tolerance": 0.25},
+    )
+
+    result = plugin.assign(request)
+
+    assert len(result.commands) == 3
+    assert {command.robot_id for command in result.commands} == {0, 1, 2}
+    assert all(command.status == "ASSIGNED" for command in result.commands)
+
+
+def test_fuel_hold_only_when_all_candidate_sources_fail_and_bootstrap_disabled():
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        parameters={
+            "grid_resolution": 0.5,
+            "goal_tolerance": 0.25,
+            "fuel_enable_bootstrap": False,
+        },
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets == (None,)
+    assert result.assignments[0].status == "HOLD"
+    assert result.debug["per_robot"][0]["candidate_source"] == "none"
+    assert "candidate_source=none" in result.assignments[0].reason
 
 
 def test_fuel_frontier_baseline_preserves_existing_target_when_not_reassigning():

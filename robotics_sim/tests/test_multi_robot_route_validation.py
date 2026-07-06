@@ -6,6 +6,7 @@ from algorithms.mmpf_explore.plugin import MMPF_COORDINATOR
 from robotics_interfaces.commands import RobotCommand
 from robotics_interfaces.plugins import build_runtime_profile
 from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
+from robotics_sim.simulation import engine as engine_module
 from robotics_sim.simulation.coordination import select_runtime_path_source
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.plugin_loader import load_coordination_plugin
@@ -124,3 +125,256 @@ def test_mmpf_targets_still_use_external_path_planner_when_no_path_planning_capa
 
     assert legacy_calls == [True]
     assert waypoints == [(3.0, 0.0)]
+
+
+class _FakeRobot(SimpleNamespace):
+    def set_waypoints(self, waypoints):
+        self.waypoints = waypoints
+
+
+def _build_fake_engine(*, planner_type: str = "A*", route_plan_responses):
+    """A minimal SimulationControllerMixin instance for exercising the real
+    _assign_route_to_multi_robot_with_corridor_validation()/hold_multi_robot_position()
+    control flow without a full engine (no Qt, no collision checker).
+
+    Only the "heavy" collaborators (route computation, corridor validation,
+    the A* fallback's inner planner call) are faked; everything else that is
+    cheap (state bookkeeping, blacklisting, logging) runs for real.
+    """
+    robot = _FakeRobot(x=0.0, y=0.0)
+    fake = SimpleNamespace(
+        robots=[robot],
+        robot=robot,
+        config=SimpleNamespace(
+            planner_type=planner_type,
+            path_simplifier="Direction changes",
+            exploration_planner="test exploration planner",
+        ),
+        mapped_obstacle_points=[],
+        multi_exploration_targets=[(4.0, 0.0)],
+        multi_invalidated_exploration_targets=[[]],
+        multi_planned_path_points=[[]],
+        route_request_count=0,
+        route_result_count=0,
+        last_goal_selection_reason="",
+        console_logs=[],
+    )
+
+    fake.is_exploration_mode = lambda: True
+    fake.dynamic_robot_obstacle_points_for_robot = lambda index: []
+    fake.dynamic_robot_obstacles_for_target_selection = lambda index: []
+    fake.multi_active_route_points_by_robot = lambda: [[]]
+    fake.multi_dynamic_target_margin = lambda: 0.25
+    fake.safety_radius_for_robot = lambda robot: 0.35
+    fake.log_console_message = lambda message, **kwargs: fake.console_logs.append(message)
+    # None of these tests exercise a PATH_PLANNING-owning plugin; the Direct
+    # ->A* fallback must still be reachable, so owns_path_planning is False.
+    fake.coordinator_runtime_profile = lambda: SimpleNamespace(owns_path_planning=False)
+
+    responses = list(route_plan_responses)
+
+    def fake_compute_route_for_multi_robot(index, force_new_exploration_target=False):
+        if len(responses) > 1:
+            return responses.pop(0)
+        return responses[0]
+
+    fake.compute_route_for_multi_robot = fake_compute_route_for_multi_robot
+    fake.route_plan_call_count = lambda: len(route_plan_responses) - len(responses) + (
+        1 if len(responses) == len(route_plan_responses) else 0
+    )
+
+    # build_planner_kwargs_for_multi_robot / call_compute_planned_waypoints are
+    # only reached by the real compute_grid_safe_fallback_route_for_multi_robot
+    # when planner_type == "Direct"; tests that do not exercise the fallback
+    # never call these.
+    fake.build_planner_kwargs_for_multi_robot = lambda index, force_new_exploration_target=False: (
+        {"goal_xy": (4.0, 0.0)},
+        "goal_reason",
+    )
+    fake.call_compute_planned_waypoints = lambda kwargs, path_simplifier=None: (
+        True,
+        "A* fallback route",
+        [(0.0, 2.0), (4.0, 0.0)],
+    )
+
+    for name in (
+        "ROUTE_STATE_ACTIVE",
+        "ROUTE_STATE_HOLD_NO_FRONTIER",
+        "ROUTE_STATE_STUCK_SAFETY",
+        "ROUTE_STATE_ESCAPE_LOCAL",
+        "ROUTE_STATE_HOLD_ROUTE_BLOCKED",
+        "ROUTE_STATE_WAITING_FOR_CORRIDOR",
+        "MAX_ROUTE_RECOVERY_ATTEMPTS",
+    ):
+        setattr(fake, name, getattr(SimulationControllerMixin, name))
+
+    for name in (
+        "hold_multi_robot_position",
+        "ensure_multi_exploration_target_slots",
+        "publish_multi_exploration_targets",
+        "set_multi_route_state",
+        "ensure_multi_route_state_slots",
+        "invalidate_current_multi_frontier",
+        "assign_route_to_multi_robot",
+        "_assign_route_to_multi_robot_with_corridor_validation",
+        "_activate_multi_robot_route",
+        "compute_grid_safe_fallback_route_for_multi_robot",
+        "set_robot_goal_or_waypoints",
+        "clean_waypoints_for_robot",
+        "log_route_assignment",
+        "_xy_text",
+    ):
+        setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
+
+    return fake
+
+
+def test_hold_no_frontier_only_when_no_candidates_exist(monkeypatch):
+    """No plugin candidate at all -> HOLD_NO_FRONTIER is correct here."""
+    fake = _build_fake_engine(route_plan_responses=[(False, "no target assigned yet", [])])
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True  # hold_multi_robot_position always returns True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_HOLD_NO_FRONTIER
+
+
+def test_route_conflict_does_not_report_no_frontier(monkeypatch):
+    """A real target exists but every corridor candidate crosses a teammate's
+    safety zone -- this must be reported as HOLD_ROUTE_BLOCKED, not
+    HOLD_NO_FRONTIER (the exact bug this commit fixes)."""
+    fake = _build_fake_engine(
+        planner_type="A*",
+        route_plan_responses=[(True, "target found", [(4.0, 0.0)])],
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "validate_multi_robot_corridor",
+        lambda **kwargs: validate_multi_robot_corridor(
+            start=kwargs["start"],
+            waypoints=kwargs["waypoints"],
+            ego_safety_radius=kwargs["ego_safety_radius"],
+            other_robot_disks=[(2.0, 0.0, 0.35)],
+            margin=kwargs.get("margin", 0.25),
+        ),
+    )
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_HOLD_ROUTE_BLOCKED
+    assert fake.multi_route_states[0] != SimulationControllerMixin.ROUTE_STATE_HOLD_NO_FRONTIER
+    assert any("HOLD_ROUTE_BLOCKED" in message for message in fake.console_logs)
+
+
+def test_route_blocked_waits_instead_of_false_no_frontier(monkeypatch):
+    """Every candidate crosses a teammate's active route specifically -> this
+    is transient (the teammate is moving), so it should wait rather than
+    report a permanent no-frontier hold."""
+    fake = _build_fake_engine(
+        planner_type="A*",
+        route_plan_responses=[(True, "target found", [(0.0, 4.0)])],
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "validate_multi_robot_corridor",
+        lambda **kwargs: validate_multi_robot_corridor(
+            start=kwargs["start"],
+            waypoints=kwargs["waypoints"],
+            ego_safety_radius=kwargs["ego_safety_radius"],
+            other_routes=[[(-2.0, 2.0), (2.0, 2.0)]],
+            margin=kwargs.get("margin", 0.25),
+        ),
+    )
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_WAITING_FOR_CORRIDOR
+    assert any("waiting for corridor" in message for message in fake.console_logs)
+
+
+def test_recovery_tries_multiple_candidate_targets_before_hold(monkeypatch):
+    """The first two candidates are blocked; the third is clear. The runtime
+    must try all three before giving up (MAX_ROUTE_RECOVERY_ATTEMPTS=3), and
+    must activate the third candidate instead of holding."""
+    fake = _build_fake_engine(
+        planner_type="A*",
+        route_plan_responses=[
+            (True, "candidate 1", [(4.0, 0.0)]),
+            (True, "candidate 2", [(0.0, 4.0)]),
+            (True, "candidate 3 (clear)", [(9.0, 9.0)]),
+        ],
+    )
+
+    def fake_validate(**kwargs):
+        # candidate 1/2 each have a teammate parked right on their target, far
+        # enough from `start` that the spawn-formation exemption does not
+        # apply; candidate 3 has no conflicting disk at all.
+        blocked = {(4.0, 0.0), (0.0, 4.0)}
+        target = tuple(kwargs["waypoints"][-1])
+        if target in blocked:
+            return validate_multi_robot_corridor(
+                start=kwargs["start"],
+                waypoints=kwargs["waypoints"],
+                ego_safety_radius=kwargs["ego_safety_radius"],
+                other_robot_disks=[target + (0.9,)],
+                margin=kwargs.get("margin", 0.25),
+            )
+        return validate_multi_robot_corridor(
+            start=kwargs["start"],
+            waypoints=kwargs["waypoints"],
+            ego_safety_radius=kwargs["ego_safety_radius"],
+            margin=kwargs.get("margin", 0.25),
+        )
+
+    monkeypatch.setattr(engine_module, "validate_multi_robot_corridor", fake_validate)
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_ACTIVE
+    assert fake.multi_planned_path_points[0][-1] == (9.0, 9.0)
+    assert any("trying alternative target 2/3" in message for message in fake.console_logs)
+    assert any("trying alternative target 3/3" in message for message in fake.console_logs)
+
+
+def test_direct_route_rejected_can_try_astar_fallback(monkeypatch):
+    """Direct's straight-line corridor is blocked, but the grid-safe A*
+    fallback route is clear -- the runtime must use the fallback instead of
+    immediately invalidating the target and asking for a new one."""
+    fake = _build_fake_engine(
+        planner_type="Direct",
+        route_plan_responses=[(True, "direct route", [(4.0, 0.0)])],
+    )
+
+    def fake_validate(**kwargs):
+        if tuple(kwargs["waypoints"]) == ((4.0, 0.0),):
+            return validate_multi_robot_corridor(
+                start=kwargs["start"],
+                waypoints=kwargs["waypoints"],
+                ego_safety_radius=kwargs["ego_safety_radius"],
+                other_robot_disks=[(2.0, 0.0, 0.35)],
+                margin=kwargs.get("margin", 0.25),
+            )
+        # The A* fallback waypoints from _build_fake_engine's
+        # call_compute_planned_waypoints stub: [(0.0, 2.0), (4.0, 0.0)].
+        return validate_multi_robot_corridor(
+            start=kwargs["start"],
+            waypoints=kwargs["waypoints"],
+            ego_safety_radius=kwargs["ego_safety_radius"],
+            margin=kwargs.get("margin", 0.25),
+        )
+
+    monkeypatch.setattr(engine_module, "validate_multi_robot_corridor", fake_validate)
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_ACTIVE
+    assert fake.multi_planned_path_points[0][-1] == (4.0, 0.0)
+    assert fake.multi_planned_path_points[0] == [(0.0, 0.0), (0.0, 2.0), (4.0, 0.0)]
+    assert any("Direct route rejected, trying A* fallback" in message for message in fake.console_logs)
+    # The fallback succeeded on the first try, so the target must not have
+    # been blacklisted/retried.
+    assert not any("target_blacklisted_after_route_rejection" in message for message in fake.console_logs)

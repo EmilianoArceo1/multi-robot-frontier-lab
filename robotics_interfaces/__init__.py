@@ -45,6 +45,8 @@ __all__ = [
 
 from robotics_interfaces.observations import WorldSnapshot
 from robotics_interfaces.proposals import ExplorationCandidate
+from robotics_interfaces.frontiers import FrontierCluster, ViewpointCandidate
+from robotics_interfaces.regions import CoveragePath, RegionTask
 from robotics_interfaces.results import (
     CollisionCheckResult,
     MapQuerySnapshot,
@@ -55,9 +57,12 @@ from robotics_interfaces.results import (
 from robotics_interfaces.services import (
     CollisionCheckingService,
     CoordinationServices,
+    CoveragePathService,
+    FrontierInformationService,
     FrontierProvider,
     MapQueryService,
     MetricsService,
     PathPlanningService,
+    RegionDecompositionService,
     TeamFrontierProvider,
 )

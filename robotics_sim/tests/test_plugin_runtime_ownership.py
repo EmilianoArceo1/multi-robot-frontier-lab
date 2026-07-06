@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,8 +11,10 @@ from robotics_interfaces.commands import RobotCommand
 from robotics_interfaces.observations import RobotCoordinationState
 from robotics_interfaces.plugins import (
     PluginCapability,
+    PluginMetadata,
     PluginRuntimeProfile,
     build_runtime_profile,
+    validate_coordination_plugin,
 )
 from robotics_interfaces.proposals import CandidateProposal
 from robotics_sim.simulation.coordination import (
@@ -32,6 +35,68 @@ def _robot(robot_id: int, x: float, y: float) -> RobotCoordinationState:
         sensor_range=2.5,
         vision_model="Camera / FoV",
     )
+
+
+class FakePathPlanningPlugin:
+    """Test double: a plugin that declares PATH_PLANNING and always returns
+    a fixed RobotCommand.path. Not a real algorithm -- it exists only to
+    prove the runtime honors PATH_PLANNING ownership end to end, from
+    metadata.capabilities through to the RobotCommand the runtime consumes.
+    """
+
+    metadata = PluginMetadata(
+        name="fake path planning plugin",
+        version="0.0.0",
+        description="test double for PATH_PLANNING ownership",
+        capabilities=(
+            PluginCapability.COORDINATION,
+            PluginCapability.TARGET_GENERATION,
+            PluginCapability.TASK_ALLOCATION,
+            PluginCapability.PATH_PLANNING,
+        ),
+    )
+
+    def assign(self, request: CoordinationRequest) -> CoordinationResult:
+        command = RobotCommand(
+            robot_id=0,
+            status="ASSIGNED",
+            target=(3.0, 0.0),
+            path=((0.0, 0.0), (1.0, 0.0), (3.0, 0.0)),
+        )
+        return CoordinationResult(
+            targets=(command.target,),
+            reasons=("fake path planning plugin: assigned",),
+            strategy=self.metadata.name,
+            commands=(command,),
+        )
+
+
+class FakeControlPlugin:
+    """Test double: a plugin that declares CONTROL and always returns a
+    fixed RobotCommand.control_xy. Not a real controller -- it exists only to
+    prove the runtime honors CONTROL ownership end to end.
+    """
+
+    metadata = PluginMetadata(
+        name="fake control plugin",
+        version="0.0.0",
+        description="test double for CONTROL ownership",
+        capabilities=(
+            PluginCapability.COORDINATION,
+            PluginCapability.TARGET_GENERATION,
+            PluginCapability.TASK_ALLOCATION,
+            PluginCapability.CONTROL,
+        ),
+    )
+
+    def assign(self, request: CoordinationRequest) -> CoordinationResult:
+        command = RobotCommand(robot_id=0, status="ASSIGNED", control_xy=(0.5, 0.0))
+        return CoordinationResult(
+            targets=(None,),
+            reasons=("fake control plugin: assigned",),
+            strategy=self.metadata.name,
+            commands=(command,),
+        )
 
 
 def test_mmpf_runtime_profile():
@@ -149,18 +214,16 @@ def test_runtime_stores_robot_commands_by_robot_id():
 
 
 def test_path_planning_ownership_uses_command_path():
-    profile = PluginRuntimeProfile(
-        owns_target_generation=True,
-        owns_task_allocation=True,
-        owns_path_planning=True,
-        owns_control=False,
-    )
-    command = RobotCommand(
-        robot_id=0,
-        status="ASSIGNED",
-        target=(3.0, 0.0),
-        path=((0.0, 0.0), (1.0, 0.0), (3.0, 0.0)),
-    )
+    plugin = FakePathPlanningPlugin()
+    validate_coordination_plugin(plugin)
+    profile = build_runtime_profile(plugin.metadata)
+    assert profile.owns_path_planning is True
+
+    request = CoordinationRequest(robot_states=(_robot(0, 0.0, 0.0),), robots_to_assign=(0,))
+    result = plugin.assign(request)
+    command = map_robot_commands_by_id(result.commands)[0]
+    assert command.path == ((0.0, 0.0), (1.0, 0.0), (3.0, 0.0))
+
     legacy_calls: list[bool] = []
 
     def legacy_provider():
@@ -198,13 +261,16 @@ def test_no_path_planning_keeps_legacy_path_planner():
 
 
 def test_control_ownership_uses_command_control_xy():
-    profile = PluginRuntimeProfile(
-        owns_target_generation=True,
-        owns_task_allocation=True,
-        owns_path_planning=False,
-        owns_control=True,
-    )
-    command = RobotCommand(robot_id=0, status="ASSIGNED", control_xy=(0.5, 0.0))
+    plugin = FakeControlPlugin()
+    validate_coordination_plugin(plugin)
+    profile = build_runtime_profile(plugin.metadata)
+    assert profile.owns_control is True
+
+    request = CoordinationRequest(robot_states=(_robot(0, 0.0, 0.0),), robots_to_assign=(0,))
+    result = plugin.assign(request)
+    command = map_robot_commands_by_id(result.commands)[0]
+    assert command.control_xy == (0.5, 0.0)
+
     legacy_control = np.array([[0.0], [0.0]])
 
     control, reason = select_runtime_control_source(profile, command, legacy_control)
@@ -222,3 +288,42 @@ def test_no_control_keeps_nominal_control():
 
     assert control is legacy_control
     assert "nominal control" in reason
+
+
+def test_plugin_control_does_not_bypass_safety_veto_if_testable():
+    """A CONTROL-owning plugin only proposes a control; it must not be able
+    to skip the safety veto that runs before the control is actually applied.
+
+    Full physics is out of scope here (see engine.py's per-robot movement
+    loop), so this test proves the guarantee at the two points that actually
+    matter:
+      1. select_runtime_control_source() is a pure decision point -- it does
+         not mutate its inputs or touch a robot itself.
+      2. engine.py's source keeps the call order plugin proposal ->
+         predicted_motion_report() (the veto) -> robot.update() (the
+         actuation), so a future edit that reordered them would fail this
+         test instead of silently letting a plugin bypass safety.
+    """
+    plugin = FakeControlPlugin()
+    profile = build_runtime_profile(plugin.metadata)
+    assert profile.owns_control is True
+
+    request = CoordinationRequest(robot_states=(_robot(0, 0.0, 0.0),), robots_to_assign=(0,))
+    command = map_robot_commands_by_id(plugin.assign(request).commands)[0]
+
+    legacy_control = np.array([[0.0], [0.0]])
+    control, _ = select_runtime_control_source(profile, command, legacy_control)
+
+    # Pure decision point: the plugin's proposal is returned as-is, and the
+    # legacy control passed in is untouched.
+    assert control == (0.5, 0.0)
+    assert legacy_control.tolist() == [[0.0], [0.0]]
+
+    # Structural guarantee: in the movement loop, whatever select_runtime_
+    # control_source() returns must reach predicted_motion_report() (the
+    # safety veto) strictly before robot.update() (the actuation).
+    source = inspect.getsource(SimulationControllerMixin)
+    call_site = source.index("select_runtime_control_source(")
+    veto_call = source.index("predicted_motion_report(", call_site)
+    update_call = source.index("robot.update(control, dt)", call_site)
+    assert call_site < veto_call < update_call

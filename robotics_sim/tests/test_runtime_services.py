@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from algorithms.mmpf_explore.plugin import MMPF_COORDINATOR
 from robotics_interfaces.plugins import PluginCapability
+from robotics_interfaces.proposals import ExplorationCandidate
 from robotics_interfaces.results import PathPlanningRequest
 from robotics_interfaces.services import (
     CollisionCheckingService,
@@ -14,9 +15,11 @@ from robotics_interfaces.services import (
 from robotics_sim.simulation.coordination import MultiRobotCoordinator, RobotCoordinationState
 from robotics_sim.simulation.runtime_services import (
     RuntimeCollisionCheckingService,
+    RuntimeFrontierInformationService,
     RuntimeMapQueryService,
     RuntimeMetricsService,
     RuntimePathPlanningService,
+    frontier_clusters_from_candidates,
 )
 
 
@@ -179,3 +182,37 @@ def test_coordination_request_receives_map_query_and_metrics_services():
     snapshot = request.services.map_query_service.map_snapshot()
     assert snapshot.bounds == (-5.0, 5.0, -5.0, 5.0)
     assert snapshot.resolution == 0.5
+
+
+def test_coordination_request_receives_frontier_information_service():
+    coordinator = MultiRobotCoordinator(strategy=MMPF_COORDINATOR)
+    request = _build_request(coordinator)
+
+    assert isinstance(request.services.frontier_information_service, RuntimeFrontierInformationService)
+
+
+def test_runtime_frontier_information_service_can_convert_candidates_to_clusters():
+    """When map-based frontier detection finds nothing (e.g. not enough
+    explored_points yet), the service must fall back to converting whatever
+    legacy candidates (team/single-robot frontier providers) it was given,
+    instead of returning empty."""
+    candidates = (
+        ExplorationCandidate(target=(2.0, 0.0), source="team_frontier", information_gain=5.0),
+        ExplorationCandidate(target=(0.0, 3.0), source="team_frontier", information_gain=7.0, heading_rad=0.3),
+    )
+
+    clusters = frontier_clusters_from_candidates(candidates, id_prefix="legacy")
+    assert len(clusters) == 2
+    assert clusters[0].centroid == (2.0, 0.0)
+    assert clusters[0].best_viewpoint.information_gain == 5.0
+    assert clusters[1].best_viewpoint.heading_rad == 0.3
+
+    service = RuntimeFrontierInformationService(legacy_candidates_by_robot={0: candidates})
+
+    per_robot = service.get_frontier_clusters(robot_id=0)
+    assert len(per_robot) == 2
+
+    all_robots = service.get_frontier_clusters()
+    assert len(all_robots) == 2
+
+    assert RuntimeFrontierInformationService().get_frontier_clusters() == ()

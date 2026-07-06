@@ -84,7 +84,7 @@ class FuelFrontierBaselinePlugin:
                 debug_by_robot[robot_id] = {"rejected": {"missing_robot": 1}}
                 continue
 
-            raw_candidates = self._candidate_pool(request, robot, team_candidates)
+            raw_candidates, candidate_source = self._candidate_pool(request, robot, team_candidates)
             clustered = self._best_candidate_per_frontier_cluster(raw_candidates, robot, request)
             chosen, rejection_counts = self._choose_candidate(
                 candidates=clustered,
@@ -98,10 +98,14 @@ class FuelFrontierBaselinePlugin:
                 "raw_candidates": len(raw_candidates),
                 "clustered_candidates": len(clustered),
                 "rejected": rejection_counts,
+                "candidate_source": candidate_source,
             }
 
             if chosen is None:
-                reason = "no valid FUEL-style frontier viewpoint candidate"
+                reason = (
+                    "no valid FUEL-style frontier viewpoint candidate "
+                    f"(candidate_source={candidate_source})"
+                )
                 assignments.append(
                     CoordinationAssignment(
                         robot_id=robot_id,
@@ -121,7 +125,10 @@ class FuelFrontierBaselinePlugin:
             if cluster_id is not None:
                 reserved_cluster_ids.add(cluster_id)
 
-            reason = "selected by FUEL frontier baseline"
+            if chosen.source == "bootstrap":
+                reason = "bootstrap exploration target while waiting for frontier clusters"
+            else:
+                reason = "selected by FUEL frontier baseline"
             assignments.append(
                 CoordinationAssignment(
                     robot_id=robot_id,
@@ -174,6 +181,7 @@ class FuelFrontierBaselinePlugin:
                     "frontier_information_service",
                     "team_frontier_provider",
                     "frontier_provider",
+                    "bootstrap",
                 ),
                 "per_robot": debug_by_robot,
             },
@@ -207,10 +215,14 @@ class FuelFrontierBaselinePlugin:
         request: CoordinationRequest,
         robot: RobotCoordinationState,
         team_candidates: Mapping[int, tuple[ExplorationCandidate, ...]],
-    ) -> tuple[ExplorationCandidate, ...]:
+    ) -> tuple[tuple[ExplorationCandidate, ...], str]:
+        """Return (candidates, candidate_source) trying progressively cheaper
+        / less-informed sources, so a robot is never left with nothing to do
+        just because the map is still empty (e.g. at simulation start,
+        before any sensor update has produced a frontier)."""
         explicit = request.proposals_by_robot.get(robot.robot_id, ())
         if explicit:
-            return tuple(self._as_candidate(candidate) for candidate in explicit)
+            return tuple(self._as_candidate(candidate) for candidate in explicit), "explicit_proposals"
 
         frontier_information = getattr(request.services, "frontier_information_service", None)
         if frontier_information is not None:
@@ -218,23 +230,63 @@ class FuelFrontierBaselinePlugin:
             candidates = tuple(self._candidate_from_cluster(cluster) for cluster in clusters)
             candidates = tuple(candidate for candidate in candidates if candidate is not None)
             if candidates:
-                return candidates
+                return candidates, "frontier_information_service"
 
-        if robot.robot_id in team_candidates:
-            return team_candidates[robot.robot_id]
+        if team_candidates.get(robot.robot_id):
+            return team_candidates[robot.robot_id], "team_frontier_provider"
 
         frontier_provider = getattr(request.services, "frontier_provider", None)
-        if frontier_provider is None or request.world is None:
-            return ()
-
-        blocked = request.blocked_targets_by_robot.get(robot.robot_id, ())
-        return tuple(
-            self._as_candidate(candidate)
-            for candidate in frontier_provider.candidates_for_robot(
-                robot=robot,
-                world=request.world,
-                blocked_targets=blocked,
+        if frontier_provider is not None and request.world is not None:
+            blocked = request.blocked_targets_by_robot.get(robot.robot_id, ())
+            candidates = tuple(
+                self._as_candidate(candidate)
+                for candidate in frontier_provider.candidates_for_robot(
+                    robot=robot,
+                    world=request.world,
+                    blocked_targets=blocked,
+                )
             )
+            if candidates:
+                return candidates, "frontier_provider"
+
+        bootstrap = self._bootstrap_candidate(robot, request)
+        if bootstrap is not None:
+            return (bootstrap,), "bootstrap"
+
+        return (), "none"
+
+    def _bootstrap_candidate(
+        self,
+        robot: RobotCoordinationState,
+        request: CoordinationRequest,
+    ) -> ExplorationCandidate | None:
+        """Deterministic initial target so a robot starts moving before any
+        frontier/candidate information exists (e.g. t=0, no map yet).
+
+        Only reached when every real candidate source above returned
+        nothing. A robot that never moves never senses anything new, so
+        without this the team can get stuck reporting "no frontier" forever
+        even though nothing has been explored yet to look for a frontier in.
+        """
+        if not bool(request.parameters.get("fuel_enable_bootstrap", True)):
+            return None
+
+        team_size = max(len(request.robot_states), 1)
+        sensor_range = float(getattr(robot, "sensor_range", 2.5) or 2.5)
+        distance = max(1.5, 0.75 * sensor_range)
+        # Spread robots over distinct directions (keyed by robot_id, not
+        # iteration order, so it stays stable between separate assign() calls)
+        # so a team does not collapse onto the same bootstrap target.
+        angle = (2.0 * math.pi * float(robot.robot_id) / team_size) + (math.pi / 4.0)
+        target = (
+            float(robot.xy[0]) + distance * math.cos(angle),
+            float(robot.xy[1]) + distance * math.sin(angle),
+        )
+        return ExplorationCandidate(
+            target=target,
+            source="bootstrap",
+            information_gain=0.0,
+            metadata={"reason": "bootstrap exploration target while waiting for frontier clusters"},
         )
 
     def _best_candidate_per_frontier_cluster(

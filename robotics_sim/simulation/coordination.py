@@ -34,6 +34,7 @@ from robotics_sim.simulation.coordination_services import (
 )
 from robotics_sim.simulation.runtime_services import (
     RuntimeCollisionCheckingService,
+    RuntimeFrontierInformationService,
     RuntimeMapQueryService,
     RuntimeMetricsService,
     RuntimePathPlanningService,
@@ -299,6 +300,10 @@ class MultiRobotCoordinator:
             (float(state.safety_radius) for state in robot_states),
             default=0.35,
         )
+        default_sensor_range = max(
+            (float(state.sensor_range) for state in robot_states),
+            default=2.5,
+        )
 
         plugin_robot_states = tuple(
             PluginRobotCoordinationState(
@@ -371,6 +376,14 @@ class MultiRobotCoordinator:
                 resolution=float(resolution),
             ),
             metrics_service=RuntimeMetricsService(),
+            frontier_information_service=RuntimeFrontierInformationService(
+                explored_points=normalized_explored_points,
+                mapped_obstacle_points=normalized_obstacle_points,
+                bounds=normalized_bounds,
+                resolution=float(resolution),
+                robot_radius=default_safety_radius,
+                sensor_range=default_sensor_range,
+            ),
         )
 
         shared: dict[str, Any] = {

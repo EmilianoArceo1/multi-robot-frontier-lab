@@ -153,6 +153,16 @@ class SimulationControllerMixin:
     ROUTE_STATE_HOLD_NO_FRONTIER = "HOLD_NO_FRONTIER"
     ROUTE_STATE_STUCK_SAFETY = "STUCK_SAFETY"
     ROUTE_STATE_ESCAPE_LOCAL = "ESCAPE_LOCAL"
+    # A route candidate exists but corridor validation rejected it -- this is
+    # not "no frontier", it is "no safe route to the frontier we do have".
+    ROUTE_STATE_HOLD_ROUTE_BLOCKED = "HOLD_ROUTE_BLOCKED"
+    # Specifically a route_conflict_with_active_route rejection: the target
+    # itself is fine, a teammate's active route is just in the way right now.
+    ROUTE_STATE_WAITING_FOR_CORRIDOR = "WAITING_FOR_CORRIDOR"
+
+    # How many candidate targets to try (1 initial attempt + retries) before
+    # a corridor-blocked robot is allowed to fall back to HOLD/WAITING.
+    MAX_ROUTE_RECOVERY_ATTEMPTS = 3
 
     # NAVIGATION MODE / ROBOT AGENT HELPERS
     # ========================================================
@@ -2390,6 +2400,8 @@ class SimulationControllerMixin:
         self,
         robot_index: int,
         reason: str = "",
+        *,
+        state: str | None = None,
     ) -> bool:
         """Assign a zero-length hold target to one robot.
 
@@ -2397,6 +2409,11 @@ class SimulationControllerMixin:
         path planner fails, the robot must *not* fall back to the shared final
         goal G. G is only a visual mission reference while a frontier planner is
         active.
+
+        state lets a caller that already knows *why* it is holding (e.g. a
+        corridor rejection, not a missing frontier) say so explicitly instead
+        of relying on substring-sniffing the reason text below, which only
+        covers the case where nothing more specific is known.
         """
         if not (0 <= int(robot_index) < len(self.robots)):
             return False
@@ -2421,11 +2438,14 @@ class SimulationControllerMixin:
         else:
             self.last_goal_selection_reason = f"R{robot_index + 1}: holding position"
 
-        state = self.ROUTE_STATE_HOLD_NO_FRONTIER
         reason_text = str(reason or "")
-        if "collision" in reason_text.lower() or "blocked" in reason_text.lower() or "safety" in reason_text.lower():
-            state = self.ROUTE_STATE_STUCK_SAFETY
-        self.set_multi_route_state(robot_index, state, reason_text or "hold position")
+        if state is not None:
+            resolved_state = state
+        else:
+            resolved_state = self.ROUTE_STATE_HOLD_NO_FRONTIER
+            if "collision" in reason_text.lower() or "blocked" in reason_text.lower() or "safety" in reason_text.lower():
+                resolved_state = self.ROUTE_STATE_STUCK_SAFETY
+        self.set_multi_route_state(robot_index, resolved_state, reason_text or "hold position")
         return True
 
     def assign_route_to_multi_robot(
@@ -2445,8 +2465,73 @@ class SimulationControllerMixin:
             robot_index,
             reason=reason,
             force_new_exploration_target=force_new_exploration_target,
-            remaining_corridor_retries=1,
+            remaining_corridor_retries=self.MAX_ROUTE_RECOVERY_ATTEMPTS - 1,
         )
+
+    def compute_grid_safe_fallback_route_for_multi_robot(
+        self,
+        robot_index: int,
+        force_new_exploration_target: bool = False,
+    ) -> tuple[bool, str, list[tuple[float, float]]]:
+        """One-off A* fallback used only when Direct's corridor is rejected.
+
+        This does not change self.config.planner_type -- Direct stays the
+        globally selected planner. It just asks the grid-safe planner for one
+        alternate route to the same goal before the target itself is given
+        up on, since a straight line can be blocked while a route around the
+        obstruction is not.
+        """
+        if compute_planned_waypoints is None:
+            return False, "planner package is not available", []
+
+        planner_kwargs, goal_reason = self.build_planner_kwargs_for_multi_robot(
+            robot_index,
+            force_new_exploration_target=force_new_exploration_target,
+        )
+        if bool(planner_kwargs.get("__hold__", False)):
+            return False, goal_reason, []
+
+        fallback_kwargs = dict(planner_kwargs)
+        fallback_kwargs["planner_type"] = "A*"
+
+        success, reason, waypoints = self.call_compute_planned_waypoints(
+            fallback_kwargs,
+            path_simplifier=self.config.path_simplifier,
+        )
+        return bool(success), f"{goal_reason}; grid-safe fallback (A*): {reason}", waypoints
+
+    def _activate_multi_robot_route(
+        self,
+        robot_index: int,
+        robot,
+        old_robot,
+        waypoints: list[tuple[float, float]],
+        route_reason: str,
+        reason: str,
+    ) -> bool:
+        """Shared tail: commit a validated route as ACTIVE and restore self.robot."""
+        self.set_robot_goal_or_waypoints(robot, waypoints)
+        self.set_multi_route_state(robot_index, self.ROUTE_STATE_ACTIVE, route_reason)
+
+        while len(self.multi_planned_path_points) <= robot_index:
+            self.multi_planned_path_points.append([])
+        self.multi_planned_path_points[robot_index] = [(float(robot.x), float(robot.y))] + list(waypoints)
+
+        self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
+        self.route_request_count += 1
+        self.route_result_count += 1
+        if reason:
+            self.last_goal_selection_reason = f"R{robot_index + 1}: {reason}; {route_reason}"
+        else:
+            self.last_goal_selection_reason = route_reason
+        self.log_route_assignment(
+            robot_index,
+            (float(robot.x), float(robot.y)),
+            list(waypoints),
+            self.last_goal_selection_reason,
+        )
+        self.publish_multi_exploration_targets()
+        return True
 
     def _assign_route_to_multi_robot_with_corridor_validation(
         self,
@@ -2518,12 +2603,64 @@ class SimulationControllerMixin:
                     f"R{robot_index + 1}: route candidate rejected: reason={corridor_check.reason_code}; "
                     f"{corridor_check.detail}"
                 )
+
+                # A straight line can be blocked while a route around the
+                # obstruction is not. Try the grid-safe planner once, for the
+                # SAME target, before giving up on it -- this only applies
+                # when Direct is the globally selected planner AND no plugin
+                # owns PATH_PLANNING. A PATH_PLANNING-owning plugin's
+                # command.path is authoritative (see compute_route_for_multi_
+                # robot/select_runtime_path_source); this local A* fallback
+                # must not silently override it just because the (now
+                # disabled) planner combo still shows "Direct".
+                if (
+                    self.config.planner_type == "Direct"
+                    and not self.coordinator_runtime_profile().owns_path_planning
+                ):
+                    self.log_console_message(
+                        f"R{robot_index + 1}: Direct route rejected, trying A* fallback"
+                    )
+                    fb_success, fb_reason, fb_waypoints = self.compute_grid_safe_fallback_route_for_multi_robot(
+                        robot_index,
+                        force_new_exploration_target=False,
+                    )
+                    if fb_success and fb_waypoints:
+                        fb_waypoints = self.clean_waypoints_for_robot(
+                            robot, fb_waypoints, obstacle_points=obstacle_points
+                        )
+                    if fb_success and fb_waypoints:
+                        fb_corridor_check = validate_multi_robot_corridor(
+                            start=(float(robot.x), float(robot.y)),
+                            waypoints=fb_waypoints,
+                            ego_safety_radius=float(self.safety_radius_for_robot(robot)),
+                            other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
+                            other_routes=[
+                                route
+                                for j, route in enumerate(self.multi_active_route_points_by_robot())
+                                if j != robot_index
+                            ],
+                            margin=self.multi_dynamic_target_margin(),
+                        )
+                        if fb_corridor_check.is_valid:
+                            _LOGGER.debug(
+                                "R%d: route_accepted_after_corridor_validation (A* fallback)",
+                                robot_index + 1,
+                            )
+                            return self._activate_multi_robot_route(
+                                robot_index, robot, old_robot, fb_waypoints, fb_reason, reason
+                            )
+
                 self.invalidate_current_multi_frontier(robot_index, corridor_check.detail)
                 self.log_console_message(
                     f"R{robot_index + 1}: target_blacklisted_after_route_rejection"
                 )
 
                 if remaining_corridor_retries > 0:
+                    attempt_number = self.MAX_ROUTE_RECOVERY_ATTEMPTS - remaining_corridor_retries
+                    self.log_console_message(
+                        f"R{robot_index + 1}: route rejected, trying alternative target "
+                        f"{attempt_number + 1}/{self.MAX_ROUTE_RECOVERY_ATTEMPTS}"
+                    )
                     self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
                     retry_reason = f"retry after {corridor_check.reason_code}"
                     if reason:
@@ -2535,37 +2672,35 @@ class SimulationControllerMixin:
                         remaining_corridor_retries=remaining_corridor_retries - 1,
                     )
 
-                held = self.hold_multi_robot_position(
-                    robot_index,
-                    f"no safe corridor available after retry; {corridor_check.detail}",
-                )
+                # Candidates exhausted. A conflict with a teammate's active
+                # route is transient (they are moving; the corridor may clear
+                # on its own), so it waits rather than reporting a permanent
+                # hold. Any other corridor conflict is reported as a blocked
+                # route, not as "no frontier" -- a target/frontier did exist.
+                if corridor_check.reason_code == "route_conflict_with_active_route":
+                    self.log_console_message(
+                        f"R{robot_index + 1}: waiting for corridor instead of HOLD_NO_FRONTIER"
+                    )
+                    held = self.hold_multi_robot_position(
+                        robot_index,
+                        f"waiting for corridor; {corridor_check.detail}",
+                        state=self.ROUTE_STATE_WAITING_FOR_CORRIDOR,
+                    )
+                else:
+                    self.log_console_message(
+                        f"R{robot_index + 1}: HOLD_ROUTE_BLOCKED; candidates exhausted"
+                    )
+                    held = self.hold_multi_robot_position(
+                        robot_index,
+                        f"no safe corridor available after retry; {corridor_check.detail}",
+                        state=self.ROUTE_STATE_HOLD_ROUTE_BLOCKED,
+                    )
                 self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
                 return held
 
             _LOGGER.debug("R%d: route_accepted_after_corridor_validation", robot_index + 1)
 
-        self.set_robot_goal_or_waypoints(robot, waypoints)
-        self.set_multi_route_state(robot_index, self.ROUTE_STATE_ACTIVE, route_reason)
-
-        while len(self.multi_planned_path_points) <= robot_index:
-            self.multi_planned_path_points.append([])
-        self.multi_planned_path_points[robot_index] = [(float(robot.x), float(robot.y))] + list(waypoints)
-
-        self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
-        self.route_request_count += 1
-        self.route_result_count += 1
-        if reason:
-            self.last_goal_selection_reason = f"R{robot_index + 1}: {reason}; {route_reason}"
-        else:
-            self.last_goal_selection_reason = route_reason
-        self.log_route_assignment(
-            robot_index,
-            (float(robot.x), float(robot.y)),
-            list(waypoints),
-            self.last_goal_selection_reason,
-        )
-        self.publish_multi_exploration_targets()
-        return True
+        return self._activate_multi_robot_route(robot_index, robot, old_robot, waypoints, route_reason, reason)
 
     def replan_multi_robots_affected_by_points(
         self,
@@ -2574,8 +2709,14 @@ class SimulationControllerMixin:
     ) -> int:
         """
         Replan only the robots whose current routes are invalidated by new map data.
+
+        This runs regardless of planner_type: a Direct route is a straight
+        line to a target, which can still be crossed by a newly discovered
+        obstacle. assign_route_to_multi_robot() resolves Direct/A*/Dijkstra/
+        plugin-owned paths uniformly, so there is nothing Direct-specific to
+        special-case here.
         """
-        if self.config.planner_type == "Direct" or not newly_mapped:
+        if not newly_mapped:
             return 0
 
         replanned = 0
@@ -3687,7 +3828,15 @@ class SimulationControllerMixin:
                     if self.is_exploration_mode():
                         self.invalidate_current_multi_frontier(index, block_reason)
 
-                    if self.config.planner_type != "Direct" and self.multi_safety_replan_allowed(index, block_reason, target):
+                    # Re-target regardless of planner_type: assign_route_to_multi_robot
+                    # already resolves Direct/A*/Dijkstra/plugin-owned paths
+                    # uniformly (see compute_route_for_multi_robot) and falls back
+                    # to HOLD_ROUTE_BLOCKED/WAITING_FOR_CORRIDOR on its own when no
+                    # safe route exists -- gating this on planner_type == "Direct"
+                    # used to skip straight to stop_for_collision() (halting the
+                    # WHOLE simulation) on the very first blocked segment whenever
+                    # Direct was selected, since Direct is the default planner.
+                    if self.multi_safety_replan_allowed(index, block_reason, target):
                         if self.assign_route_to_multi_robot(
                             index,
                             reason=block_reason,
@@ -3699,17 +3848,9 @@ class SimulationControllerMixin:
 
                     # During the cooldown, stay stopped instead of logging the
                     # same rejected route every frame.
-                    if self.config.planner_type != "Direct":
-                        control = self.brake_control_for_collision()
-                        new_controls.append(control)
-                        continue
-
-                    self.robot = robot
-                    self.last_collision_report = active_segment_report
-                    self.stop_for_collision(
-                        f"BLOCKED: R{index + 1} cannot safely continue. {block_reason}"
-                    )
-                    return
+                    control = self.brake_control_for_collision()
+                    new_controls.append(control)
+                    continue
 
             # nominal_control_safe() also advances the robot's state machine
             # (active waypoint, ARRIVED/BLOCKED mode), so it always runs even
@@ -3741,7 +3882,10 @@ class SimulationControllerMixin:
                 if self.is_exploration_mode():
                     self.invalidate_current_multi_frontier(index, block_reason)
 
-                if self.config.planner_type != "Direct" and self.multi_safety_replan_allowed(index, block_reason, target):
+                # Re-target regardless of planner_type -- see the matching
+                # comment on the active-segment block above for why gating
+                # this on planner_type == "Direct" was wrong.
+                if self.multi_safety_replan_allowed(index, block_reason, target):
                     if self.assign_route_to_multi_robot(
                         index,
                         reason=block_reason,
@@ -3751,15 +3895,9 @@ class SimulationControllerMixin:
                         new_controls.append(control)
                         continue
 
-                if self.config.planner_type != "Direct":
-                    control = self.brake_control_for_collision()
-                    new_controls.append(control)
-                    continue
-
-                self.stop_for_collision(
-                    f"PREDICTED COLLISION: R{index + 1} would enter an obstacle safety region before next update."
-                )
-                return
+                control = self.brake_control_for_collision()
+                new_controls.append(control)
+                continue
 
             robot.update(control, dt)
             new_controls.append(control)

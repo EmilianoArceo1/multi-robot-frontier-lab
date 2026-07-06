@@ -10,10 +10,14 @@ classes below through CoordinationServices.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from robotics_interfaces.frontiers import FrontierCluster, ViewpointCandidate
 from robotics_interfaces.observations import Point2D, WorldBounds
+from robotics_interfaces.proposals import ExplorationCandidate
+from robotics_interfaces.regions import CoveragePath, RegionTask
 from robotics_interfaces.results import (
     CollisionCheckResult,
     MapQuerySnapshot,
@@ -21,7 +25,10 @@ from robotics_interfaces.results import (
     PathPlanningRequest,
     PathPlanningResponse,
 )
-from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
+from robotics_sim.planning.coordinated_frontier_planner import (
+    _detect_global_frontier_viewpoints,
+    validate_multi_robot_corridor,
+)
 from robotics_sim.planning.planner_registry import compute_planned_waypoints
 
 
@@ -157,4 +164,183 @@ class RuntimeMetricsService:
     def record_event(self, event: MetricsEvent) -> None:
         logging.getLogger(self.logger_name).debug(
             "metrics event: name=%s data=%s", event.name, dict(event.data)
+        )
+
+
+def frontier_clusters_from_candidates(
+    candidates: Sequence[ExplorationCandidate],
+    id_prefix: str = "legacy",
+) -> tuple[FrontierCluster, ...]:
+    """Convert already-computed ExplorationCandidate objects (e.g. from
+    RuntimeTeamFrontierProvider/RuntimeFrontierProvider) into simple
+    single-viewpoint FrontierCluster objects.
+
+    This is not real re-clustering -- each candidate becomes its own cluster
+    -- so a FrontierInformationService consumer has something usable even
+    when fresh map-based frontier detection has not found anything yet (e.g.
+    a plugin that only knows about FrontierInformationService and does not
+    want to reach for team/single-robot providers itself).
+    """
+    clusters = []
+    for index, candidate in enumerate(candidates):
+        viewpoint = ViewpointCandidate(
+            xy=candidate.target,
+            heading_rad=candidate.heading_rad,
+            information_gain=float(candidate.information_gain),
+            travel_cost=float(candidate.travel_cost),
+            safety_cost=float(candidate.safety_cost),
+            metadata=dict(candidate.metadata),
+        )
+        clusters.append(
+            FrontierCluster(
+                cluster_id=f"{id_prefix}-{index}",
+                centroid=candidate.target,
+                viewpoints=(viewpoint,),
+                information_gain=float(candidate.information_gain),
+                metadata={"source": candidate.source},
+            )
+        )
+    return tuple(clusters)
+
+
+@dataclass(frozen=True)
+class RuntimeFrontierInformationService:
+    """FrontierInformationService backed by the same frontier detector the
+    coordinated frontier planner uses. Each detected candidate becomes one
+    single-viewpoint FrontierCluster -- this is not yet FUEL-style
+    multi-viewpoint sampling per cluster, it exists so the contract is real
+    and invocable today.
+
+    If map-based detection finds nothing (e.g. not enough explored_points
+    yet), it falls back to converting whatever legacy_candidates_by_robot was
+    supplied at construction time (typically pre-computed from
+    RuntimeTeamFrontierProvider/RuntimeFrontierProvider) instead of returning
+    empty. If there is truly no data anywhere, it returns an empty tuple
+    instead of raising.
+    """
+
+    explored_points: tuple[Point2D, ...] = ()
+    mapped_obstacle_points: tuple[Point2D, ...] = ()
+    bounds: WorldBounds | None = None
+    resolution: float = 0.5
+    robot_radius: float = 0.35
+    sensor_range: float = 2.5
+    legacy_candidates_by_robot: dict[int, tuple[ExplorationCandidate, ...]] = field(default_factory=dict)
+
+    def get_frontier_clusters(self, robot_id: int | None = None) -> tuple[FrontierCluster, ...]:
+        if self.bounds is not None and self.explored_points:
+            candidates = _detect_global_frontier_viewpoints(
+                explored_points=self.explored_points,
+                mapped_obstacle_points=self.mapped_obstacle_points,
+                bounds=self.bounds,
+                resolution=self.resolution,
+                robot_radius=self.robot_radius,
+                sensor_range=self.sensor_range,
+            )
+            if candidates:
+                clusters = []
+                for index, candidate in enumerate(candidates):
+                    viewpoint = ViewpointCandidate(
+                        xy=candidate.target,
+                        information_gain=float(candidate.information_gain),
+                        visible_cell_count=int(candidate.size),
+                        metadata={"reason": candidate.reason},
+                    )
+                    metadata: dict = {"reason": candidate.reason}
+                    if robot_id is not None:
+                        metadata["requested_for_robot_id"] = robot_id
+                    clusters.append(
+                        FrontierCluster(
+                            cluster_id=f"frontier-{index}",
+                            centroid=candidate.target,
+                            viewpoints=(viewpoint,),
+                            information_gain=float(candidate.information_gain),
+                            metadata=metadata,
+                        )
+                    )
+                return tuple(clusters)
+
+        if robot_id is not None:
+            legacy = self.legacy_candidates_by_robot.get(robot_id, ())
+        else:
+            legacy = tuple(
+                candidate
+                for candidates in self.legacy_candidates_by_robot.values()
+                for candidate in candidates
+            )
+        if not legacy:
+            return ()
+        return frontier_clusters_from_candidates(legacy, id_prefix="legacy")
+
+
+@dataclass(frozen=True)
+class RuntimeRegionDecompositionService:
+    """RegionDecompositionService derived from the same frontier detection
+    RuntimeFrontierInformationService uses: each frontier cluster becomes one
+    unassigned region task. This is a placeholder decomposition (not a real
+    space-filling/Voronoi partition), so the contract has something real to
+    return before a proper region planner exists.
+    """
+
+    frontier_information_service: RuntimeFrontierInformationService
+
+    def get_region_tasks(self) -> tuple[RegionTask, ...]:
+        clusters = self.frontier_information_service.get_frontier_clusters()
+        if not clusters:
+            return ()
+
+        return tuple(
+            RegionTask(
+                region_id=f"region-{cluster.cluster_id}",
+                centroid=cluster.centroid if cluster.centroid is not None else (0.0, 0.0),
+                unknown_cell_count=sum(vp.visible_cell_count for vp in cluster.viewpoints),
+                cells=cluster.cells,
+                metadata={"source_cluster_id": cluster.cluster_id},
+            )
+            for cluster in clusters
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeCoveragePathService:
+    """CoveragePathService that orders region centroids by greedy nearest-
+    neighbor distance from the origin. This is a placeholder ("trivial
+    coverage path"), not a CVRP/TSP solver -- a real solver can replace this
+    later without changing the contract algorithms depend on.
+    """
+
+    def plan_coverage_path(self, robot_id: int, regions: tuple[RegionTask, ...]) -> CoveragePath:
+        if not regions:
+            return CoveragePath(
+                robot_id=robot_id,
+                waypoints=(),
+                metadata={"reason": "no region tasks available"},
+            )
+
+        remaining = list(regions)
+        origin = (0.0, 0.0)
+        ordered: list[RegionTask] = []
+        cursor = origin
+        while remaining:
+            remaining.sort(
+                key=lambda region: math.hypot(
+                    region.centroid[0] - cursor[0], region.centroid[1] - cursor[1]
+                )
+            )
+            next_region = remaining.pop(0)
+            ordered.append(next_region)
+            cursor = next_region.centroid
+
+        estimated_cost = 0.0
+        cursor = origin
+        for region in ordered:
+            estimated_cost += math.hypot(region.centroid[0] - cursor[0], region.centroid[1] - cursor[1])
+            cursor = region.centroid
+
+        return CoveragePath(
+            robot_id=robot_id,
+            waypoints=tuple(region.centroid for region in ordered),
+            region_ids=tuple(region.region_id for region in ordered),
+            estimated_cost=estimated_cost,
+            metadata={"ordering": "nearest_neighbor_from_origin"},
         )

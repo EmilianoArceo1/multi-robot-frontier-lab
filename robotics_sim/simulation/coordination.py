@@ -32,6 +32,12 @@ from robotics_sim.simulation.coordination_services import (
     RuntimeFrontierProvider,
     RuntimeTeamFrontierProvider,
 )
+from robotics_sim.simulation.runtime_services import (
+    RuntimeCollisionCheckingService,
+    RuntimeMapQueryService,
+    RuntimeMetricsService,
+    RuntimePathPlanningService,
+)
 from robotics_sim.simulation.plugin_loader import (
     PluginLoadError,
     list_coordination_plugin_names,
@@ -330,6 +336,15 @@ class MultiRobotCoordinator:
             metadata={"planner_name": planner_name},
         )
 
+        other_robot_disks_by_id = {
+            state.robot_id: (float(state.xy[0]), float(state.xy[1]), float(state.safety_radius))
+            for state in plugin_robot_states
+        }
+        other_routes_by_id = {
+            index: normalized_route_points[index] if index < len(normalized_route_points) else ()
+            for index in range(len(plugin_robot_states))
+        }
+
         services = CoordinationServices(
             frontier_provider=RuntimeFrontierProvider(
                 ipp_distance_penalty=float(ipp_distance_penalty),
@@ -343,6 +358,19 @@ class MultiRobotCoordinator:
                 target_exclusion_radius=float(target_exclusion_radius),
                 dynamic_obstacle_margin=float(dynamic_obstacle_margin),
             ),
+            path_planning_service=RuntimePathPlanningService(),
+            collision_checking_service=RuntimeCollisionCheckingService(
+                other_robot_disks_by_id=other_robot_disks_by_id,
+                other_routes_by_id=other_routes_by_id,
+                margin=float(dynamic_obstacle_margin),
+            ),
+            map_query_service=RuntimeMapQueryService(
+                explored_points=normalized_explored_points,
+                mapped_obstacle_points=normalized_obstacle_points,
+                bounds=normalized_bounds,
+                resolution=float(resolution),
+            ),
+            metrics_service=RuntimeMetricsService(),
         )
 
         shared: dict[str, Any] = {

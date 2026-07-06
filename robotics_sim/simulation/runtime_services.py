@@ -9,12 +9,15 @@ classes below through CoordinationServices.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from robotics_interfaces.observations import Point2D
+from robotics_interfaces.observations import Point2D, WorldBounds
 from robotics_interfaces.results import (
     CollisionCheckResult,
+    MapQuerySnapshot,
+    MetricsEvent,
     PathPlanningRequest,
     PathPlanningResponse,
 )
@@ -83,8 +86,75 @@ class RuntimeCollisionCheckingService:
             other_routes=other_routes,
             margin=self.margin,
         )
+
+        conflict_robot_id = None
+        if not result.is_valid and result.reason_code == "route_conflict_with_robot_safety_zone":
+            conflict_robot_id = self._find_conflicting_robot_id(start, waypoints, safety_radius, robot_id)
+
         return CollisionCheckResult(
             is_safe=result.is_valid,
             reason_code=result.reason_code,
             detail=result.detail,
+            conflict_robot_id=conflict_robot_id,
+        )
+
+    def _find_conflicting_robot_id(
+        self,
+        start: Point2D,
+        waypoints: Sequence[Point2D],
+        safety_radius: float,
+        robot_id: int,
+    ) -> int | None:
+        """Best-effort: identify which single teammate disk the corridor
+        crosses, by re-checking one disk at a time. validate_multi_robot_corridor
+        only reports a reason code, not which teammate triggered it."""
+        for other_id, disk in self.other_robot_disks_by_id.items():
+            if other_id == robot_id:
+                continue
+            single = validate_multi_robot_corridor(
+                start=start,
+                waypoints=waypoints,
+                ego_safety_radius=safety_radius,
+                other_robot_disks=[disk],
+                margin=self.margin,
+            )
+            if not single.is_valid and single.reason_code == "route_conflict_with_robot_safety_zone":
+                return other_id
+        return None
+
+
+@dataclass(frozen=True)
+class RuntimeMapQueryService:
+    """MapQueryService backed by a snapshot captured when the coordination
+    request was built. This is read-only and does not re-query the live
+    engine, so it reflects the map as of that request, not "right now"."""
+
+    explored_points: tuple[Point2D, ...] = ()
+    mapped_obstacle_points: tuple[Point2D, ...] = ()
+    bounds: WorldBounds | None = None
+    resolution: float = 0.5
+
+    def map_snapshot(self) -> MapQuerySnapshot:
+        return MapQuerySnapshot(
+            explored_points=self.explored_points,
+            mapped_obstacle_points=self.mapped_obstacle_points,
+            bounds=self.bounds,
+            resolution=self.resolution,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeMetricsService:
+    """Minimal MetricsService: records events through the stdlib logger.
+
+    This is deliberately the simplest safe implementation -- it never raises
+    and never blocks -- rather than wiring a real dashboard/metrics store
+    before any algorithm actually needs one.
+    """
+
+    logger_name: str = "robotics_sim.runtime_metrics"
+
+    def record_event(self, event: MetricsEvent) -> None:
+        logging.getLogger(self.logger_name).debug(
+            "metrics event: name=%s data=%s", event.name, dict(event.data)
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from algorithms.mmpf_explore.plugin import MMPF_COORDINATOR
 from robotics_interfaces.plugins import PluginCapability
 from robotics_interfaces.results import PathPlanningRequest
 from robotics_interfaces.services import (
@@ -10,10 +11,37 @@ from robotics_interfaces.services import (
     PathPlanningService,
     TeamFrontierProvider,
 )
+from robotics_sim.simulation.coordination import MultiRobotCoordinator, RobotCoordinationState
 from robotics_sim.simulation.runtime_services import (
     RuntimeCollisionCheckingService,
+    RuntimeMapQueryService,
+    RuntimeMetricsService,
     RuntimePathPlanningService,
 )
+
+
+def _build_request(coordinator: MultiRobotCoordinator):
+    return coordinator._build_plugin_request(
+        planner_name="test planner",
+        robot_states=[
+            RobotCoordinationState(xy=(0.0, 0.0), safety_radius=0.35, sensor_range=2.5, vision_model="LiDAR"),
+            RobotCoordinationState(xy=(2.0, 0.0), safety_radius=0.35, sensor_range=2.5, vision_model="LiDAR"),
+        ],
+        existing_targets=[None, None],
+        robots_to_assign=[0, 1],
+        invalidated_targets_by_robot=[[], []],
+        explored_points=[(0.0, 0.0)],
+        mapped_obstacle_points=[],
+        bounds=(-5.0, 5.0, -5.0, 5.0),
+        resolution=0.5,
+        final_goal_xy=(5.0, 5.0),
+        ipp_distance_penalty=0.5,
+        target_exclusion_radius=1.5,
+        dynamic_obstacle_margin=0.25,
+        route_points_by_robot=[[], []],
+        explored_points_by_robot=[[], []],
+        goal_tolerance=0.25,
+    )
 
 
 def test_runtime_services_are_interface_protocols():
@@ -102,3 +130,52 @@ def test_collision_service_accepts_path_without_conflict():
     result = service.is_path_safe([(0.0, 0.0), (4.0, 0.0)], robot_id=0, safety_radius=0.35)
 
     assert result.is_safe is True
+
+
+def test_coordination_request_receives_path_planning_service():
+    coordinator = MultiRobotCoordinator(strategy=MMPF_COORDINATOR)
+    request = _build_request(coordinator)
+
+    service = request.services.path_planning_service
+    assert isinstance(service, RuntimePathPlanningService)
+
+    response = service.plan_path(
+        PathPlanningRequest(
+            start=(0.0, 0.0),
+            goal=(4.0, 0.0),
+            robot_radius=0.35,
+            bounds=(-5.0, 5.0, -5.0, 5.0),
+            resolution=0.5,
+            planner_type="Direct",
+        )
+    )
+    assert response.success is True
+    assert response.waypoints == ((4.0, 0.0),)
+
+
+def test_coordination_request_receives_collision_checking_service():
+    coordinator = MultiRobotCoordinator(strategy=MMPF_COORDINATOR)
+    request = _build_request(coordinator)
+
+    service = request.services.collision_checking_service
+    assert isinstance(service, RuntimeCollisionCheckingService)
+
+    # Robot 1 sits at (2.0, 0.0); robot 0's straight corridor to (4.0, 0.0)
+    # must cross robot 1's safety zone.
+    result = service.is_path_safe([(0.0, 0.0), (4.0, 0.0)], robot_id=0, safety_radius=0.35)
+
+    assert result.is_safe is False
+    assert result.reason_code == "route_conflict_with_robot_safety_zone"
+    assert result.conflict_robot_id == 1
+
+
+def test_coordination_request_receives_map_query_and_metrics_services():
+    coordinator = MultiRobotCoordinator(strategy=MMPF_COORDINATOR)
+    request = _build_request(coordinator)
+
+    assert isinstance(request.services.map_query_service, RuntimeMapQueryService)
+    assert isinstance(request.services.metrics_service, RuntimeMetricsService)
+
+    snapshot = request.services.map_query_service.map_snapshot()
+    assert snapshot.bounds == (-5.0, 5.0, -5.0, 5.0)
+    assert snapshot.resolution == 0.5

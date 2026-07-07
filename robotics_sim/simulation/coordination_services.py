@@ -16,7 +16,10 @@ from typing import Mapping, Sequence
 from robotics_interfaces.coordination import CoordinationRequest
 from robotics_interfaces.observations import RobotCoordinationState, WorldSnapshot
 from robotics_interfaces.proposals import ExplorationCandidate
-from robotics_sim.planning.coordinated_frontier_planner import assign_frontier_viewpoints
+from robotics_sim.planning.coordinated_frontier_planner import (
+    assign_frontier_viewpoints,
+    detect_global_frontier_candidates,
+)
 
 Point2D = tuple[float, float]
 
@@ -42,105 +45,118 @@ class RuntimeTeamFrontierProvider:
         if world is None or world.bounds is None or not request.robot_states:
             return {}
 
-        index_by_robot_id = {
-            int(robot.robot_id): index
-            for index, robot in enumerate(request.robot_states)
-        }
         robot_ids_to_assign = (
             tuple(int(robot_id) for robot_id in request.robots_to_assign)
             if request.robots_to_assign
             else tuple(int(robot.robot_id) for robot in request.robot_states if robot.is_active)
         )
-        planner_indices = tuple(
-            index_by_robot_id[robot_id]
-            for robot_id in robot_ids_to_assign
-            if robot_id in index_by_robot_id
-        )
-        if not planner_indices:
+        if not robot_ids_to_assign:
             return {}
 
-        existing_targets = tuple(
-            _normalize_point(request.existing_targets_by_robot.get(robot.robot_id))
+        active_assignable_robot_ids = {
+            int(robot.robot_id)
             for robot in request.robot_states
-        )
-        invalidated_targets = tuple(
-            tuple(_valid_points(request.blocked_targets_by_robot.get(robot.robot_id, ())))
-            for robot in request.robot_states
-        )
-        route_points_by_robot = _align_routes(
-            request.route_points_by_robot,
-            count=len(request.robot_states),
-        )
-        explored_by_robot = _explored_points_by_robot(request)
+            if int(robot.robot_id) in robot_ids_to_assign and robot.is_active
+        }
+        if not active_assignable_robot_ids:
+            return {}
 
-        result = assign_frontier_viewpoints(
-            robot_states=request.robot_states,
-            existing_targets=existing_targets,
-            robots_to_assign=planner_indices,
-            invalidated_targets_by_robot=invalidated_targets,
+        max_robot_radius = max(
+            (float(robot.safety_radius) for robot in request.robot_states),
+            default=0.0,
+        )
+        avg_sensor_range = (
+            sum(float(robot.sensor_range) for robot in request.robot_states)
+            / max(len(request.robot_states), 1)
+        )
+
+        global_candidates = detect_global_frontier_candidates(
             explored_points=tuple(_valid_points(world.explored_points)),
             mapped_obstacle_points=tuple(_valid_points(world.mapped_obstacle_points)),
             bounds=tuple(float(value) for value in world.bounds),
             resolution=float(world.resolution),
-            final_goal_xy=_normalize_point(world.final_goal_xy) or (0.0, 0.0),
-            ipp_distance_penalty=float(self.ipp_distance_penalty),
-            target_exclusion_radius=float(self.target_exclusion_radius),
-            dynamic_obstacle_margin=float(self.dynamic_obstacle_margin),
-            route_points_by_robot=route_points_by_robot,
-            explored_points_by_robot=explored_by_robot,
+            robot_radius=max_robot_radius,
+            sensor_range=avg_sensor_range,
         )
 
         candidates_by_robot: dict[int, tuple[ExplorationCandidate, ...]] = {}
+
         for robot in request.robot_states:
             robot_id = int(robot.robot_id)
-            index = index_by_robot_id[robot_id]
-            target = (
-                _normalize_point(result.targets[index])
-                if index < len(getattr(result, "targets", ()))
-                else None
-            )
-            if target is None:
-                candidates_by_robot[robot_id] = ()
+            if robot_id not in active_assignable_robot_ids:
                 continue
 
-            assignment = None
-            assignments = getattr(result, "assignments", ())
-            if index < len(assignments):
-                assignment = assignments[index]
-
-            reason = "runtime team frontier provider"
-            information_gain = 1.0
-            travel_cost = 0.0
-            overlap_cost = 0.0
-            score = None
-
-            if assignment is not None:
-                reason = str(getattr(assignment, "reason", reason))
-                information_gain = float(getattr(assignment, "information_gain", information_gain))
-                distance = float(getattr(assignment, "distance", 0.0))
-                travel_cost = float(self.ipp_distance_penalty) * distance
-                overlap_cost = float(getattr(assignment, "route_overlap_ratio", 0.0))
-                score = getattr(assignment, "score", None)
-
-            metadata = {
-                "robot_id": robot_id,
-                "provider": type(self).__name__,
-                "reason": reason,
-                "team_synchronized": True,
-            }
-            if isinstance(score, (int, float)):
-                metadata["score"] = float(score)
-
-            candidates_by_robot[robot_id] = (
-                ExplorationCandidate(
-                    target=target,
-                    source="runtime_team_frontier_provider",
-                    information_gain=information_gain,
-                    travel_cost=travel_cost,
-                    overlap_cost=overlap_cost,
-                    metadata=metadata,
-                ),
+            blocked_targets = tuple(
+                _valid_points(request.blocked_targets_by_robot.get(robot_id, ()))
             )
+
+            existing_targets = tuple(
+                point
+                for other_id, target in request.existing_targets_by_robot.items()
+                if int(other_id) != robot_id
+                if (point := _normalize_point(target)) is not None
+            )
+
+            robot_candidates: list[ExplorationCandidate] = []
+
+            for candidate in global_candidates:
+                target = _normalize_point(candidate.target)
+                if target is None:
+                    continue
+
+                distance = _distance(robot.xy, target)
+                blocked = _point_near_any(
+                    target,
+                    blocked_targets,
+                    self.target_exclusion_radius,
+                )
+                reserved = _point_near_any(
+                    target,
+                    existing_targets,
+                    self.target_exclusion_radius,
+                )
+
+                safety_cost = 0.0
+                if blocked:
+                    safety_cost += 2.0
+                if reserved:
+                    safety_cost += 8.0
+
+                metadata = {
+                    "robot_id": robot_id,
+                    "provider": type(self).__name__,
+                    "reason": str(
+                        getattr(candidate, "reason", "runtime team frontier candidate")
+                    ),
+                    "team_synchronized": True,
+                    "distance": distance,
+                    "frontier_size": int(getattr(candidate, "size", 0)),
+                    "raw_score": float(getattr(candidate, "score", 0.0)),
+                    "blocked_by_robot_blacklist": blocked,
+                    "reserved_by_existing_target": reserved,
+                }
+
+                robot_candidates.append(
+                    ExplorationCandidate(
+                        target=target,
+                        source="runtime_team_frontier_provider",
+                        information_gain=float(getattr(candidate, "information_gain", 0.0)),
+                        travel_cost=float(self.ipp_distance_penalty) * distance,
+                        safety_cost=safety_cost,
+                        metadata=metadata,
+                    )
+                )
+
+            robot_candidates.sort(
+                key=lambda item: (
+                    item.utility,
+                    item.information_gain,
+                    -float(item.metadata.get("distance", 0.0)),
+                ),
+                reverse=True,
+            )
+
+            candidates_by_robot[robot_id] = tuple(robot_candidates)
 
         return candidates_by_robot
 
@@ -244,6 +260,19 @@ class RuntimeFrontierProvider:
             return tuple(_valid_points(self.explored_points_by_robot[int(robot_id)]))
         return ()
 
+def _distance(a: Point2D, b: Point2D) -> float:
+    dx = float(a[0]) - float(b[0])
+    dy = float(a[1]) - float(b[1])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _point_near_any(
+    point: Point2D,
+    others: Sequence[Point2D],
+    radius: float,
+) -> bool:
+    radius = max(float(radius), 0.0)
+    return any(_distance(point, other) <= radius for other in others)
 
 def _explored_points_by_robot(
     request: CoordinationRequest,

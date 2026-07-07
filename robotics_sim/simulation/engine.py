@@ -1696,10 +1696,13 @@ class SimulationControllerMixin:
             else:
                 self.robot.goal = np.array(hold_xy, dtype=float)
 
-            # Keep agent in sync: no path, no stale goal.
+            # Keep agent in sync: no path, no stale goal, and no stale
+            # exploration target -- otherwise desired_target_from_mode()
+            # keeps returning the target that just failed to plan, and the
+            # agent immediately re-requests a plan for it next tick.
             agent = self.runtime_agent(None)
             if agent is not None:
-                agent.invalidate_route(reason=f"planner failed: {reason}")
+                agent.invalidate_failed_exploration_route(reason=f"planner failed: {reason}")
 
             self.current_exploration_target = None
             self.canvas.set_exploration_target(None)

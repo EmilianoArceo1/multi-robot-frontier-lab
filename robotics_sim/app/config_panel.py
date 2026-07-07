@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QRectF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -23,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QScrollArea,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -36,6 +40,45 @@ from robotics_sim.app.widgets import (
     ToggleSwitch,
     make_icon,
 )
+
+
+class BrushSizePreview(QWidget):
+    """Small visual brush-size selector preview used by the map editor panel."""
+
+    def __init__(self, brush_size: float = 0.2):
+        super().__init__()
+        self.brush_size = float(brush_size)
+        self.setMinimumHeight(46)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_brush_size(self, brush_size: float) -> None:
+        self.brush_size = max(0.05, float(brush_size))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        painter.setPen(QPen(QColor(BORDER), 1.0))
+        painter.setBrush(QBrush(QColor("#FFFFFF")))
+        painter.drawRoundedRect(rect, 8.0, 8.0)
+
+        center_x = rect.left() + 32.0
+        center_y = rect.center().y()
+        radius = max(4.0, min(19.0, 4.0 + self.brush_size * 8.0))
+
+        painter.setPen(QPen(QColor(MAROON), 1.6))
+        painter.setBrush(QBrush(QColor(122, 0, 25, 48)))
+        painter.drawEllipse(QRectF(center_x - radius, center_y - radius, radius * 2.0, radius * 2.0))
+
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        painter.setPen(QColor(TEXT))
+        painter.drawText(
+            QRectF(center_x + 30.0, rect.top(), rect.width() - 68.0, rect.height()),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            f"Brush {self.brush_size:.2f} m",
+        )
 
 
 def labeled_toggle(label: str, switch: ToggleSwitch):
@@ -224,17 +267,17 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_combo("Path Planner Service", window.planner_combo),
-        2,
+        3,
         0,
     )
     options_grid.addWidget(
         labeled_combo("Motion/Control Service", window.control_combo),
-        2,
+        3,
         1,
     )
     options_grid.addWidget(
         labeled_combo("Vision Model", window.vision_combo),
-        3,
+        4,
         0,
         1,
         2,
@@ -245,7 +288,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        4,
+        5,
         0,
         1,
         2,
@@ -257,7 +300,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        5,
+        6,
         0,
         1,
         2,
@@ -269,7 +312,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        6,
+        7,
         0,
         1,
         2,
@@ -285,7 +328,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        7,
+        8,
         0,
         1,
         2,
@@ -683,6 +726,8 @@ def build_config_panel(window):
 
     window.preview_switch.toggled.connect(window.update_preview)
     window.state_switch.toggled.connect(window.update_preview)
+    # Editor controls are created in build_editor_panel(). Do not create the
+    # editor tool combo here; doing so would leave the editor with wrong options.
     window.planner_combo.currentTextChanged.connect(window.update_preview)
     window.path_simplifier_combo.currentTextChanged.connect(window.update_preview)
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
@@ -771,4 +816,283 @@ def build_config_panel(window):
 
     return panel
 
+
+def build_editor_panel(window):
+    panel = QFrame()
+    panel.setObjectName("sidePanel")
+    panel.setFixedWidth(SIDE_PANEL_WIDTH)
+
+    layout = QVBoxLayout(panel)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    layout.addWidget(HeroHeader(find_tamu_image()))
+
+    scroll = QScrollArea()
+    scroll.setObjectName("configScroll")
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    scroll.setFrameShape(QFrame.NoFrame)
+
+    content = QWidget()
+    content.setObjectName("scrollContent")
+    content_layout = QVBoxLayout(content)
+    content_layout.setContentsMargins(9, 9, 9, 9)
+    content_layout.setSpacing(9)
+
+    # --------------------------------------------------------
+    # Editor tools
+    # --------------------------------------------------------
+    editor_card = SectionCard("editor", "Map Editor")
+    editor_grid = QGridLayout()
+    editor_grid.setHorizontalSpacing(8)
+    editor_grid.setVerticalSpacing(7)
+
+    window.editor_status_label = QLabel("Editor disabled")
+    window.editor_status_label.setObjectName("fieldLabel")
+    window.editor_status_label.setWordWrap(True)
+    window.editor_status_label.setStyleSheet("font-size: 11px; color: #4B5563; line-height: 1.35;")
+
+    window.editor_tool_combo = QComboBox()
+    window.editor_tool_combo.addItems(["Rectangles", "Squares", "Free draw", "Erase", "Camera view"])
+    window.editor_tool_combo.setCurrentText("Rectangles")
+    window.editor_tool_combo.currentTextChanged.connect(window.set_editor_tool)
+
+    mode_button_row = QHBoxLayout()
+    mode_button_row.setSpacing(6)
+    window.editor_mode_button_group = QButtonGroup(window)
+    window.editor_mode_button_group.setExclusive(True)
+    for mode_name, label, icon_name in (
+        ("paint", "Edit objects", "gear"),
+        ("move", "Pan / Zoom map", "maximize"),
+    ):
+        button = QPushButton(label)
+        button.setObjectName("secondaryButton")
+        button.setCheckable(True)
+        button.setIcon(make_icon(icon_name, TEXT))
+        button.setIconSize(QSize(16, 16))
+        button.clicked.connect(lambda checked=False, name=mode_name: window.set_editor_interaction_mode(name))
+        window.editor_mode_button_group.addButton(button)
+        mode_button_row.addWidget(button)
+        setattr(window, f"editor_{mode_name}_button", button)
+
+    tool_button_row = QHBoxLayout()
+    tool_button_row.setSpacing(6)
+    window.editor_tool_button_group = QButtonGroup(window)
+    window.editor_tool_button_group.setExclusive(True)
+    for tool_name, label, icon_name in (
+        ("rectangles", "Rect", "maximize"),
+        ("squares", "Square", "maximize"),
+        ("free", "Free", "gear"),
+        ("erase", "Erase", "reset"),
+        ("camera", "Viewport", "console"),
+    ):
+        button = QPushButton(label)
+        button.setObjectName("secondaryButton")
+        button.setCheckable(True)
+        button.setIcon(make_icon(icon_name, TEXT))
+        button.setIconSize(QSize(16, 16))
+        button.clicked.connect(lambda checked=False, name=tool_name: window.set_editor_tool(name))
+        window.editor_tool_button_group.addButton(button)
+        tool_button_row.addWidget(button)
+        setattr(window, f"editor_{tool_name}_button", button)
+
+    window.editor_brush_size_preview = BrushSizePreview(getattr(window, "editor_brush_size", 0.2))
+    window.editor_brush_size_value_label = QLabel(f"{getattr(window, 'editor_brush_size', 0.2):.2f} m")
+    window.editor_brush_size_value_label.setObjectName("fieldLabel")
+    window.editor_brush_size_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+    window.editor_brush_size_slider = QSlider(Qt.Horizontal)
+    window.editor_brush_size_slider.setMinimum(5)
+    window.editor_brush_size_slider.setMaximum(200)
+    window.editor_brush_size_slider.setSingleStep(5)
+    window.editor_brush_size_slider.setPageStep(20)
+    window.editor_brush_size_slider.setValue(int(round(getattr(window, "editor_brush_size", 0.2) * 100.0)))
+    window.editor_brush_size_slider.valueChanged.connect(window.set_editor_brush_size_from_slider)
+
+    # Compatibility name used by MainWindow.refresh_editor_tool_buttons().
+    window.editor_brush_size_input = window.editor_brush_size_slider
+
+    brush_size_row = QVBoxLayout()
+    brush_size_row.setSpacing(5)
+    brush_header = QHBoxLayout()
+    brush_header.setSpacing(6)
+    brush_size_label = QLabel("Free-draw brush")
+    brush_size_label.setObjectName("fieldLabel")
+    brush_header.addWidget(brush_size_label)
+    brush_header.addWidget(window.editor_brush_size_value_label)
+    brush_size_row.addLayout(brush_header)
+    brush_size_row.addWidget(window.editor_brush_size_preview)
+    brush_size_row.addWidget(window.editor_brush_size_slider)
+
+    editor_hint = QLabel(
+        "Edit objects and Pan/Zoom are exclusive modes. Click any obstacle/object and drag it directly. "
+        "Free draw uses circular stamps and renders connected stamps as one smooth object. "
+        "Shortcuts: Ctrl+Z undo, Ctrl+Alt+Z redo."
+    )
+    editor_hint.setObjectName("fieldLabel")
+    editor_hint.setWordWrap(True)
+
+    interaction_label = QLabel("Interaction mode")
+    interaction_label.setObjectName("subsectionLabel")
+    tools_label = QLabel("Object tool")
+    tools_label.setObjectName("subsectionLabel")
+
+    editor_grid.addWidget(window.editor_status_label, 0, 0, 1, 2)
+    editor_grid.addWidget(interaction_label, 1, 0, 1, 2)
+    editor_grid.addLayout(mode_button_row, 2, 0, 1, 2)
+    editor_grid.addWidget(tools_label, 3, 0, 1, 2)
+    editor_grid.addWidget(labeled_combo("Tool", window.editor_tool_combo), 4, 0, 1, 2)
+    editor_grid.addLayout(tool_button_row, 5, 0, 1, 2)
+    editor_grid.addLayout(brush_size_row, 6, 0, 1, 2)
+    editor_grid.addWidget(editor_hint, 7, 0, 1, 2)
+    editor_grid.setColumnStretch(0, 1)
+    editor_grid.setColumnStretch(1, 1)
+    editor_card.root.addLayout(editor_grid)
+    content_layout.addWidget(editor_card)
+
+    # --------------------------------------------------------
+    # Simulation camera / viewport
+    # --------------------------------------------------------
+    camera_card = SectionCard("camera", "Simulation Camera")
+    camera_grid = QGridLayout()
+    camera_grid.setHorizontalSpacing(8)
+    camera_grid.setVerticalSpacing(7)
+
+    window.editor_camera_x_input = NumericStepper(
+        "Center X",
+        getattr(window.config, "camera_center_x", 0.0),
+        -100.0,
+        100.0,
+        0.25,
+    )
+    window.editor_camera_y_input = NumericStepper(
+        "Center Y",
+        getattr(window.config, "camera_center_y", 0.0),
+        -100.0,
+        100.0,
+        0.25,
+    )
+    window.editor_camera_width_input = NumericStepper(
+        "Width (m)",
+        getattr(window.config, "camera_width", WORLD_X_MAX - WORLD_X_MIN),
+        1.0,
+        80.0,
+        0.5,
+    )
+    window.editor_camera_height_input = NumericStepper(
+        "Height (m)",
+        getattr(window.config, "camera_height", WORLD_Y_MAX - WORLD_Y_MIN),
+        1.0,
+        80.0,
+        0.5,
+    )
+
+    for widget in (
+        window.editor_camera_x_input,
+        window.editor_camera_y_input,
+        window.editor_camera_width_input,
+        window.editor_camera_height_input,
+    ):
+        widget.valueChanged.connect(window.sync_editor_camera_from_panel)
+
+    window.editor_camera_reset_button = QPushButton("Reset to full world")
+    window.editor_camera_reset_button.setIcon(make_icon("reset", TEXT))
+    window.editor_camera_reset_button.setIconSize(QSize(16, 16))
+    window.editor_camera_reset_button.setObjectName("secondaryButton")
+    window.editor_camera_reset_button.clicked.connect(window.reset_editor_camera)
+
+    window.editor_camera_fit_button = QPushButton("Fit camera to obstacles")
+    window.editor_camera_fit_button.setIcon(make_icon("maximize", TEXT))
+    window.editor_camera_fit_button.setIconSize(QSize(16, 16))
+    window.editor_camera_fit_button.setObjectName("secondaryButton")
+    window.editor_camera_fit_button.clicked.connect(window.fit_editor_camera_to_obstacles)
+
+    camera_hint = QLabel(
+        "Drag the red border on the map or type exact numbers here. This viewport is saved with the .sim file."
+    )
+    camera_hint.setObjectName("fieldLabel")
+    camera_hint.setWordWrap(True)
+
+    camera_grid.addWidget(window.editor_camera_x_input, 0, 0)
+    camera_grid.addWidget(window.editor_camera_y_input, 0, 1)
+    camera_grid.addWidget(window.editor_camera_width_input, 1, 0)
+    camera_grid.addWidget(window.editor_camera_height_input, 1, 1)
+    camera_grid.addWidget(window.editor_camera_reset_button, 2, 0)
+    camera_grid.addWidget(window.editor_camera_fit_button, 2, 1)
+    camera_grid.addWidget(camera_hint, 3, 0, 1, 2)
+    camera_grid.setColumnStretch(0, 1)
+    camera_grid.setColumnStretch(1, 1)
+    camera_card.root.addLayout(camera_grid)
+    content_layout.addWidget(camera_card)
+
+    # --------------------------------------------------------
+    # Map actions
+    # --------------------------------------------------------
+    actions_card = SectionCard("map_actions", "Map Actions")
+    actions_grid = QGridLayout()
+    actions_grid.setHorizontalSpacing(8)
+    actions_grid.setVerticalSpacing(7)
+
+    window.editor_new_map_button = QPushButton("New blank map")
+    window.editor_new_map_button.setIcon(make_icon("reset", TEXT))
+    window.editor_new_map_button.setIconSize(QSize(16, 16))
+    window.editor_new_map_button.setObjectName("secondaryButton")
+    window.editor_new_map_button.clicked.connect(window.new_editor_map)
+
+    window.editor_clear_button = QPushButton("Clear obstacles")
+    window.editor_clear_button.setIcon(make_icon("reset", TEXT))
+    window.editor_clear_button.setIconSize(QSize(16, 16))
+    window.editor_clear_button.setObjectName("secondaryButton")
+    window.editor_clear_button.clicked.connect(window.clear_editor_map)
+
+    window.editor_undo_button = QPushButton("Undo  Ctrl+Z")
+    window.editor_undo_button.setIcon(make_icon("reset", TEXT))
+    window.editor_undo_button.setIconSize(QSize(16, 16))
+    window.editor_undo_button.setObjectName("secondaryButton")
+    window.editor_undo_button.clicked.connect(window.undo_editor_change)
+
+    window.editor_redo_button = QPushButton("Redo  Ctrl+Alt+Z")
+    window.editor_redo_button.setIcon(make_icon("reset", TEXT))
+    window.editor_redo_button.setIconSize(QSize(16, 16))
+    window.editor_redo_button.setObjectName("secondaryButton")
+    window.editor_redo_button.clicked.connect(window.redo_editor_change)
+
+    window.editor_commit_button = QPushButton("Accept map")
+    window.editor_commit_button.setIcon(make_icon("save", "white"))
+    window.editor_commit_button.setIconSize(QSize(18, 18))
+    window.editor_commit_button.setObjectName("startButton")
+    window.editor_commit_button.clicked.connect(window.commit_editor_map)
+
+    actions_grid.addWidget(window.editor_undo_button, 0, 0)
+    actions_grid.addWidget(window.editor_redo_button, 0, 1)
+    actions_grid.addWidget(window.editor_new_map_button, 1, 0)
+    actions_grid.addWidget(window.editor_clear_button, 1, 1)
+    actions_grid.addWidget(window.editor_commit_button, 2, 0, 1, 2)
+    actions_grid.setColumnStretch(0, 1)
+    actions_grid.setColumnStretch(1, 1)
+    actions_card.root.addLayout(actions_grid)
+    content_layout.addWidget(actions_card)
+
+    content_layout.addStretch()
+    scroll.setWidget(content)
+    layout.addWidget(scroll, 1)
+
+    bottom_actions = QFrame()
+    bottom_actions.setObjectName("actionPanelBottom")
+    actions_layout = QVBoxLayout(bottom_actions)
+    actions_layout.setContentsMargins(12, 12, 12, 12)
+    actions_layout.setSpacing(8)
+
+    window.editor_back_button = QPushButton("Back to Simulation")
+    window.editor_back_button.setIcon(make_icon("play", TEXT))
+    window.editor_back_button.setIconSize(QSize(16, 16))
+    window.editor_back_button.setObjectName("secondaryButton")
+    window.editor_back_button.clicked.connect(lambda: window.set_editor_mode(False))
+    actions_layout.addWidget(window.editor_back_button)
+    layout.addWidget(bottom_actions)
+
+    window.refresh_editor_tool_buttons()
+    return panel
 

@@ -43,6 +43,16 @@ from robotics_sim.app.widgets import (
 )
 from robotics_sim.app.simulation_canvas import SimulationCanvas
 from robotics_sim.app.config_panel import build_config_panel as build_right_config_panel
+from robotics_sim.app.map_editor import (
+    MIN_EDITOR_OBSTACLE_SIZE,
+    create_free_draw_obstacles_from_path,
+    create_rect_obstacle_from_drag,
+    merge_obstacles,
+    move_obstacle_to,
+    move_obstacles_by,
+    normalize_obstacles,
+    remove_obstacle_at,
+)
 from robotics_sim.simulation.coordination import runtime_profile_for_strategy
 from robotics_sim.simulation.gui_policy import compute_gui_control_policy
 from robotics_sim.simulation.navigation_modes import is_exploration_planner
@@ -72,6 +82,18 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.robot_agents = self.runtime_robot_registry.agents
         self.running = False
         self.paused = False
+        self.editor_mode = False
+        self.editor_tool = "rectangles"
+        self.editor_interaction_mode = "paint"
+        self.editor_brush_size = 0.2
+        self.editor_pan_zoom_label = None
+        self.editor_pending_draw_points: list[tuple[float, float]] = []
+        self.editor_undo_stack: list[tuple[tuple[tuple[float, float, float, float], ...], tuple[float, float, float, float]]] = []
+        self.editor_redo_stack: list[tuple[tuple[tuple[float, float, float, float], ...], tuple[float, float, float, float]]] = []
+        self.editor_history_limit = 100
+        self.editor_panel = None
+        self.simulation_panel = None
+        self.side_panel_container = None
 
         # Simulation clock and speed multiplier. The GUI still targets 60 FPS;
         # this multiplier changes simulated dt, not the QTimer interval.
@@ -202,25 +224,91 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         body_layout.setSpacing(14)
 
         self.canvas = SimulationCanvas()
+        self.canvas.set_editor_brush_size(self.editor_brush_size)
         self.canvas.goalClicked.connect(self.set_goal_from_canvas)
         self.canvas.robotDragged.connect(self.move_robot_from_canvas)
         self.canvas.robotSelected.connect(self.select_robot_panel)
+        self.canvas.editor_interaction_started.connect(self.on_editor_interaction_started)
+        self.canvas.editor_interaction_progress.connect(self.on_editor_interaction_progress)
+        self.canvas.editor_interaction_finished.connect(self.on_editor_interaction_finished)
+        self.canvas.editor_camera_changed.connect(self.on_editor_camera_changed)
+        self.canvas.editor_camera_interaction_started.connect(self.push_editor_undo_state)
+        self.canvas.editor_obstacle_move_started.connect(self.push_editor_undo_state)
+        self.canvas.editor_obstacle_moved.connect(self.on_editor_obstacle_moved)
+        self.canvas.editor_view_changed.connect(self.refresh_editor_status_label)
 
-        panel = self.build_config_panel()
+        self.simulation_panel = self.build_config_panel()
+        self.editor_panel = self.build_editor_panel()
+        self.side_panel_container = QWidget()
+        self.side_panel_container.setObjectName("sidePanelContainer")
+        self.side_panel_container_layout = QVBoxLayout(self.side_panel_container)
+        self.side_panel_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.side_panel_container_layout.setSpacing(0)
+        self.side_panel_container_layout.addWidget(self.simulation_panel)
+        self.side_panel_container_layout.addWidget(self.editor_panel)
+        self.switch_panel_to_simulation()
 
         body_layout.addWidget(self.canvas, 1)
-        body_layout.addWidget(panel, 0)
+        body_layout.addWidget(self.side_panel_container, 0)
 
         outer.addWidget(body, 1)
 
     def build_config_panel(self):
-        """Build the right-side configuration panel.
-
-        The actual panel construction lives in robotics_sim.app.config_panel so
-        MainWindow stays focused on the top-level app window and Qt signal
-        wiring.
-        """
+        """Build the right-side simulation configuration panel."""
         return build_right_config_panel(self)
+
+    def build_editor_panel(self):
+        from robotics_sim.app.config_panel import build_editor_panel
+        return build_editor_panel(self)
+
+    def read_config(self) -> SimulationConfig:
+        """Read GUI configuration and preserve editor camera settings."""
+        config = super().read_config()
+        if hasattr(self, "editor_camera_x_input"):
+            config.camera_center_x = float(self.editor_camera_x_input.value())
+            config.camera_center_y = float(self.editor_camera_y_input.value())
+            config.camera_width = max(1.0, float(self.editor_camera_width_input.value()))
+            config.camera_height = max(1.0, float(self.editor_camera_height_input.value()))
+        else:
+            config.camera_center_x = float(getattr(self.config, "camera_center_x", config.camera_center_x))
+            config.camera_center_y = float(getattr(self.config, "camera_center_y", config.camera_center_y))
+            config.camera_width = max(1.0, float(getattr(self.config, "camera_width", config.camera_width)))
+            config.camera_height = max(1.0, float(getattr(self.config, "camera_height", config.camera_height)))
+        return config
+
+    def apply_config_to_widgets(self, config: SimulationConfig) -> None:
+        """Apply loaded config, including the editor/simulation camera."""
+        super().apply_config_to_widgets(config)
+        if hasattr(self, "editor_camera_x_input"):
+            self.set_editor_camera_controls(
+                config.camera_center_x,
+                config.camera_center_y,
+                config.camera_width,
+                config.camera_height,
+                emit_preview=False,
+            )
+            self.config = self.read_config()
+            self.canvas.set_preview_config(self.config)
+            self.refresh_editor_status_label()
+
+    def switch_panel_to_editor(self) -> None:
+        if self.simulation_panel is not None:
+            self.simulation_panel.setVisible(False)
+        if self.editor_panel is not None:
+            self.editor_panel.setVisible(True)
+            self.editor_panel.setEnabled(True)
+        self.refresh_editor_status_label()
+
+    def switch_panel_to_simulation(self) -> None:
+        if self.editor_panel is not None:
+            self.editor_panel.setVisible(False)
+            self.editor_panel.setEnabled(False)
+        if self.simulation_panel is not None:
+            self.simulation_panel.setVisible(True)
+            self.simulation_panel.setEnabled(True)
+
+    def toggle_editor_mode_from_button(self) -> None:
+        self.set_editor_mode(not self.editor_mode)
 
     def ensure_multi_robot_configs(self) -> None:
         """Keep the editable multi-robot list consistent with the robot count."""
@@ -571,10 +659,434 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         """
         widgets = getattr(self, "locked_during_run_widgets", [])
         for widget in widgets:
-            widget.setEnabled(not locked)
+            widget.setEnabled(not locked and not self.editor_mode)
+
+        if hasattr(self, "editor_tool_combo"):
+            self.editor_tool_combo.setEnabled(not locked and self.editor_mode)
+        if hasattr(self.top_bar, "editor_button"):
+            self.top_bar.editor_button.setEnabled(True)
 
         # Keep visibility rules active even while the controls are disabled.
         self.update_relevant_parameter_visibility()
+
+    def set_editor_mode(self, enabled: bool) -> None:
+        self.editor_mode = bool(enabled)
+        self.canvas.set_editor_mode(self.editor_mode)
+        if self.editor_mode:
+            self.switch_panel_to_editor()
+            if hasattr(self, "editor_tool_combo"):
+                self.editor_tool_combo.setEnabled(True)
+            self.canvas.set_status("Editor mode enabled. Create or edit the map.")
+        else:
+            self.switch_panel_to_simulation()
+            if hasattr(self, "editor_tool_combo"):
+                self.editor_tool_combo.setEnabled(False)
+            self.canvas.set_status("Editor mode disabled. Simulation interactions restored.")
+        self.update_preview()
+        if hasattr(self.top_bar, "editor_button"):
+            self.top_bar.editor_button.setChecked(self.editor_mode)
+        self.set_configuration_locked(self.running or self.robot is not None)
+
+    def set_editor_tool(self, tool: str) -> None:
+        tool_name = str(tool).lower()
+        if "camera" in tool_name or "viewport" in tool_name:
+            self.editor_tool = "camera"
+        elif "move obstacle" in tool_name or "select" in tool_name:
+            # Legacy UI text from older builds. Object movement is no longer a
+            # separate tool; click-drag any existing object while editing.
+            self.editor_tool = "rectangles"
+        elif "free" in tool_name:
+            self.editor_tool = "free"
+        elif "erase" in tool_name:
+            self.editor_tool = "erase"
+        elif "square" in tool_name:
+            self.editor_tool = "squares"
+        else:
+            self.editor_tool = "rectangles"
+
+        self.canvas.set_editor_tool(self.editor_tool)
+
+        if hasattr(self, "editor_brush_size_input") and self.editor_brush_size_input is not None:
+            self.editor_brush_size_input.setEnabled(self.editor_tool == "free")
+
+        if hasattr(self, "editor_tool_combo") and self.editor_tool_combo is not None:
+            desired_text = {
+                "camera": "Camera view",
+                "free": "Free draw",
+                "erase": "Erase",
+                "squares": "Squares",
+                "rectangles": "Rectangles",
+            }.get(self.editor_tool, "Rectangles")
+            if self.editor_tool_combo.currentText() != desired_text:
+                blocked = self.editor_tool_combo.blockSignals(True)
+                self.editor_tool_combo.setCurrentText(desired_text)
+                self.editor_tool_combo.blockSignals(blocked)
+
+        self.refresh_editor_tool_buttons()
+        self.refresh_editor_status_label()
+        status_by_tool = {
+            "rectangles": "Map editor: click empty space to draw rectangles; click an object to drag it.",
+            "squares": "Map editor: click empty space to draw squares; click an object to drag it.",
+            "free": "Map editor: free-draw with circular brush; click an object to drag it.",
+            "erase": "Map editor: click an obstacle to remove it.",
+            "camera": "Map editor: drag/resize the red simulation camera viewport.",
+        }
+        self.canvas.set_status(status_by_tool.get(self.editor_tool, "Map editor tool updated."))
+
+    def set_editor_brush_size(self, brush_size: float) -> None:
+        self.editor_brush_size = max(0.05, float(brush_size))
+        self.canvas.set_editor_brush_size(self.editor_brush_size)
+
+        slider = getattr(self, "editor_brush_size_slider", None)
+        if slider is not None:
+            blocked = slider.blockSignals(True)
+            slider.setValue(int(round(self.editor_brush_size * 100.0)))
+            slider.blockSignals(blocked)
+
+        preview = getattr(self, "editor_brush_size_preview", None)
+        if preview is not None:
+            preview.set_brush_size(self.editor_brush_size)
+
+        value_label = getattr(self, "editor_brush_size_value_label", None)
+        if value_label is not None:
+            value_label.setText(f"{self.editor_brush_size:.2f} m")
+
+    def set_editor_brush_size_from_slider(self, raw_value: int) -> None:
+        self.set_editor_brush_size(float(raw_value) / 100.0)
+
+    def set_editor_interaction_mode(self, mode: str) -> None:
+        self.editor_interaction_mode = "move" if str(mode).lower() == "move" else "paint"
+        self.canvas.set_editor_interaction_mode(self.editor_interaction_mode)
+        self.refresh_editor_tool_buttons()
+        if self.editor_interaction_mode == "move":
+            self.canvas.set_status("Pan/Zoom mode: drag the map or use the wheel. Object tools are locked.")
+        else:
+            self.canvas.set_status("Edit objects mode: draw on empty space, or click-drag an existing object to move it.")
+
+    def refresh_editor_tool_buttons(self) -> None:
+        tool_names = ("rectangles", "squares", "free", "erase", "camera")
+        tool_controls_enabled = self.editor_interaction_mode != "move"
+
+        for name in tool_names:
+            button = getattr(self, f"editor_{name}_button", None)
+            if button is not None:
+                button.setChecked(self.editor_tool == name and tool_controls_enabled)
+                button.setEnabled(tool_controls_enabled)
+
+        tool_combo = getattr(self, "editor_tool_combo", None)
+        if tool_combo is not None:
+            tool_combo.setEnabled(tool_controls_enabled)
+
+        brush_enabled = tool_controls_enabled and self.editor_tool == "free"
+        for attr in ("editor_brush_size_input", "editor_brush_size_slider", "editor_brush_size_preview"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(brush_enabled)
+
+        # Viewport numeric controls are only editable when the editor is in
+        # object-edit mode. Pan/Zoom mode is exclusively for moving the editor
+        # camera, not the simulation viewport.
+        camera_enabled = tool_controls_enabled
+        for attr in (
+            "editor_camera_x_input",
+            "editor_camera_y_input",
+            "editor_camera_width_input",
+            "editor_camera_height_input",
+            "editor_camera_reset_button",
+            "editor_camera_fit_button",
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(camera_enabled)
+
+        paint_button = getattr(self, "editor_paint_button", None)
+        move_button = getattr(self, "editor_move_button", None)
+        if paint_button is not None:
+            paint_button.setChecked(self.editor_interaction_mode == "paint")
+        if move_button is not None:
+            move_button.setChecked(self.editor_interaction_mode == "move")
+
+    def set_editor_camera_controls(
+        self,
+        center_x: float,
+        center_y: float,
+        width: float,
+        height: float,
+        *,
+        emit_preview: bool = True,
+    ) -> None:
+        if not hasattr(self, "editor_camera_x_input"):
+            return
+
+        self._syncing_editor_camera = True
+        try:
+            values = (float(center_x), float(center_y), max(1.0, float(width)), max(1.0, float(height)))
+            widgets = (
+                self.editor_camera_x_input,
+                self.editor_camera_y_input,
+                self.editor_camera_width_input,
+                self.editor_camera_height_input,
+            )
+            for widget, value in zip(widgets, values):
+                blocked = widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(blocked)
+        finally:
+            self._syncing_editor_camera = False
+
+        self.config.camera_center_x = float(center_x)
+        self.config.camera_center_y = float(center_y)
+        self.config.camera_width = max(1.0, float(width))
+        self.config.camera_height = max(1.0, float(height))
+        self.canvas.set_camera_view(
+            self.config.camera_center_x,
+            self.config.camera_center_y,
+            self.config.camera_width,
+            self.config.camera_height,
+            emit_signal=False,
+        )
+        self.refresh_editor_status_label()
+        if emit_preview:
+            self.update_preview()
+
+    def sync_editor_camera_from_panel(self, *_):
+        if getattr(self, "_syncing_editor_camera", False):
+            return
+        if not hasattr(self, "editor_camera_x_input"):
+            return
+        self.push_editor_undo_state()
+        self.set_editor_camera_controls(
+            self.editor_camera_x_input.value(),
+            self.editor_camera_y_input.value(),
+            self.editor_camera_width_input.value(),
+            self.editor_camera_height_input.value(),
+        )
+
+    def on_editor_camera_changed(self, camera_tuple: tuple) -> None:
+        if len(camera_tuple) != 4:
+            return
+        self.set_editor_camera_controls(
+            float(camera_tuple[0]),
+            float(camera_tuple[1]),
+            float(camera_tuple[2]),
+            float(camera_tuple[3]),
+        )
+
+    def reset_editor_camera(self) -> None:
+        self.push_editor_undo_state()
+        self.set_editor_camera_controls(
+            (WORLD_X_MIN + WORLD_X_MAX) / 2.0,
+            (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0,
+            WORLD_X_MAX - WORLD_X_MIN,
+            WORLD_Y_MAX - WORLD_Y_MIN,
+        )
+        self.canvas.set_status("Simulation camera reset to the full world.")
+
+    def fit_editor_camera_to_obstacles(self) -> None:
+        self.push_editor_undo_state()
+        if not self.config.obstacles:
+            self.reset_editor_camera()
+            return
+
+        xs = [obstacle[0] for obstacle in self.config.obstacles] + [obstacle[0] + obstacle[2] for obstacle in self.config.obstacles]
+        ys = [obstacle[1] for obstacle in self.config.obstacles] + [obstacle[1] + obstacle[3] for obstacle in self.config.obstacles]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        width = max(1.0, (max_x - min_x) * 1.25)
+        height = max(1.0, (max_y - min_y) * 1.25)
+        self.set_editor_camera_controls(
+            (min_x + max_x) / 2.0,
+            (min_y + max_y) / 2.0,
+            width,
+            height,
+        )
+        self.canvas.set_status("Simulation camera fitted to current obstacles.")
+
+    def editor_snapshot(self) -> tuple[tuple[tuple[float, float, float, float], ...], tuple[float, float, float, float]]:
+        """Return an undoable snapshot of obstacles and camera viewport."""
+        obstacles = tuple(tuple(map(float, obstacle)) for obstacle in self.config.obstacles)
+        camera = (
+            float(getattr(self.config, "camera_center_x", (WORLD_X_MIN + WORLD_X_MAX) / 2.0)),
+            float(getattr(self.config, "camera_center_y", (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0)),
+            float(getattr(self.config, "camera_width", WORLD_X_MAX - WORLD_X_MIN)),
+            float(getattr(self.config, "camera_height", WORLD_Y_MAX - WORLD_Y_MIN)),
+        )
+        return obstacles, camera
+
+    def restore_editor_snapshot(self, snapshot: tuple[tuple[tuple[float, float, float, float], ...], tuple[float, float, float, float]]) -> None:
+        obstacles, camera = snapshot
+        self.config.obstacles = [tuple(map(float, obstacle)) for obstacle in obstacles]
+        self.set_editor_camera_controls(camera[0], camera[1], camera[2], camera[3], emit_preview=False)
+        self.rebuild_editor_state()
+
+    def push_editor_undo_state(self, *_args) -> None:
+        if not self.editor_mode:
+            return
+        snapshot = self.editor_snapshot()
+        if self.editor_undo_stack and self.editor_undo_stack[-1] == snapshot:
+            return
+        self.editor_undo_stack.append(snapshot)
+        if len(self.editor_undo_stack) > self.editor_history_limit:
+            self.editor_undo_stack = self.editor_undo_stack[-self.editor_history_limit:]
+        self.editor_redo_stack.clear()
+
+    def undo_editor_change(self) -> None:
+        if not self.editor_mode or not self.editor_undo_stack:
+            self.canvas.set_status("Nothing to undo in the map editor.")
+            return
+        current = self.editor_snapshot()
+        previous = self.editor_undo_stack.pop()
+        self.editor_redo_stack.append(current)
+        self.restore_editor_snapshot(previous)
+        self.canvas.set_status("Editor undo applied.")
+
+    def redo_editor_change(self) -> None:
+        if not self.editor_mode or not self.editor_redo_stack:
+            self.canvas.set_status("Nothing to redo in the map editor.")
+            return
+        current = self.editor_snapshot()
+        next_snapshot = self.editor_redo_stack.pop()
+        self.editor_undo_stack.append(current)
+        self.restore_editor_snapshot(next_snapshot)
+        self.canvas.set_status("Editor redo applied.")
+
+    def on_editor_obstacle_moved(self, move_tuple: tuple) -> None:
+        if len(move_tuple) != 3:
+            return
+
+        first = move_tuple[0]
+        if isinstance(first, (list, tuple)):
+            indices = [int(index) for index in first]
+            dx = float(move_tuple[1])
+            dy = float(move_tuple[2])
+            moved = move_obstacles_by(self.config.obstacles, indices, (dx, dy))
+            label = "Object moved." if len(indices) > 1 else "Obstacle moved."
+        else:
+            # Backward-compatible path for older canvas payloads.
+            index = int(first)
+            left = float(move_tuple[1])
+            bottom = float(move_tuple[2])
+            moved = move_obstacle_to(self.config.obstacles, index, (left, bottom))
+            label = "Obstacle moved."
+
+        if moved:
+            self.rebuild_editor_state()
+            self.canvas.set_status(label)
+
+    def commit_editor_map(self) -> None:
+        self.rebuild_editor_state()
+        self.canvas.fit_to_obstacles(self.config.obstacles)
+        self.canvas.set_status("Map updated and ready to use.")
+
+    def new_editor_map(self) -> None:
+        self.push_editor_undo_state()
+        self.config.obstacles = []
+        self.rebuild_editor_state()
+        self.canvas.fit_to_obstacles(self.config.obstacles)
+        self.canvas.set_status("Blank map created.")
+
+    def clear_editor_map(self) -> None:
+        self.push_editor_undo_state()
+        self.config.obstacles = []
+        self.rebuild_editor_state()
+        self.canvas.set_status("Map cleared.")
+
+    def on_editor_interaction_started(self, start_xy: tuple[float, float]) -> None:
+        if self.running or self.robot is not None or bool(getattr(self, "robots", [])):
+            return
+        self.editor_pending_draw_points = [tuple(start_xy)]
+        self.canvas.set_editor_drag_start(start_xy)
+
+    def on_editor_interaction_progress(self, point_xy: tuple[float, float]) -> None:
+        self.editor_pending_draw_points.append(tuple(point_xy))
+
+    def on_editor_interaction_finished(self, start_xy: tuple[float, float], end_xy: tuple[float, float]) -> None:
+        if self.running or self.robot is not None or bool(getattr(self, "robots", [])):
+            return
+        if not self.editor_mode:
+            return
+
+        if self.editor_tool == "camera":
+            self.canvas.set_status("Camera tool active. Drag the red frame or its handles.")
+            return
+
+        if self.editor_tool == "erase":
+            self.push_editor_undo_state()
+            removed = remove_obstacle_at(self.config.obstacles, end_xy)
+            if removed:
+                self.rebuild_editor_state()
+                self.canvas.set_status("Obstacle removed.")
+            else:
+                self.canvas.set_status("No obstacle selected for editing.")
+            return
+
+        if self.editor_tool == "free":
+            free_draw_obstacles = create_free_draw_obstacles_from_path(
+                self.editor_pending_draw_points,
+                brush_size=self.editor_brush_size,
+            )
+            if free_draw_obstacles:
+                self.push_editor_undo_state()
+                self.config.obstacles.extend(free_draw_obstacles)
+                self.rebuild_editor_state()
+                self.canvas.set_status("Smooth free-draw object added.")
+            else:
+                self.canvas.set_status("No free-draw stroke created.")
+            return
+
+        if self.editor_tool == "squares":
+            from robotics_sim.app.map_editor import create_square_obstacle_from_drag
+            obstacle = create_square_obstacle_from_drag(start_xy, end_xy, min_size=MIN_EDITOR_OBSTACLE_SIZE)
+            if obstacle is None:
+                self.canvas.set_status("Obstacle too small. Drag a larger square.")
+                return
+            self.push_editor_undo_state()
+            self.config.obstacles.append(obstacle)
+            self.rebuild_editor_state()
+            self.canvas.set_status("Square obstacle added.")
+            return
+
+        obstacle = create_rect_obstacle_from_drag(start_xy, end_xy, min_size=MIN_EDITOR_OBSTACLE_SIZE)
+        if obstacle is None:
+            self.canvas.set_status("Obstacle too small. Drag a larger rectangle.")
+            return
+
+        self.push_editor_undo_state()
+        self.config.obstacles.append(obstacle)
+        self.rebuild_editor_state()
+        self.canvas.set_status("Obstacle added.")
+
+
+    def keyPressEvent(self, event):
+        if self.editor_mode and event.key() == Qt.Key_Z:
+            modifiers = event.modifiers()
+            if modifiers & Qt.ControlModifier and modifiers & Qt.AltModifier:
+                self.redo_editor_change()
+                event.accept()
+                return
+            if modifiers & Qt.ControlModifier and modifiers & Qt.ShiftModifier:
+                self.redo_editor_change()
+                event.accept()
+                return
+            if modifiers & Qt.ControlModifier:
+                self.undo_editor_change()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def rebuild_editor_state(self) -> None:
+        # Do not auto-union user-created obstacles. Destructive bounding-box
+        # merges change free-draw strokes and L-shaped compositions into shapes
+        # the user never drew. Explicit tools may still call merge_obstacles
+        # when they know the merge preserves geometry.
+        self.config.obstacles = normalize_obstacles([tuple(obstacle) for obstacle in self.config.obstacles])
+        self.spatial_index.rebuild(self.config.obstacles)
+        self.update_preview()
+        self.refresh_editor_status_label()
+
+    def refresh_editor_status_label(self) -> None:
+        if hasattr(self, "editor_status_label") and self.editor_status_label is not None:
+            self.editor_status_label.setText(self.canvas.editor_status_text() if self.editor_mode else "Editor disabled")
 
     # ========================================================
 
@@ -925,6 +1437,12 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
         QPushButton#secondaryButton:hover {{
             background: #F5F6F8;
+        }}
+
+        QPushButton#secondaryButton:checked {{
+            background: #F4EAEA;
+            color: {MAROON};
+            border: 1px solid {MAROON};
         }}
 
         QTableWidget {{

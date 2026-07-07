@@ -25,11 +25,25 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from robotics_sim.simulation.config import *
+from robotics_sim.app.map_editor import (
+    MIN_EDITOR_OBSTACLE_SIZE,
+    connected_obstacle_indices,
+    find_obstacle_group_at,
+    remove_obstacle_at,
+)
 
 class SimulationCanvas(QWidget):
     goalClicked = Signal(float, float)
     robotDragged = Signal(int, float, float)
     robotSelected = Signal(int)
+    editor_interaction_started = Signal(tuple)
+    editor_interaction_progress = Signal(tuple)
+    editor_interaction_finished = Signal(tuple, tuple)
+    editor_camera_changed = Signal(tuple)
+    editor_camera_interaction_started = Signal()
+    editor_obstacle_move_started = Signal()
+    editor_obstacle_moved = Signal(tuple)
+    editor_view_changed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -108,6 +122,24 @@ class SimulationCanvas(QWidget):
         # Dragging support for pre-simulation multi-robot placement.
         self.dragging_robot_index: int | None = None
         self.dragging_robot_offset: tuple[float, float] = (0.0, 0.0)
+        self.editor_mode = False
+        self.editor_tool = "rectangles"
+        self.editor_drag_start: tuple[float, float] | None = None
+        self.editor_drag_current: tuple[float, float] | None = None
+        self.editor_preview_points: list[tuple[float, float]] = []
+        self.editor_pan_offset: tuple[float, float] = (0.0, 0.0)
+        self.editor_zoom = 1.0
+        self.editor_brush_size = 0.2
+        self.editor_interaction_mode = "paint"
+        self.editor_pan_active = False
+        self.editor_last_pan_pos: tuple[float, float] | None = None
+        self.editor_camera_active_handle: str | None = None
+        self.editor_camera_drag_start_world: tuple[float, float] | None = None
+        self.editor_camera_start_bounds: tuple[float, float, float, float] | None = None
+        self.editor_obstacle_drag_index: int | None = None
+        self.editor_obstacle_drag_indices: list[int] = []
+        self.editor_obstacle_drag_offset: tuple[float, float] = (0.0, 0.0)
+        self.editor_obstacle_drag_last_world: tuple[float, float] | None = None
 
         # Cached current blue sensor footprint. This avoids recomputing
         # ray-casting in every paintEvent when the robot moved only a tiny
@@ -150,6 +182,19 @@ class SimulationCanvas(QWidget):
         self._obstacles_cache_mapped_count = -1
         self._obstacles_cache_signature = None
 
+    def invalidate_view_transform_caches(self):
+        """
+        Invalidate all pixmap caches whose pixels depend on world_to_screen().
+
+        Pan/zoom changes do not change widget size, but they do change the
+        world-to-screen transform. Any cached layer drawn in screen coordinates
+        must be rebuilt after camera movement.
+        """
+        self.invalidate_static_plot_cache()
+        self.invalidate_explored_area_cache()
+        self.invalidate_mapped_points_cache()
+        self.invalidate_obstacles_cache()
+
     def invalidate_sensor_cache(self):
         self._sensor_polygon_cache = []
         self._sensor_polygon_pose = None
@@ -161,6 +206,12 @@ class SimulationCanvas(QWidget):
         previous_obstacles = getattr(self.config, "obstacles", None)
         previous_vision = getattr(self.config, "vision", None)
         previous_vision_model = getattr(self.config, "vision_model", None)
+        previous_camera = (
+            getattr(self.config, "camera_center_x", None),
+            getattr(self.config, "camera_center_y", None),
+            getattr(self.config, "camera_width", None),
+            getattr(self.config, "camera_height", None),
+        )
         self.config = config
         if previous_spacing != config.mapping_point_spacing or previous_obstacles != config.obstacles:
             self.invalidate_obstacle_coverage_cache()
@@ -171,6 +222,16 @@ class SimulationCanvas(QWidget):
             or previous_vision_model != config.vision_model
         ):
             self.invalidate_sensor_cache()
+
+        current_camera = (
+            getattr(config, "camera_center_x", None),
+            getattr(config, "camera_center_y", None),
+            getattr(config, "camera_width", None),
+            getattr(config, "camera_height", None),
+        )
+        if previous_camera != current_camera:
+            self.invalidate_view_transform_caches()
+
         self.update()
 
     def set_robot(self, robot):
@@ -468,6 +529,61 @@ class SimulationCanvas(QWidget):
             -self.plot_margin_bottom,
         )
 
+    def editor_view_span_world(self) -> tuple[float, float]:
+        """Return the world span currently visible in editor mode."""
+        zoom = max(0.10, float(self.editor_zoom))
+        return (
+            max(0.25, (WORLD_X_MAX - WORLD_X_MIN) / zoom),
+            max(0.25, (WORLD_Y_MAX - WORLD_Y_MIN) / zoom),
+        )
+
+    def simulation_camera_span_world(self) -> tuple[float, float]:
+        """Return the simulation camera span stored in the config."""
+        return (
+            max(0.50, float(getattr(self.config, "camera_width", WORLD_X_MAX - WORLD_X_MIN))),
+            max(0.50, float(getattr(self.config, "camera_height", WORLD_Y_MAX - WORLD_Y_MIN))),
+        )
+
+    def active_view_center_world(self) -> tuple[float, float]:
+        if self.editor_mode:
+            return (float(self.editor_pan_offset[0]), float(self.editor_pan_offset[1]))
+        return (
+            float(getattr(self.config, "camera_center_x", (WORLD_X_MIN + WORLD_X_MAX) / 2.0)),
+            float(getattr(self.config, "camera_center_y", (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0)),
+        )
+
+    def active_view_span_world(self) -> tuple[float, float]:
+        if self.editor_mode:
+            return self.editor_view_span_world()
+        return self.simulation_camera_span_world()
+
+    def active_view_bounds_world(self) -> tuple[float, float, float, float]:
+        """Return left, right, bottom, top of the visible world rectangle."""
+        center_x, center_y = self.active_view_center_world()
+        span_x, span_y = self.active_view_span_world()
+        return (
+            center_x - span_x / 2.0,
+            center_x + span_x / 2.0,
+            center_y - span_y / 2.0,
+            center_y + span_y / 2.0,
+        )
+
+    def world_to_screen(self, x: float, y: float):
+        rect = self.plot_rect()
+        center_x, center_y = self.active_view_center_world()
+        span_x, span_y = self.active_view_span_world()
+        sx = rect.left() + (rect.width() / 2.0) + (float(x) - center_x) * (rect.width() / span_x)
+        sy = rect.bottom() - (rect.height() / 2.0) - (float(y) - center_y) * (rect.height() / span_y)
+        return sx, sy
+
+    def screen_to_world(self, sx: float, sy: float):
+        rect = self.plot_rect()
+        center_x, center_y = self.active_view_center_world()
+        span_x, span_y = self.active_view_span_world()
+        x = center_x + ((float(sx) - (rect.left() + rect.width() / 2.0)) / rect.width()) * span_x
+        y = center_y - ((float(sy) - (rect.bottom() - rect.height() / 2.0)) / rect.height()) * span_y
+        return x, y
+
     def telemetry_rect(self):
         r = self.rect()
         return r.adjusted(30, r.height() - 50, -30, -16)
@@ -507,17 +623,6 @@ class SimulationCanvas(QWidget):
         metrics = self.metrics_rect()
         return QRectF(metrics.left(), metrics.top(), eye.right() - metrics.left(), metrics.height())
 
-    def world_to_screen(self, x: float, y: float):
-        rect = self.plot_rect()
-        sx = rect.left() + (x - WORLD_X_MIN) / (WORLD_X_MAX - WORLD_X_MIN) * rect.width()
-        sy = rect.bottom() - (y - WORLD_Y_MIN) / (WORLD_Y_MAX - WORLD_Y_MIN) * rect.height()
-        return sx, sy
-
-    def screen_to_world(self, sx: float, sy: float):
-        rect = self.plot_rect()
-        x = WORLD_X_MIN + (sx - rect.left()) / rect.width() * (WORLD_X_MAX - WORLD_X_MIN)
-        y = WORLD_Y_MIN + (rect.bottom() - sy) / rect.height() * (WORLD_Y_MAX - WORLD_Y_MIN)
-        return x, y
 
     def multi_robot_screen_positions(self) -> list[tuple[int, float, float, RobotStartConfig]]:
         if "Multiple" not in self.config.agent_mode:
@@ -529,6 +634,10 @@ class SimulationCanvas(QWidget):
             sx, sy = self.world_to_screen(robot_cfg.x, robot_cfg.y)
             positions.append((index, sx, sy, robot_cfg))
         return positions
+
+    def pixels_per_meter(self) -> float:
+        span_x, _ = self.active_view_span_world()
+        return max(1.0, self.plot_rect().width() / max(0.1, span_x))
 
     def robot_index_at_screen_position(self, sx: float, sy: float) -> tuple[int, RobotStartConfig] | None:
         """
@@ -545,7 +654,7 @@ class SimulationCanvas(QWidget):
         if self.robot is not None or self.robots:
             return None
 
-        px_per_meter = self.plot_rect().width() / (WORLD_X_MAX - WORLD_X_MIN)
+        px_per_meter = self.pixels_per_meter()
         body_px = max(7.0, float(self.config.body_radius) * px_per_meter)
         hit_radius = max(13.0, body_px + 5.0)
 
@@ -567,6 +676,242 @@ class SimulationCanvas(QWidget):
 
         return None
 
+    def set_editor_mode(self, enabled: bool) -> None:
+        self.editor_mode = bool(enabled)
+        self.editor_drag_start = None
+        self.editor_drag_current = None
+        self.editor_preview_points = []
+        self.editor_pan_active = False
+        self.editor_last_pan_pos = None
+        self.editor_camera_active_handle = None
+        self.editor_camera_drag_start_world = None
+        self.editor_camera_start_bounds = None
+        self.editor_obstacle_drag_index = None
+        self.editor_obstacle_drag_indices = []
+        self.editor_obstacle_drag_offset = (0.0, 0.0)
+        self.editor_obstacle_drag_last_world = None
+        if not self.editor_mode:
+            self.editor_pan_offset = (0.0, 0.0)
+            self.editor_zoom = 1.0
+            self.invalidate_view_transform_caches()
+            self.editor_view_changed.emit()
+            self.update()
+            return
+
+        self.fit_to_obstacles(self.config.obstacles)
+
+    def set_editor_tool(self, tool: str) -> None:
+        self.editor_tool = str(tool)
+        self.editor_drag_start = None
+        self.editor_drag_current = None
+        self.editor_preview_points = []
+        self.editor_camera_active_handle = None
+        self.editor_camera_drag_start_world = None
+        self.editor_camera_start_bounds = None
+        self.editor_obstacle_drag_index = None
+        self.editor_obstacle_drag_indices = []
+        self.editor_obstacle_drag_offset = (0.0, 0.0)
+        self.editor_obstacle_drag_last_world = None
+        self.editor_view_changed.emit()
+        self.update()
+
+    def set_editor_drag_start(self, start_xy: tuple[float, float]) -> None:
+        self.editor_drag_start = tuple(start_xy)
+        self.editor_drag_current = tuple(start_xy)
+        self.editor_preview_points = [tuple(start_xy)]
+        self.update()
+
+    def set_editor_brush_size(self, brush_size: float) -> None:
+        self.editor_brush_size = max(0.05, float(brush_size))
+        self.invalidate_obstacles_cache()
+        self.update()
+
+    def set_editor_interaction_mode(self, mode: str) -> None:
+        mode_name = str(mode).lower()
+        self.editor_interaction_mode = "move" if mode_name == "move" else "paint"
+        self.editor_drag_start = None
+        self.editor_drag_current = None
+        self.editor_preview_points = []
+        self.editor_pan_active = False
+        self.editor_last_pan_pos = None
+        self.editor_camera_active_handle = None
+        self.editor_camera_drag_start_world = None
+        self.editor_camera_start_bounds = None
+        self.editor_obstacle_drag_index = None
+        self.editor_obstacle_drag_indices = []
+        self.editor_obstacle_drag_offset = (0.0, 0.0)
+        self.editor_obstacle_drag_last_world = None
+        self.update()
+
+    def fit_to_obstacles(self, obstacles: list[tuple[float, float, float, float]]) -> None:
+        if self.width() <= 0 or self.height() <= 0:
+            return
+
+        if not obstacles:
+            self.editor_pan_offset = ((WORLD_X_MIN + WORLD_X_MAX) / 2.0, (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0)
+            self.editor_zoom = 1.0
+            self.invalidate_view_transform_caches()
+            self.editor_view_changed.emit()
+            self.update()
+            return
+
+        xs = [obstacle[0] for obstacle in obstacles] + [obstacle[0] + obstacle[2] for obstacle in obstacles]
+        ys = [obstacle[1] for obstacle in obstacles] + [obstacle[1] + obstacle[3] for obstacle in obstacles]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span_x = max(max_x - min_x, 1.0)
+        span_y = max(max_y - min_y, 1.0)
+        padding_x = max(0.5, span_x * 0.08)
+        padding_y = max(0.5, span_y * 0.08)
+
+        world_span_x = max(span_x + padding_x * 2.0, 1.0)
+        world_span_y = max(span_y + padding_y * 2.0, 1.0)
+        zoom_x = (WORLD_X_MAX - WORLD_X_MIN) / world_span_x
+        zoom_y = (WORLD_Y_MAX - WORLD_Y_MIN) / world_span_y
+        self.editor_zoom = max(0.35, min(3.0, min(zoom_x, zoom_y)))
+        self.editor_pan_offset = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
+        self.invalidate_view_transform_caches()
+        self.editor_view_changed.emit()
+        self.update()
+
+    def editor_status_text(self) -> str:
+        zoom_percent = max(0.0, self.editor_zoom * 100.0)
+        cam_x = float(getattr(self.config, "camera_center_x", 0.0))
+        cam_y = float(getattr(self.config, "camera_center_y", 0.0))
+        cam_w = float(getattr(self.config, "camera_width", WORLD_X_MAX - WORLD_X_MIN))
+        cam_h = float(getattr(self.config, "camera_height", WORLD_Y_MAX - WORLD_Y_MIN))
+        return (
+            f"Editor zoom {zoom_percent:.0f}%  ·  View center ({self.editor_pan_offset[0]:.1f}, {self.editor_pan_offset[1]:.1f})  ·  "
+            f"Simulation camera center ({cam_x:.1f}, {cam_y:.1f}) size {cam_w:.1f} × {cam_h:.1f} m"
+        )
+
+    def camera_bounds_world(self) -> tuple[float, float, float, float]:
+        """Return simulation camera left, right, bottom, top in world coordinates."""
+        center_x = float(getattr(self.config, "camera_center_x", 0.0))
+        center_y = float(getattr(self.config, "camera_center_y", 0.0))
+        width = max(0.50, float(getattr(self.config, "camera_width", WORLD_X_MAX - WORLD_X_MIN)))
+        height = max(0.50, float(getattr(self.config, "camera_height", WORLD_Y_MAX - WORLD_Y_MIN)))
+        return (
+            center_x - width / 2.0,
+            center_x + width / 2.0,
+            center_y - height / 2.0,
+            center_y + height / 2.0,
+        )
+
+    def camera_rect_screen(self) -> QRectF:
+        left, right, bottom, top = self.camera_bounds_world()
+        x1, y1 = self.world_to_screen(left, bottom)
+        x2, y2 = self.world_to_screen(right, top)
+        return QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+
+    def set_camera_view(
+        self,
+        center_x: float,
+        center_y: float,
+        width: float,
+        height: float,
+        *,
+        emit_signal: bool = False,
+    ) -> None:
+        """Update the red editor camera rectangle and simulation viewport."""
+        width = max(0.50, float(width))
+        height = max(0.50, float(height))
+        self.config.camera_center_x = float(center_x)
+        self.config.camera_center_y = float(center_y)
+        self.config.camera_width = width
+        self.config.camera_height = height
+        self.invalidate_view_transform_caches()
+        self.editor_view_changed.emit()
+        if emit_signal:
+            self.editor_camera_changed.emit((
+                self.config.camera_center_x,
+                self.config.camera_center_y,
+                self.config.camera_width,
+                self.config.camera_height,
+            ))
+        self.update()
+
+    def camera_handle_at_screen_position(self, sx: float, sy: float) -> str | None:
+        """Return resize/move handle under the cursor for the camera frame."""
+        rect = self.camera_rect_screen()
+        if rect.isNull() or rect.width() <= 0.0 or rect.height() <= 0.0:
+            return None
+
+        point = QPointF(float(sx), float(sy))
+        handle_radius = 10.0
+        corners = {
+            "nw": rect.topLeft(),
+            "ne": rect.topRight(),
+            "sw": rect.bottomLeft(),
+            "se": rect.bottomRight(),
+        }
+        for name, corner in corners.items():
+            if math.hypot(point.x() - corner.x(), point.y() - corner.y()) <= handle_radius:
+                return name
+
+        edge_tol = 7.0
+        if rect.left() - edge_tol <= point.x() <= rect.right() + edge_tol:
+            if abs(point.y() - rect.top()) <= edge_tol:
+                return "n"
+            if abs(point.y() - rect.bottom()) <= edge_tol:
+                return "s"
+        if rect.top() - edge_tol <= point.y() <= rect.bottom() + edge_tol:
+            if abs(point.x() - rect.left()) <= edge_tol:
+                return "w"
+            if abs(point.x() - rect.right()) <= edge_tol:
+                return "e"
+
+        if rect.adjusted(0, 0, 0, 0).contains(point):
+            return "move"
+        return None
+
+    def update_camera_from_drag(self, current_world: tuple[float, float]) -> None:
+        if (
+            self.editor_camera_active_handle is None
+            or self.editor_camera_drag_start_world is None
+            or self.editor_camera_start_bounds is None
+        ):
+            return
+
+        start_x, start_y = self.editor_camera_drag_start_world
+        dx = float(current_world[0]) - start_x
+        dy = float(current_world[1]) - start_y
+        left, right, bottom, top = self.editor_camera_start_bounds
+        handle = self.editor_camera_active_handle
+        min_size = 0.75
+
+        if handle == "move":
+            left += dx
+            right += dx
+            bottom += dy
+            top += dy
+        else:
+            if "w" in handle:
+                left += dx
+            if "e" in handle:
+                right += dx
+            if "s" in handle:
+                bottom += dy
+            if "n" in handle:
+                top += dy
+
+            if right - left < min_size:
+                if "w" in handle:
+                    left = right - min_size
+                else:
+                    right = left + min_size
+            if top - bottom < min_size:
+                if "s" in handle:
+                    bottom = top - min_size
+                else:
+                    top = bottom + min_size
+
+        center_x = (left + right) / 2.0
+        center_y = (bottom + top) / 2.0
+        width = right - left
+        height = top - bottom
+        self.set_camera_view(center_x, center_y, width, height, emit_signal=True)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             pos = event.position()
@@ -577,6 +922,55 @@ class SimulationCanvas(QWidget):
                 return
 
             if self.plot_rect().contains(pos.toPoint()):
+                if self.editor_mode and not self.robot and not self.robots:
+                    # Pan/Zoom mode is exclusive. It must never select, move,
+                    # erase, resize the viewport, or create obstacles.
+                    if self.editor_interaction_mode == "move":
+                        self.editor_pan_active = True
+                        self.editor_last_pan_pos = (pos.x(), pos.y())
+                        self.setCursor(Qt.ClosedHandCursor)
+                        return
+
+                    world_x, world_y = self.screen_to_world(pos.x(), pos.y())
+
+                    if self.editor_tool == "camera":
+                        handle = self.camera_handle_at_screen_position(pos.x(), pos.y())
+                        if handle is not None:
+                            self.editor_camera_interaction_started.emit()
+                            self.editor_camera_active_handle = handle
+                            self.editor_camera_drag_start_world = (float(world_x), float(world_y))
+                            self.editor_camera_start_bounds = self.camera_bounds_world()
+                            self.setCursor(Qt.ClosedHandCursor if handle == "move" else Qt.SizeAllCursor)
+                            return
+                        # Camera mode should never create obstacles by accident.
+                        return
+
+                    if self.editor_tool == "erase":
+                        self.editor_drag_start = (world_x, world_y)
+                        self.editor_drag_current = self.editor_drag_start
+                        self.editor_interaction_started.emit(self.editor_drag_start)
+                        self.update()
+                        return
+
+                    # Object movement is no longer a separate tool. In edit mode,
+                    # clicking an existing connected object starts dragging it;
+                    # clicking empty space keeps the currently selected draw tool.
+                    group_indices = find_obstacle_group_at(self.config.obstacles, (world_x, world_y))
+                    if group_indices:
+                        self.editor_obstacle_move_started.emit()
+                        self.editor_obstacle_drag_index = int(group_indices[-1])
+                        self.editor_obstacle_drag_indices = list(group_indices)
+                        self.editor_obstacle_drag_last_world = (float(world_x), float(world_y))
+                        self.setCursor(Qt.ClosedHandCursor)
+                        self.update()
+                        return
+
+                    self.editor_drag_start = (world_x, world_y)
+                    self.editor_drag_current = self.editor_drag_start
+                    self.editor_interaction_started.emit(self.editor_drag_start)
+                    self.update()
+                    return
+
                 hit = self.robot_index_at_screen_position(pos.x(), pos.y())
                 if hit is not None:
                     index, robot_cfg = hit
@@ -592,6 +986,49 @@ class SimulationCanvas(QWidget):
                 self.goalClicked.emit(x, y)
 
     def mouseMoveEvent(self, event):
+        if self.editor_mode and self.editor_pan_active and self.editor_last_pan_pos is not None:
+            pos = event.position()
+            dx = pos.x() - self.editor_last_pan_pos[0]
+            dy = pos.y() - self.editor_last_pan_pos[1]
+            span_x, span_y = self.editor_view_span_world()
+            self.editor_pan_offset = (
+                self.editor_pan_offset[0] - dx * span_x / max(1.0, self.plot_rect().width()),
+                self.editor_pan_offset[1] + dy * span_y / max(1.0, self.plot_rect().height()),
+            )
+            self.editor_last_pan_pos = (pos.x(), pos.y())
+            self.invalidate_view_transform_caches()
+            self.editor_view_changed.emit()
+            self.update()
+            return
+
+        if self.editor_mode and self.editor_camera_active_handle is not None:
+            pos = event.position()
+            self.update_camera_from_drag(self.screen_to_world(pos.x(), pos.y()))
+            return
+
+        if self.editor_mode and self.editor_obstacle_drag_indices and self.editor_obstacle_drag_last_world is not None:
+            pos = event.position()
+            world_x, world_y = self.screen_to_world(pos.x(), pos.y())
+            last_x, last_y = self.editor_obstacle_drag_last_world
+            dx = float(world_x) - float(last_x)
+            dy = float(world_y) - float(last_y)
+            if abs(dx) > 1.0e-9 or abs(dy) > 1.0e-9:
+                self.editor_obstacle_moved.emit((tuple(self.editor_obstacle_drag_indices), dx, dy))
+                self.editor_obstacle_drag_last_world = (float(world_x), float(world_y))
+            self.update()
+            return
+
+        if self.editor_mode and self.editor_drag_start is not None:
+            pos = event.position()
+            world_x, world_y = self.screen_to_world(pos.x(), pos.y())
+            self.editor_drag_current = (world_x, world_y)
+            if self.editor_tool == "free":
+                if not self.editor_preview_points or math.hypot(world_x - self.editor_preview_points[-1][0], world_y - self.editor_preview_points[-1][1]) >= 0.05:
+                    self.editor_preview_points.append((world_x, world_y))
+                    self.editor_interaction_progress.emit((world_x, world_y))
+            self.update()
+            return
+
         if self.dragging_robot_index is None:
             return
 
@@ -603,9 +1040,66 @@ class SimulationCanvas(QWidget):
         self.robotDragged.emit(int(self.dragging_robot_index), float(x), float(y))
 
     def mouseReleaseEvent(self, event):
+        if self.editor_mode and self.editor_pan_active:
+            self.editor_pan_active = False
+            self.editor_last_pan_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        if self.editor_mode and self.editor_camera_active_handle is not None:
+            self.editor_camera_active_handle = None
+            self.editor_camera_drag_start_world = None
+            self.editor_camera_start_bounds = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        if self.editor_mode and self.editor_obstacle_drag_indices:
+            self.editor_obstacle_drag_index = None
+            self.editor_obstacle_drag_indices = []
+            self.editor_obstacle_drag_offset = (0.0, 0.0)
+            self.editor_obstacle_drag_last_world = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        if self.editor_mode and self.editor_drag_start is not None:
+            pos = event.position()
+            world_x, world_y = self.screen_to_world(pos.x(), pos.y())
+            self.editor_drag_current = (world_x, world_y)
+            self.editor_interaction_finished.emit(self.editor_drag_start, (world_x, world_y))
+            self.editor_drag_start = None
+            self.editor_drag_current = None
+            self.update()
+            return
+
         if self.dragging_robot_index is not None:
             self.dragging_robot_index = None
             self.setCursor(Qt.ArrowCursor)
+
+    def wheelEvent(self, event):
+        if not self.editor_mode:
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        pos = event.position()
+        world_before = self.screen_to_world(pos.x(), pos.y())
+
+        zoom_factor = 1.10 if delta > 0 else 0.90
+        self.editor_zoom = max(0.35, min(8.0, self.editor_zoom * zoom_factor))
+
+        world_after = self.screen_to_world(pos.x(), pos.y())
+        self.editor_pan_offset = (
+            self.editor_pan_offset[0] + (world_before[0] - world_after[0]),
+            self.editor_pan_offset[1] + (world_before[1] - world_after[1]),
+        )
+        self.invalidate_view_transform_caches()
+        self.editor_view_changed.emit()
+        self.update()
 
     def paintEvent(self, event):
         self.record_render_frame()
@@ -663,8 +1157,9 @@ class SimulationCanvas(QWidget):
         status_width = max(0.0, self.width() - status_left - 24.0)
         if status_width >= 70.0:
             status_rect = QRectF(status_left, 16, status_width, 22)
+            status_text = self.editor_status_text() if self.editor_mode else self.status_message
             status = painter.fontMetrics().elidedText(
-                self.status_message,
+                status_text,
                 Qt.ElideRight,
                 int(status_rect.width()),
             )
@@ -758,7 +1253,6 @@ class SimulationCanvas(QWidget):
         cache_painter.save()
         cache_painter.setClipRect(rect)
         cache_painter.fillRect(rect, QColor("#F9FBFD"))
-        self.draw_topography(cache_painter, rect)
         self.draw_grid(cache_painter, rect)
         cache_painter.restore()
         cache_painter.end()
@@ -914,7 +1408,6 @@ class SimulationCanvas(QWidget):
             painter.drawPixmap(0, 0, self._static_plot_cache)
         else:
             painter.fillRect(rect, QColor("#F9FBFD"))
-            self.draw_topography(painter, rect)
             self.draw_grid(painter, rect)
 
         # Always-visible physical world layers.
@@ -930,6 +1423,10 @@ class SimulationCanvas(QWidget):
         # hidden without changing the robot's partial map or planner inputs.
         if self.config.show_obstacles:
             self.draw_ground_truth_obstacles(painter)
+
+        self.draw_editor_preview(painter)
+        self.draw_editor_move_selection(painter)
+        self.draw_editor_camera_frame(painter)
 
         # Mapped points remain visible because they represent the discovered map.
         # They are drawn above the vision/r layer and below routes/waypoints/robot.
@@ -982,16 +1479,84 @@ class SimulationCanvas(QWidget):
 
         painter.restore()
 
+    def nice_grid_step(self, visible_span: float, pixel_span: float, target_pixels: float = 58.0) -> float:
+        """Choose a readable coordinate-grid spacing for the current zoom."""
+        approx_lines = max(2.0, float(pixel_span) / max(20.0, float(target_pixels)))
+        raw_step = max(1.0e-9, float(visible_span) / approx_lines)
+        exponent = math.floor(math.log10(raw_step))
+        scale = 10.0 ** exponent
+        for multiplier in (1.0, 2.0, 5.0, 10.0):
+            step = multiplier * scale
+            if step >= raw_step:
+                return step
+        return 10.0 * scale
+
+    def format_grid_label(self, value: float, step: float) -> str:
+        if abs(value) < step * 1.0e-4:
+            value = 0.0
+        if step >= 1.0:
+            return f"{value:.0f}"
+        if step >= 0.1:
+            return f"{value:.1f}"
+        return f"{value:.2f}"
+
     def draw_grid(self, painter: QPainter, rect):
-        for x in range(math.ceil(WORLD_X_MIN), math.floor(WORLD_X_MAX) + 1):
-            sx, _ = self.world_to_screen(x, 0)
-            painter.setPen(QPen(GRID_AXIS, 1.5) if x == 0 else QPen(GRID, 1))
+        """Draw an infinite-style coordinate grid for the current view."""
+        left, right, bottom, top = self.active_view_bounds_world()
+        span_x = max(0.1, right - left)
+        span_y = max(0.1, top - bottom)
+        step = self.nice_grid_step(min(span_x, span_y), min(rect.width(), rect.height()))
+        minor_step = step / 2.0
+
+        painter.save()
+
+        # Minor grid.
+        painter.setPen(QPen(QColor(235, 238, 243), 1))
+        start_x = math.floor(left / minor_step) * minor_step
+        x = start_x
+        while x <= right + minor_step * 0.5:
+            sx, _ = self.world_to_screen(x, 0.0)
+            painter.drawLine(QPointF(sx, rect.top()), QPointF(sx, rect.bottom()))
+            x += minor_step
+
+        start_y = math.floor(bottom / minor_step) * minor_step
+        y = start_y
+        while y <= top + minor_step * 0.5:
+            _, sy = self.world_to_screen(0.0, y)
+            painter.drawLine(QPointF(rect.left(), sy), QPointF(rect.right(), sy))
+            y += minor_step
+
+        # Major grid and coordinate labels.
+        painter.setFont(QFont("Consolas", 7))
+        label_color = QColor(116, 126, 142, 185)
+        major_pen = QPen(QColor(210, 216, 226), 1.15)
+        axis_pen = QPen(GRID_AXIS, 1.8)
+
+        x = math.floor(left / step) * step
+        while x <= right + step * 0.5:
+            sx, _ = self.world_to_screen(x, 0.0)
+            is_axis = left <= 0.0 <= right and abs(x) <= step * 1.0e-4
+            painter.setPen(axis_pen if is_axis else major_pen)
             painter.drawLine(QPointF(sx, rect.top()), QPointF(sx, rect.bottom()))
 
-        for y in range(math.ceil(WORLD_Y_MIN), math.floor(WORLD_Y_MAX) + 1):
-            _, sy = self.world_to_screen(0, y)
-            painter.setPen(QPen(GRID_AXIS, 1.5) if y == 0 else QPen(GRID, 1))
+            if rect.left() + 4 <= sx <= rect.right() - 4:
+                painter.setPen(label_color)
+                painter.drawText(QRectF(sx - 22, rect.bottom() - 18, 44, 14), Qt.AlignCenter, self.format_grid_label(x, step))
+            x += step
+
+        y = math.floor(bottom / step) * step
+        while y <= top + step * 0.5:
+            _, sy = self.world_to_screen(0.0, y)
+            is_axis = bottom <= 0.0 <= top and abs(y) <= step * 1.0e-4
+            painter.setPen(axis_pen if is_axis else major_pen)
             painter.drawLine(QPointF(rect.left(), sy), QPointF(rect.right(), sy))
+
+            if rect.top() + 6 <= sy <= rect.bottom() - 6:
+                painter.setPen(label_color)
+                painter.drawText(QRectF(rect.left() + 5, sy - 7, 42, 14), Qt.AlignLeft | Qt.AlignVCenter, self.format_grid_label(y, step))
+            y += step
+
+        painter.restore()
 
     def current_robot_pose(self) -> tuple[float, float, float, float]:
         if self.robot is not None:
@@ -1312,6 +1877,150 @@ class SimulationCanvas(QWidget):
 
         self.rebuild_obstacles_cache(signature)
 
+    def obstacle_is_squareish_stamp(self, obstacle: tuple[float, float, float, float]) -> bool:
+        """Return whether an obstacle looks like one free-draw brush stamp.
+
+        Free-draw strokes are stored as small square bounding boxes because the
+        runtime planner/collision code still consumes rectangles. Rendering is
+        allowed to interpret connected dense stamps as circles so the user sees
+        one smooth object instead of a chain of tiny squares.
+        """
+        _, _, width, height = obstacle
+        width = abs(float(width))
+        height = abs(float(height))
+        if width <= 0.0 or height <= 0.0:
+            return False
+
+        squareish = abs(width - height) <= max(0.025, 0.12 * max(width, height))
+        # Do not depend on the current brush slider value. The user may draw a
+        # stroke, change brush size, then run the simulation. A visual stamp
+        # should still render as a stamp. Keep the cap high enough for normal
+        # editor brush sizes, but low enough that large square obstacles remain
+        # rectangles.
+        plausible_stamp_size = max(width, height) <= 2.25
+        return bool(squareish and plausible_stamp_size)
+
+    def obstacle_group_looks_like_free_draw(self, indices: list[int]) -> bool:
+        """Heuristic for deciding when a connected object is a free-draw stroke."""
+        if len(indices) < 3:
+            return False
+
+        obstacles = [tuple(self.config.obstacles[index]) for index in indices if 0 <= index < len(self.config.obstacles)]
+        if len(obstacles) < 3:
+            return False
+
+        squareish_count = sum(1 for obstacle in obstacles if self.obstacle_is_squareish_stamp(obstacle))
+        if squareish_count / len(obstacles) < 0.70:
+            return False
+
+        sizes = [max(abs(float(obstacle[2])), abs(float(obstacle[3]))) for obstacle in obstacles]
+        min_size = max(min(sizes), 1.0e-9)
+        max_size = max(sizes)
+        similar_sizes = (max_size / min_size) <= 2.25
+        return bool(similar_sizes)
+
+    def obstacle_screen_path(
+        self,
+        obstacle: tuple[float, float, float, float],
+        *,
+        as_brush_stamp: bool = False,
+    ) -> QPainterPath:
+        """Return the visual path for one obstacle in screen coordinates."""
+        ox, oy, ow, oh = obstacle
+        x1, y1 = self.world_to_screen(ox, oy)
+        x2, y2 = self.world_to_screen(ox + ow, oy + oh)
+        rect = QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+
+        path = QPainterPath()
+        if as_brush_stamp:
+            path.addEllipse(rect)
+        else:
+            path.addRect(rect)
+        return path
+
+    def obstacle_visual_groups(self) -> list[list[int]]:
+        """Return connected obstacle groups for seam-free rendering.
+
+        Data remains as individual rectangles. This method affects only the
+        display layer, so joined objects and free-draw strokes look like one
+        object in both editor mode and simulation mode.
+        """
+        groups: list[list[int]] = []
+        visited: set[int] = set()
+
+        for index in range(len(self.config.obstacles)):
+            if index in visited:
+                continue
+            group = connected_obstacle_indices(list(self.config.obstacles), index)
+            if not group:
+                group = [index]
+            for group_index in group:
+                visited.add(group_index)
+            groups.append(group)
+
+        return groups
+
+    def obstacle_group_screen_path(self, indices: list[int]) -> QPainterPath:
+        """Build a unified visual path for one connected obstacle object."""
+        union_path = QPainterPath()
+        draw_as_free_stroke = self.obstacle_group_looks_like_free_draw(indices)
+
+        for index in indices:
+            if index < 0 or index >= len(self.config.obstacles):
+                continue
+
+            obstacle_path = self.obstacle_screen_path(
+                tuple(self.config.obstacles[index]),
+                as_brush_stamp=draw_as_free_stroke,
+            )
+            if union_path.isEmpty():
+                union_path = obstacle_path
+            else:
+                union_path = union_path.united(obstacle_path)
+
+        return union_path.simplified()
+
+    def obstacle_group_mapping_coverage(self, indices: list[int]) -> float:
+        """Return display-only completion coverage for a connected object."""
+        valid_indices = [index for index in indices if 0 <= index < len(self.config.obstacles)]
+        if not valid_indices:
+            return 0.0
+        return float(
+            sum(self._obstacle_coverage_cache.get(index, 0.0) for index in valid_indices)
+            / len(valid_indices)
+        )
+
+    def draw_obstacle_group(
+        self,
+        painter: QPainter,
+        indices: list[int],
+    ) -> None:
+        """Draw one connected obstacle object without internal seams."""
+        path = self.obstacle_group_screen_path(indices)
+        if path.isEmpty():
+            return
+
+        if self.editor_mode:
+            fill = QColor(178, 181, 188, 105)
+            stroke = QColor(82, 84, 92, 165)
+            pen_width = 1.35
+        else:
+            coverage = self.obstacle_group_mapping_coverage(indices)
+            fully_discovered = coverage >= OBSTACLE_COMPLETE_COVERAGE
+
+            if fully_discovered:
+                fill = QColor(190, 194, 202, 170)
+                stroke = QColor(82, 84, 92, 210)
+                pen_width = 1.7
+            else:
+                fill = QColor(178, 181, 188, 85)
+                stroke = QColor(82, 84, 92, 105)
+                pen_width = 1.2
+
+        painter.setPen(QPen(stroke, pen_width))
+        painter.setBrush(QBrush(fill))
+        painter.drawPath(path)
+
     def rebuild_obstacles_cache(self, signature: tuple | None = None):
         cache = QPixmap(self.size())
         cache.fill(Qt.transparent)
@@ -1329,32 +2038,8 @@ class SimulationCanvas(QWidget):
         cache_painter.setRenderHint(QPainter.Antialiasing)
         cache_painter.setClipRect(self.plot_rect())
 
-        for index, obstacle in enumerate(self.config.obstacles):
-            ox, oy, ow, oh = obstacle
-            coverage = self._obstacle_coverage_cache.get(index, 0.0)
-            fully_discovered = coverage >= OBSTACLE_COMPLETE_COVERAGE
-
-            if fully_discovered:
-                fill = QColor(190, 194, 202, 170)
-                stroke = QColor(82, 84, 92, 210)
-                pen_width = 1.7
-            else:
-                fill = QColor(178, 181, 188, 85)
-                stroke = QColor(82, 84, 92, 105)
-                pen_width = 1.2
-
-            cache_painter.setPen(QPen(stroke, pen_width))
-            cache_painter.setBrush(QBrush(fill))
-
-            x1, y1 = self.world_to_screen(ox, oy)
-            x2, y2 = self.world_to_screen(ox + ow, oy + oh)
-
-            left = min(x1, x2)
-            top = min(y1, y2)
-            width = abs(x2 - x1)
-            height = abs(y2 - y1)
-
-            cache_painter.drawRect(QRectF(left, top, width, height))
+        for group in self.obstacle_visual_groups():
+            self.draw_obstacle_group(cache_painter, group)
 
         cache_painter.end()
 
@@ -1376,6 +2061,131 @@ class SimulationCanvas(QWidget):
         painter.drawPixmap(0, 0, self._obstacles_cache)
         painter.restore()
 
+    def draw_editor_preview(self, painter: QPainter):
+        if not self.editor_mode or self.editor_drag_start is None or self.editor_drag_current is None:
+            return
+
+        if self.editor_tool == "free":
+            if len(self.editor_preview_points) >= 2:
+                painter.save()
+                stroke_width = max(1.6, self.editor_brush_size * self.pixels_per_meter() * 0.8)
+                painter.setPen(QPen(QColor(BLUE), stroke_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.setOpacity(0.75)
+                path = QPainterPath()
+                first = self.editor_preview_points[0]
+                x0, y0 = self.world_to_screen(first[0], first[1])
+                path.moveTo(x0, y0)
+                for point in self.editor_preview_points[1:]:
+                    x, y = self.world_to_screen(point[0], point[1])
+                    path.lineTo(x, y)
+                painter.drawPath(path)
+
+                # Live circular brush cursor at the last stamp position.
+                last = self.editor_preview_points[-1]
+                cx, cy = self.world_to_screen(last[0], last[1])
+                radius = max(2.0, self.editor_brush_size * self.pixels_per_meter() / 2.0)
+                painter.setPen(QPen(QColor(BLUE_DARK), 1.4))
+                painter.setBrush(QBrush(QColor(255, 255, 255, 95)))
+                painter.drawEllipse(QRectF(cx - radius, cy - radius, 2.0 * radius, 2.0 * radius))
+                painter.restore()
+            return
+
+        if self.editor_tool not in {"rectangles", "squares"}:
+            return
+
+        start_x, start_y = self.editor_drag_start
+        current_x, current_y = self.editor_drag_current
+        left = min(start_x, current_x)
+        bottom = min(start_y, current_y)
+        width = abs(current_x - start_x)
+        height = abs(current_y - start_y)
+
+        if width < MIN_EDITOR_OBSTACLE_SIZE and height < MIN_EDITOR_OBSTACLE_SIZE:
+            return
+
+        if self.editor_tool == "squares":
+            size = max(width, height)
+            width = size
+            height = size
+
+        x1, y1 = self.world_to_screen(left, bottom)
+        x2, y2 = self.world_to_screen(left + width, bottom + height)
+        rect = QRectF(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+
+        painter.save()
+        painter.setPen(QPen(QColor(BLUE), 2, Qt.DashLine))
+        painter.setBrush(QBrush(QColor(BLUE_LIGHT)))
+        painter.setOpacity(0.35)
+        painter.drawRect(rect)
+        painter.restore()
+
+
+    def draw_editor_move_selection(self, painter: QPainter):
+        """Highlight the connected object currently being moved in editor mode."""
+        if not self.editor_mode or not self.editor_obstacle_drag_indices:
+            return
+
+        selection_path = QPainterPath()
+        for index in self.editor_obstacle_drag_indices:
+            if index < 0 or index >= len(self.config.obstacles):
+                continue
+            path = self.obstacle_screen_path(tuple(self.config.obstacles[index]))
+            selection_path = path if selection_path.isEmpty() else selection_path.united(path)
+
+        if selection_path.isEmpty():
+            return
+
+        painter.save()
+        painter.setPen(QPen(QColor(220, 52, 52), 2.0, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(selection_path.simplified())
+        painter.restore()
+
+    def draw_editor_camera_frame(self, painter: QPainter):
+        """Draw the adjustable red simulation camera frame in editor mode."""
+        if not self.editor_mode:
+            return
+
+        rect = self.camera_rect_screen()
+        plot = QRectF(self.plot_rect())
+        if rect.isNull() or rect.width() <= 0.0 or rect.height() <= 0.0:
+            return
+
+        painter.save()
+        painter.setClipRect(plot)
+
+        # Soft outside overlay so the user understands this frame is the future
+        # simulation viewport, not an obstacle.
+        outside = QPainterPath()
+        outside.addRect(plot)
+        inside = QPainterPath()
+        inside.addRect(rect)
+        outside = outside.subtracted(inside)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(220, 52, 52, 20)))
+        painter.drawPath(outside)
+
+        painter.setPen(QPen(QColor(220, 52, 52), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(rect)
+
+        painter.setPen(QPen(QColor(255, 255, 255), 1.4))
+        painter.setBrush(QBrush(QColor(220, 52, 52)))
+        handle_size = 7.0
+        for point in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()):
+            painter.drawRect(QRectF(point.x() - handle_size / 2.0, point.y() - handle_size / 2.0, handle_size, handle_size))
+
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        label = "Simulation camera viewport"
+        label_rect = QRectF(rect.left() + 8, rect.top() + 8, 172, 20)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 225)))
+        painter.drawRoundedRect(label_rect, 6, 6)
+        painter.setPen(QColor(160, 20, 20))
+        painter.drawText(label_rect.adjusted(8, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
+
+        painter.restore()
+
     def draw_safety_radius(self, painter: QPainter):
         """
         Draw safety radius r below mapped obstacles and waypoints.
@@ -1383,7 +2193,7 @@ class SimulationCanvas(QWidget):
         In multi-robot mode every robot gets its own colored safety radius when
         Robot Orders is enabled.
         """
-        px_per_meter = self.plot_rect().width() / (WORLD_X_MAX - WORLD_X_MIN)
+        px_per_meter = self.pixels_per_meter()
 
         painter.save()
         for cache_key, x, y, _, _ in self.sensor_display_poses():
@@ -1616,7 +2426,7 @@ class SimulationCanvas(QWidget):
         # stable first.
         if self.robot is None and "Multiple" in self.config.agent_mode:
             painter.save()
-            px_per_meter = self.plot_rect().width() / (WORLD_X_MAX - WORLD_X_MIN)
+            px_per_meter = self.pixels_per_meter()
             selected_index = max(0, min(int(self.config.selected_robot_index), int(self.config.robot_count) - 1))
 
             for index, robot_cfg in enumerate(normalized_robot_start_configs(self.config)):
@@ -1652,7 +2462,7 @@ class SimulationCanvas(QWidget):
         # baseline: every robot is visible and moves as an independent agent.
         if self.robots and "Multiple" in self.config.agent_mode:
             painter.save()
-            px_per_meter = self.plot_rect().width() / (WORLD_X_MAX - WORLD_X_MIN)
+            px_per_meter = self.pixels_per_meter()
 
             if self.config.show_robot_orders:
                 for index, path_points in enumerate(self.multi_path_points):
@@ -1692,7 +2502,7 @@ class SimulationCanvas(QWidget):
         # Robot marker: always visible. Its size follows body_radius. The safety
         # radius r is a separate layer shown only when Robot Orders is ON.
         painter.save()
-        px_per_meter = self.plot_rect().width() / (WORLD_X_MAX - WORLD_X_MIN)
+        px_per_meter = self.pixels_per_meter()
         body_px = max(5.0, float(self.config.body_radius) * px_per_meter)
         painter.setPen(QPen(QColor("white"), 2.0))
         painter.setBrush(QBrush(QColor(BLUE)))

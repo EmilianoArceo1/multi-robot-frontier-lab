@@ -307,6 +307,14 @@ class SimulationConfig:
     agent_mode: str = "Single Robot Mode"
     grid_resolution: float = 0.5
 
+    # Simulation camera/view rectangle. In editor mode this is shown as a
+    # red adjustable frame. In simulation mode this rectangle is the world area
+    # mapped to the canvas viewport.
+    camera_center_x: float = (WORLD_X_MIN + WORLD_X_MAX) / 2.0
+    camera_center_y: float = (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0
+    camera_width: float = WORLD_X_MAX - WORLD_X_MIN
+    camera_height: float = WORLD_Y_MAX - WORLD_Y_MIN
+
     obstacles: list[tuple[float, float, float, float]] = field(
         default_factory=lambda: list(DEFAULT_OBSTACLES)
     )
@@ -510,6 +518,12 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "obstacles": [list(obstacle) for obstacle in config.obstacles],
             "grid_resolution": config.grid_resolution,
         },
+        "camera": {
+            "center_x": config.camera_center_x,
+            "center_y": config.camera_center_y,
+            "width": config.camera_width,
+            "height": config.camera_height,
+        },
         "planner": {
             "type": config.planner_type,
             "path_simplifier": config.path_simplifier,
@@ -581,6 +595,7 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     coordination = payload.get("coordination", {}) if isinstance(payload.get("coordination", {}), dict) else {}
     sensor = payload.get("sensor", {}) if isinstance(payload.get("sensor", {}), dict) else {}
     simulation = payload.get("simulation", {}) if isinstance(payload.get("simulation", {}), dict) else {}
+    camera = payload.get("camera", {}) if isinstance(payload.get("camera", {}), dict) else {}
     multi_robot = payload.get("multi_robot", {}) if isinstance(payload.get("multi_robot", {}), dict) else {}
 
     planner_type = str(planner.get("type", default.planner_type))
@@ -691,6 +706,10 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
             map_data.get("grid_resolution", default.grid_resolution),
             default.grid_resolution,
         ),
+        camera_center_x=_as_float(camera.get("center_x", default.camera_center_x), default.camera_center_x),
+        camera_center_y=_as_float(camera.get("center_y", default.camera_center_y), default.camera_center_y),
+        camera_width=max(1.0, _as_float(camera.get("width", default.camera_width), default.camera_width)),
+        camera_height=max(1.0, _as_float(camera.get("height", default.camera_height), default.camera_height)),
         obstacles=_as_obstacle_list(map_data.get("obstacles", default.obstacles)),
         show_goal_preview=bool(
             simulation.get("show_goal_preview", default.show_goal_preview)

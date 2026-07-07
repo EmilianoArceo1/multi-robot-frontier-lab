@@ -249,6 +249,12 @@ class TopBar(QFrame):
         self.multi_mode_button.setCheckable(True)
         self.multi_mode_button.setFixedSize(86, 30)
         self.multi_mode_button.clicked.connect(lambda: self.set_agent_mode("Multiple Robot Mode"))
+
+        self.editor_button = QPushButton("Editor")
+        self.editor_button.setObjectName("modeSegmentButton")
+        self.editor_button.setCheckable(True)
+        self.editor_button.setFixedSize(78, 30)
+        self.editor_button.clicked.connect(self.window.toggle_editor_mode_from_button)
         self.update_mode_icon(self.mode_selector.currentText())
 
         self.gear_button = QPushButton()
@@ -286,6 +292,7 @@ class TopBar(QFrame):
         layout.addWidget(self.mode_icon)
         layout.addWidget(self.single_mode_button)
         layout.addWidget(self.multi_mode_button)
+        layout.addWidget(self.editor_button)
         layout.addSpacing(12)
         layout.addWidget(self.gear_button)
         layout.addWidget(self.min_button)
@@ -314,6 +321,11 @@ class TopBar(QFrame):
             self.multi_mode_button.setChecked(is_multiple)
             self.single_mode_button.blockSignals(False)
             self.multi_mode_button.blockSignals(False)
+
+        if hasattr(self, "editor_button"):
+            self.editor_button.blockSignals(True)
+            self.editor_button.setChecked(getattr(self.window, "editor_mode", False))
+            self.editor_button.blockSignals(False)
 
     def set_status(self, state: str):
         if state == "running":

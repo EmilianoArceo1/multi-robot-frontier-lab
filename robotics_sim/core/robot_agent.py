@@ -192,7 +192,15 @@ class RobotAgent:
     # ------------------------------------------------------------------ route state
 
     def invalidate_route(self, reason: str = "") -> None:
-        """Clear the active path and the prefetch buffer."""
+        """Clear the active path and the prefetch buffer.
+
+        Does NOT touch exploration_target_xy: several callers (e.g.
+        set_exploration_target()) invalidate the route to discard a
+        now-stale path while deliberately keeping -- or having just
+        assigned -- the exploration target. Use
+        invalidate_failed_exploration_route() when the target itself must
+        be abandoned because planning to it failed.
+        """
         self.waypoints.clear()
         self.active_path_goal_xy = None
         self.active_path_mode = None
@@ -201,6 +209,21 @@ class RobotAgent:
         self.status = "idle"
         if reason:
             self.last_plan_reason = reason
+
+    def invalidate_failed_exploration_route(self, reason: str = "") -> None:
+        """Clear the active/pending route AND the exploration target that
+        failed to produce a usable path.
+
+        Use this instead of invalidate_route() specifically when a planner
+        attempt for the current exploration_target_xy has failed. Without
+        clearing exploration_target_xy here, desired_target_from_mode()
+        keeps returning the same unreachable target, and the exploration
+        loop immediately re-requests a plan for it -- producing a repeated
+        planner-failure loop instead of falling back to HOLD and picking a
+        fresh target on the next tick.
+        """
+        self.invalidate_route(reason=reason)
+        self.exploration_target_xy = None
 
     def assign_path(
         self,

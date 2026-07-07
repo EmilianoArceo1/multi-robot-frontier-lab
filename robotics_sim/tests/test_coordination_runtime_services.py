@@ -83,26 +83,48 @@ def test_runtime_frontier_provider_adapts_legacy_planner(monkeypatch):
     assert calls[0]["invalidated_targets_by_robot"] == (((1.0, 1.0),),)
 
 
-def test_runtime_team_frontier_provider_calls_legacy_planner_once_for_whole_team(monkeypatch):
+def test_runtime_team_frontier_provider_exposes_raw_candidate_pool(monkeypatch):
     from robotics_sim.simulation import coordination_services as services_module
+    from robotics_sim.planning.exploration_planners import FrontierCandidate
 
     calls = []
 
-    def fake_assign_frontier_viewpoints(**kwargs):
+    def fake_detect_global_frontier_candidates(**kwargs):
         calls.append(kwargs)
-        return FakePlannerResult(
-            targets=((2.0, 0.0), (0.0, 2.0)),
-            reasons=("fake team r0", "fake team r1"),
-            assignments=(
-                FakePlannerAssignment(target=(2.0, 0.0), score=8.0),
-                FakePlannerAssignment(target=(0.0, 2.0), score=7.0),
+        return (
+            FrontierCandidate(
+                target=(2.0, 0.0),
+                size=3,
+                distance_from_robot=0.0,
+                score=8.0,
+                information_gain=7.0,
+                reason="fake frontier east",
             ),
+            FrontierCandidate(
+                target=(0.0, 2.0),
+                size=2,
+                distance_from_robot=0.0,
+                score=7.0,
+                information_gain=6.0,
+                reason="fake frontier north",
+            ),
+        )
+
+    def forbidden_assign_frontier_viewpoints(**kwargs):
+        raise AssertionError(
+            "RuntimeTeamFrontierProvider must not call assign_frontier_viewpoints(); "
+            "providers expose candidates, coordinators allocate targets."
         )
 
     monkeypatch.setattr(
         services_module,
+        "detect_global_frontier_candidates",
+        fake_detect_global_frontier_candidates,
+    )
+    monkeypatch.setattr(
+        services_module,
         "assign_frontier_viewpoints",
-        fake_assign_frontier_viewpoints,
+        forbidden_assign_frontier_viewpoints,
     )
 
     request = CoordinationRequest(
@@ -122,13 +144,31 @@ def test_runtime_team_frontier_provider_calls_legacy_planner_once_for_whole_team
     candidates = provider.candidates_for_team(request)
 
     assert len(calls) == 1
-    assert calls[0]["robots_to_assign"] == (0, 1)
-    assert calls[0]["robot_states"] == request.robot_states
-    assert calls[0]["invalidated_targets_by_robot"] == (((1.0, 1.0),), ())
-    assert candidates[0][0].target == (2.0, 0.0)
-    assert candidates[1][0].target == (0.0, 2.0)
-    assert candidates[0][0].metadata["team_synchronized"] is True
+    assert calls[0]["explored_points"] == ((0.0, 0.0),)
+    assert calls[0]["mapped_obstacle_points"] == ()
+    assert calls[0]["bounds"] == (-5.0, 5.0, -5.0, 5.0)
+    assert calls[0]["resolution"] == 0.5
 
+    assert set(candidates) == {0, 1}
+
+    for robot_id in (0, 1):
+        assert len(candidates[robot_id]) == 2
+        assert {candidate.target for candidate in candidates[robot_id]} == {
+            (2.0, 0.0),
+            (0.0, 2.0),
+        }
+        assert all(
+            candidate.source == "runtime_team_frontier_provider"
+            for candidate in candidates[robot_id]
+        )
+        assert all(
+            candidate.metadata["provider"] == "RuntimeTeamFrontierProvider"
+            for candidate in candidates[robot_id]
+        )
+        assert all(
+            candidate.metadata["team_synchronized"] is True
+            for candidate in candidates[robot_id]
+        )
 
 def test_runtime_passes_min_frontier_distance_to_plugin():
     from robotics_sim.simulation import coordination as sim_coord
@@ -168,24 +208,46 @@ def test_runtime_passes_min_frontier_distance_to_plugin():
 def test_multi_robot_coordinator_injects_world_and_team_runtime_services(monkeypatch):
     from robotics_sim.simulation import coordination as sim_coord
     from robotics_sim.simulation import coordination_services as services_module
+    from robotics_sim.planning.exploration_planners import FrontierCandidate
 
     calls = []
 
-    def fake_assign_frontier_viewpoints(**kwargs):
+    def fake_detect_global_frontier_candidates(**kwargs):
         calls.append(kwargs)
-        return FakePlannerResult(
-            targets=((3.0, 0.0), (0.0, 3.0)),
-            reasons=("fake runtime frontier r0", "fake runtime frontier r1"),
-            assignments=(
-                FakePlannerAssignment(target=(3.0, 0.0), score=8.0),
-                FakePlannerAssignment(target=(0.0, 3.0), score=7.0),
+        return (
+            FrontierCandidate(
+                target=(3.0, 0.0),
+                size=4,
+                distance_from_robot=0.0,
+                score=8.0,
+                information_gain=7.0,
+                reason="fake runtime frontier east",
             ),
+            FrontierCandidate(
+                target=(0.0, 3.0),
+                size=3,
+                distance_from_robot=0.0,
+                score=7.0,
+                information_gain=6.0,
+                reason="fake runtime frontier north",
+            ),
+        )
+
+    def forbidden_assign_frontier_viewpoints(**kwargs):
+        raise AssertionError(
+            "RuntimeTeamFrontierProvider must not call assign_frontier_viewpoints() "
+            "during team candidate generation."
         )
 
     monkeypatch.setattr(
         services_module,
+        "detect_global_frontier_candidates",
+        fake_detect_global_frontier_candidates,
+    )
+    monkeypatch.setattr(
+        services_module,
         "assign_frontier_viewpoints",
-        fake_assign_frontier_viewpoints,
+        forbidden_assign_frontier_viewpoints,
     )
 
     coordinator = sim_coord.MultiRobotCoordinator(strategy=MMPF_COORDINATOR)
@@ -218,8 +280,10 @@ def test_multi_robot_coordinator_injects_world_and_team_runtime_services(monkeyp
     )
 
     assert len(calls) == 1
-    assert calls[0]["robots_to_assign"] == (0, 1)
+    assert calls[0]["explored_points"] == ((0.0, 0.0),)
+
     assert result.strategy == MMPF_COORDINATOR
-    assert result.targets == ((3.0, 0.0), (0.0, 3.0))
+    assert result.debug["source"] == "team_frontier_provider"
+    assert set(result.targets) == {(3.0, 0.0), (0.0, 3.0)}
     assert result.reasons[0].startswith("selected by MMPF explore coordinator")
     assert result.reasons[1].startswith("selected by MMPF explore coordinator")

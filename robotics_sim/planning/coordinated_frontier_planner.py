@@ -125,6 +125,116 @@ def _route_segment_overlap_ratio(
     return hits / len(samples)
 
 
+@dataclass(frozen=True)
+class CorridorValidationResult:
+    """Outcome of validating a full waypoint corridor before it goes ACTIVE.
+
+    reason_code is "" when is_valid is True, otherwise one of:
+        "route_conflict_with_robot_safety_zone"
+        "route_conflict_with_active_route"
+        "corridor_reservation_conflict"
+    """
+
+    is_valid: bool
+    reason_code: str
+    detail: str
+
+
+def _sample_polyline(points: Sequence[tuple[float, float]], spacing: float) -> list[tuple[float, float]]:
+    normalized = [(float(p[0]), float(p[1])) for p in points if p is not None]
+    if len(normalized) < 2:
+        return list(normalized)
+    samples: list[tuple[float, float]] = []
+    for start, end in zip(normalized[:-1], normalized[1:]):
+        samples.extend(_sample_route_to_target(start, end, spacing))
+    return samples
+
+
+def validate_multi_robot_corridor(
+    *,
+    start: tuple[float, float],
+    waypoints: Sequence[tuple[float, float]],
+    ego_safety_radius: float,
+    other_robot_disks: Sequence[tuple[float, float, float]] = (),
+    other_routes: Sequence[Sequence[tuple[float, float]]] = (),
+    reserved_corridors: Sequence[Sequence[tuple[float, float]]] = (),
+    margin: float = 0.0,
+    sample_spacing: float = 0.25,
+) -> CorridorValidationResult:
+    """Validate a FULL candidate corridor before it is accepted as ACTIVE.
+
+    This runs earlier and is stricter than the per-frame movement safety veto,
+    which only checks the immediate next segment once a route is already
+    moving. Here every planned segment (Direct's single segment included) is
+    checked against:
+        - other robots' current position + safety radius
+        - other robots' active routes
+        - reserved corridors (if any are supplied; empty by default today)
+
+    A robot that already starts within another robot's combined safety
+    clearance is not treated as a violation -- that is the team's starting
+    formation, not a corridor crossing (mirrors the same fix applied to
+    assign_frontier_viewpoints's teammate-corridor check).
+    """
+    corridor = [(float(start[0]), float(start[1]))] + [
+        (float(point[0]), float(point[1])) for point in waypoints
+    ]
+    segments = _polyline_segments(corridor)
+    if not segments:
+        return CorridorValidationResult(True, "", "no movement segment to validate")
+
+    ego_safety_radius = float(ego_safety_radius)
+    margin = max(float(margin), 0.0)
+
+    for cx, cy, radius in other_robot_disks:
+        center = (float(cx), float(cy))
+        required = ego_safety_radius + float(radius) + margin
+        if _distance(corridor[0], center) <= required:
+            # Already this close at the start is the spawn/starting formation,
+            # not a corridor the robot is choosing to drive through.
+            continue
+        for seg_start, seg_end in segments:
+            if _distance_point_to_segment(center, seg_start, seg_end) <= required:
+                return CorridorValidationResult(
+                    False,
+                    "route_conflict_with_robot_safety_zone",
+                    f"corridor passes within {required:.2f} m of a teammate at "
+                    f"({center[0]:.2f}, {center[1]:.2f})",
+                )
+
+    samples = _sample_polyline(corridor, max(float(sample_spacing), 1e-3))
+    required_clearance = ego_safety_radius + margin
+
+    def _crosses_any(routes: Sequence[Sequence[tuple[float, float]]]) -> bool:
+        for route in routes:
+            route_segments = _polyline_segments(route)
+            if not route_segments:
+                continue
+            for sample in samples:
+                if any(
+                    _distance_point_to_segment(sample, a, b) <= required_clearance
+                    for a, b in route_segments
+                ):
+                    return True
+        return False
+
+    if _crosses_any(other_routes):
+        return CorridorValidationResult(
+            False,
+            "route_conflict_with_active_route",
+            "corridor crosses a teammate's active route",
+        )
+
+    if _crosses_any(reserved_corridors):
+        return CorridorValidationResult(
+            False,
+            "corridor_reservation_conflict",
+            "corridor crosses a reserved corridor",
+        )
+
+    return CorridorValidationResult(True, "", "corridor clear")
+
+
 def _cell_key(point: tuple[float, float], resolution: float) -> tuple[int, int]:
     return (int(round(float(point[0]) / resolution)), int(round(float(point[1]) / resolution)))
 
@@ -390,29 +500,37 @@ def _target_too_close(
     return any(_distance(target, other) <= radius for other in others)
 
 
+_DEBUG_COUNTER_KEYS = (
+    "raw_candidates",
+    "rejected_by_invalidated",
+    "rejected_by_target_too_close",
+    "rejected_by_teammate_distance",
+    "rejected_by_corridor_overlap",
+    "rejected_by_route_overlap",
+    "rejected_by_zero_information_gain",
+    # Named to match what an operator actually asks when reading a HOLD/penalty
+    # reason: "why was this candidate rejected or penalized?"
+    "too_close_to_robot",
+    "target_reservation_conflict",
+    "active_route_overlap",
+    "fov_overlap_penalty",
+    "safety_replan_blacklist",
+)
+
+
+def _new_debug_counters() -> dict[str, int]:
+    return {key: 0 for key in _DEBUG_COUNTER_KEYS}
+
+
 def _build_debug_reason(
     base_reason: str,
     *,
-    raw_candidates: int,
-    rejected_by_invalidated: int,
-    rejected_by_target_too_close: int,
-    rejected_by_teammate_distance: int,
-    rejected_by_corridor_overlap: int,
-    rejected_by_route_overlap: int,
-    rejected_by_zero_information_gain: int,
+    counters: dict[str, int],
     selected_target: tuple[float, float] | None,
 ) -> str:
     selected_text = "HOLD" if selected_target is None else f"{selected_target[0]:.2f},{selected_target[1]:.2f}"
-    return (
-        f"{base_reason}; raw_candidates={raw_candidates}; "
-        f"rejected_by_invalidated={rejected_by_invalidated}; "
-        f"rejected_by_target_too_close={rejected_by_target_too_close}; "
-        f"rejected_by_teammate_distance={rejected_by_teammate_distance}; "
-        f"rejected_by_corridor_overlap={rejected_by_corridor_overlap}; "
-        f"rejected_by_route_overlap={rejected_by_route_overlap}; "
-        f"rejected_by_zero_information_gain={rejected_by_zero_information_gain}; "
-        f"selected_target={selected_text}"
-    )
+    counters_text = "; ".join(f"{key}={counters.get(key, 0)}" for key in _DEBUG_COUNTER_KEYS)
+    return f"{base_reason}; {counters_text}; selected_target={selected_text}"
 
 
 def assign_frontier_viewpoints(
@@ -480,15 +598,7 @@ def assign_frontier_viewpoints(
         explored_cells_by_robot.append({_cell_key(point, resolution) for point in points})
 
     pair_options: dict[int, list[CoordinatedFrontierAssignment]] = {index: [] for index in assign_set}
-    debug_tracker: dict[int, dict[str, int]] = {index: {
-        "raw_candidates": 0,
-        "rejected_by_invalidated": 0,
-        "rejected_by_target_too_close": 0,
-        "rejected_by_teammate_distance": 0,
-        "rejected_by_corridor_overlap": 0,
-        "rejected_by_route_overlap": 0,
-        "rejected_by_zero_information_gain": 0,
-    } for index in assign_set}
+    debug_tracker: dict[int, dict[str, int]] = {index: _new_debug_counters() for index in assign_set}
     for index in sorted(assign_set):
         state = robot_states[index]
         invalidated = _target_list(
@@ -518,14 +628,23 @@ def assign_frontier_viewpoints(
         for candidate in global_candidates:
             debug_tracker[index]["raw_candidates"] += 1
             target = candidate.target
+
+            # A target already reserved by a robot that is not being
+            # reassigned this call is a strong soft penalty, not a veto: if it
+            # is genuinely the only usable candidate, assigning it anyway
+            # (accepting some duplication) still beats leaving this robot on
+            # HOLD indefinitely.
+            reservation_penalty = 0.0
             if _target_too_close(target, kept_targets, target_exclusion_radius):
                 debug_tracker[index]["rejected_by_invalidated"] += 1
-                continue
+                debug_tracker[index]["target_reservation_conflict"] += 1
+                reservation_penalty = 8.0
 
             distance = _distance(state.xy, target)
             invalidated_penalty = 2.0 if _target_too_close(target, invalidated, target_exclusion_radius) else 0.0
             if invalidated_penalty > 0.0:
                 debug_tracker[index]["rejected_by_invalidated"] += 1
+                debug_tracker[index]["safety_replan_blacklist"] += 1
             footprint = _footprint_cells(
                 target,
                 resolution=resolution,
@@ -536,18 +655,24 @@ def assign_frontier_viewpoints(
                 len(footprint & other_explored_cells) / max(len(footprint), 1)
                 if footprint else 0.0
             )
+            if other_map_ratio > 0.3:
+                debug_tracker[index]["fov_overlap_penalty"] += 1
+
+            # A candidate whose direct corridor from the robot's current
+            # position crosses a teammate's safety disk is penalized, not
+            # vetoed -- same reasoning as reservation_penalty above: it should
+            # still be selectable as a last resort instead of forcing HOLD.
             corridor_margin = max(dynamic_obstacle_margin, resolution * 0.75)
-            corridor_conflict = False
+            corridor_penalty = 0.0
             for cx, cy, radius in teammate_disks:
                 center = (float(cx), float(cy))
                 if _distance(target, center) > float(radius) + float(state.safety_radius) + corridor_margin:
                     continue
                 if _distance_point_to_segment(center, state.xy, target) <= float(radius) + float(state.safety_radius) + corridor_margin:
-                    corridor_conflict = True
+                    corridor_penalty = 8.0
+                    debug_tracker[index]["rejected_by_corridor_overlap"] += 1
+                    debug_tracker[index]["too_close_to_robot"] += 1
                     break
-            if corridor_conflict:
-                debug_tracker[index]["rejected_by_corridor_overlap"] += 1
-                continue
 
             route_overlap_ratio = _route_segment_overlap_ratio(
                 start=state.xy,
@@ -558,22 +683,26 @@ def assign_frontier_viewpoints(
             )
             if route_overlap_ratio > 0.6:
                 debug_tracker[index]["rejected_by_route_overlap"] += 1
+                debug_tracker[index]["active_route_overlap"] += 1
 
             information_gain = float(candidate.information_gain)
             if information_gain <= 0.0:
                 debug_tracker[index]["rejected_by_zero_information_gain"] += 1
                 continue
 
-            # Overlap and route redundancy are treated as soft penalties.  A useful
-            # frontier should still be available when the team starts close or when
-            # the initial FoV overlaps; the planner should only reject candidates
-            # that are physically unsafe or otherwise impossible.
+            # Overlap, reservation conflicts, corridor crossings, and route
+            # redundancy are all treated as soft penalties. A useful frontier
+            # should still be available when the team starts close together or
+            # the initial FoV overlaps; the planner only hard-rejects
+            # candidates with zero information gain (see above).
             score = (
                 information_gain
                 - float(ipp_distance_penalty) * distance
                 - 6.0 * other_map_ratio
                 - 3.0 * route_overlap_ratio
                 - invalidated_penalty
+                - reservation_penalty
+                - corridor_penalty
             )
             reason = (
                 "coordinated frontier: assigned; "
@@ -638,13 +767,7 @@ def assign_frontier_viewpoints(
         targets[index] = None
         reasons[index] = _build_debug_reason(
             "coordinated frontier planner: no candidate survived filtering",
-            raw_candidates=debug_tracker.get(index, {}).get("raw_candidates", 0),
-            rejected_by_invalidated=debug_tracker.get(index, {}).get("rejected_by_invalidated", 0),
-            rejected_by_target_too_close=debug_tracker.get(index, {}).get("rejected_by_target_too_close", 0),
-            rejected_by_teammate_distance=debug_tracker.get(index, {}).get("rejected_by_teammate_distance", 0),
-            rejected_by_corridor_overlap=debug_tracker.get(index, {}).get("rejected_by_corridor_overlap", 0),
-            rejected_by_route_overlap=debug_tracker.get(index, {}).get("rejected_by_route_overlap", 0),
-            rejected_by_zero_information_gain=debug_tracker.get(index, {}).get("rejected_by_zero_information_gain", 0),
+            counters=debug_tracker.get(index, {}),
             selected_target=None,
         )
 
@@ -668,9 +791,16 @@ def assign_frontier_viewpoints(
         dfs(pos + 1, current_score - 1000.0, partial)
 
         for option in pair_options[robot_index][:12]:
+            duplicate_penalty = 0.0
             if _target_too_close(option.target, chosen_targets, target_exclusion_radius):
-                continue
-            extra_penalty = 0.0
+                # A candidate that duplicates an already-reserved/chosen target
+                # is nearly useless (both robots would drive to the same
+                # spot), but it is still better than leaving a robot on HOLD
+                # when nothing else is available -- so this is a large soft
+                # penalty, not a pruning `continue`.
+                duplicate_penalty = 1000.0
+
+            extra_penalty = duplicate_penalty
             for other_robot_index, other in partial.items():
                 separation = _distance(option.target, other.target)
                 if separation < target_exclusion_radius:
@@ -678,28 +808,35 @@ def assign_frontier_viewpoints(
                 elif separation < avg_sensor_range:
                     extra_penalty += 4.0 * (avg_sensor_range - separation) / max(avg_sensor_range, 1e-6)
 
-                # Two newly assigned robots should also not receive corridors
-                # that immediately pass through each other's current safety
-                # zones. This is not robot-robot avoidance control; it is target
-                # assignment refusing an obviously bad crossing.
+                # Two newly assigned robots should also avoid corridors that
+                # cross each other's current safety zones mid-route. This is
+                # not robot-robot avoidance control; it is target assignment
+                # discouraging an obviously bad crossing. It is a soft penalty
+                # (not a veto) so HOLD remains a last resort. ignore_near_start
+                # keeps it from firing just because the team already starts
+                # close together (e.g. spawning side by side) -- that is not a
+                # crossing, it is the starting formation.
                 other_state = robot_states[other_robot_index]
                 current_state = robot_states[robot_index]
+                same_start_radius = (
+                    float(current_state.safety_radius) + float(other_state.safety_radius) + dynamic_obstacle_margin
+                )
                 if _segment_crosses_any_disk(
                     start=current_state.xy,
                     end=option.target,
                     disks=[(other_state.xy[0], other_state.xy[1], float(other_state.safety_radius))],
                     margin=float(current_state.safety_radius) + dynamic_obstacle_margin,
+                    ignore_near_start=same_start_radius,
                 ):
-                    extra_penalty += 1000.0
+                    extra_penalty += 400.0
                 if _segment_crosses_any_disk(
                     start=other_state.xy,
                     end=other.target,
                     disks=[(current_state.xy[0], current_state.xy[1], float(current_state.safety_radius))],
                     margin=float(other_state.safety_radius) + dynamic_obstacle_margin,
+                    ignore_near_start=same_start_radius,
                 ):
-                    extra_penalty += 1000.0
-            if extra_penalty >= 1000.0:
-                continue
+                    extra_penalty += 400.0
             partial[robot_index] = option
             chosen_targets.append(option.target)
             dfs(pos + 1, current_score + option.score - extra_penalty, partial)
@@ -713,13 +850,7 @@ def assign_frontier_viewpoints(
         assignments[index] = assignment
         reasons[index] = _build_debug_reason(
             assignment.reason,
-            raw_candidates=debug_tracker.get(index, {}).get("raw_candidates", 0),
-            rejected_by_invalidated=debug_tracker.get(index, {}).get("rejected_by_invalidated", 0),
-            rejected_by_target_too_close=debug_tracker.get(index, {}).get("rejected_by_target_too_close", 0),
-            rejected_by_teammate_distance=debug_tracker.get(index, {}).get("rejected_by_teammate_distance", 0),
-            rejected_by_corridor_overlap=debug_tracker.get(index, {}).get("rejected_by_corridor_overlap", 0),
-            rejected_by_route_overlap=debug_tracker.get(index, {}).get("rejected_by_route_overlap", 0),
-            rejected_by_zero_information_gain=debug_tracker.get(index, {}).get("rejected_by_zero_information_gain", 0),
+            counters=debug_tracker.get(index, {}),
             selected_target=assignment.target,
         )
 
@@ -728,13 +859,7 @@ def assign_frontier_viewpoints(
         if not reasons[index] or reasons[index] == "no target assigned yet":
             reasons[index] = _build_debug_reason(
                 "coordinated frontier planner: held to avoid duplicate/low-value frontier",
-                raw_candidates=debug_tracker.get(index, {}).get("raw_candidates", 0),
-                rejected_by_invalidated=debug_tracker.get(index, {}).get("rejected_by_invalidated", 0),
-                rejected_by_target_too_close=debug_tracker.get(index, {}).get("rejected_by_target_too_close", 0),
-                rejected_by_teammate_distance=debug_tracker.get(index, {}).get("rejected_by_teammate_distance", 0),
-                rejected_by_corridor_overlap=debug_tracker.get(index, {}).get("rejected_by_corridor_overlap", 0),
-                rejected_by_route_overlap=debug_tracker.get(index, {}).get("rejected_by_route_overlap", 0),
-                rejected_by_zero_information_gain=debug_tracker.get(index, {}).get("rejected_by_zero_information_gain", 0),
+                counters=debug_tracker.get(index, {}),
                 selected_target=None,
             )
 

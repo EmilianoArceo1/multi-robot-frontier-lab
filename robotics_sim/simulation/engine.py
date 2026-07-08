@@ -38,6 +38,7 @@ from robotics_sim.simulation.navigation_modes import (
 )
 from robotics_sim.navigation.exploration_behavior import ExplorationBehavior
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
+from robotics_sim.simulation.telemetry import TelemetryLogger
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
@@ -551,6 +552,22 @@ class SimulationControllerMixin:
                 if excluded_targets
                 else 0.0
             ),
+        )
+
+        selected_score = None
+        if result.success and result.target is not None:
+            selected_key = (round(float(result.target[0]), 3), round(float(result.target[1]), 3))
+            for candidate in result.candidates:
+                if (round(float(candidate.target[0]), 3), round(float(candidate.target[1]), 3)) == selected_key:
+                    selected_score = candidate.score
+                    break
+        self.telemetry.report_frontier_selection(
+            robot_label="R1",
+            success=bool(result.success),
+            selected=result.target if result.success else None,
+            reason=str(result.reason),
+            score=selected_score,
+            candidate_count=len(result.candidates),
         )
 
         if not result.success or result.target is None:
@@ -1781,7 +1798,10 @@ class SimulationControllerMixin:
                 self.canvas.set_planned_path([(self.robot.x, self.robot.y)] + clean_waypoints)
                 if self.is_exploration_mode() and clean_waypoints:
                     self.canvas.set_exploration_target(clean_waypoints[-1])
-                self.canvas.set_status(
+                # Verbose legacy detail: debug-only console line. Normal
+                # mode gets the compact [ROUTE ok] line from
+                # log_route_assignment() below instead.
+                self.telemetry.debug(
                     f"Planner: {self.planner_label()}. {self.last_goal_selection_reason}. {reason}. "
                     f"Mapped points: {len(self.mapped_obstacle_points)}."
                 )
@@ -1821,9 +1841,13 @@ class SimulationControllerMixin:
             self.canvas.set_status(
                 f"Planner failed in exploration mode: {reason}. Holding current position; not falling back to G."
             )
-            self.log_console_message(
-                f"R1 holding position at {self._xy_text(hold_xy)}; planner failed in exploration mode: {reason}; "
-                f"attempted_target={attempted_target}"
+            self.telemetry.report_route_failure(
+                robot_label="R1",
+                start_xy=hold_xy,
+                attempted_target=attempted_target,
+                reason=reason,
+                planner_type=str(self.config.planner_type),
+                mapped_obstacle_count=len(self.mapped_obstacle_points),
             )
             return
 
@@ -1956,6 +1980,23 @@ class SimulationControllerMixin:
         if canvas is not None and hasattr(canvas, "clear_status_history"):
             canvas.clear_status_history()
 
+    def ensure_telemetry(self) -> TelemetryLogger:
+        """Return the shared TelemetryLogger, creating it if needed.
+
+        engine.py only decides WHEN to report an event (calls report_*()
+        every tick/sample/route event); TelemetryLogger decides HOW that is
+        throttled, aggregated, and formatted. The sink is this engine's own
+        log_console_message(), so telemetry lines land in the same console
+        history as everything else, without telemetry.py importing Qt/canvas.
+        """
+        if not hasattr(self, "_telemetry") or self._telemetry is None:
+            self._telemetry = TelemetryLogger(sink=self.log_console_message)
+        return self._telemetry
+
+    @property
+    def telemetry(self) -> TelemetryLogger:
+        return self.ensure_telemetry()
+
     def log_console_message(self, message: str, *, visible_status: bool = False) -> None:
         """Write a readable debugging message to the simulation console.
 
@@ -2076,11 +2117,20 @@ class SimulationControllerMixin:
     ) -> None:
         label = f"R{int(robot_index) + 1}" if robot_index is not None else "R1"
         target = waypoints[-1] if waypoints else None
-        self.log_console_message(
-            f"{label} route assigned: start={self._xy_text(start_xy)}, "
-            f"target={self._xy_text(target)}, waypoints={len(waypoints)}, "
-            f"planner={self.config.planner_type}, exploration={self.config.exploration_planner}, "
-            f"reason={reason}"
+        length = 0.0
+        previous = start_xy
+        for point in waypoints:
+            length += math.hypot(float(point[0]) - float(previous[0]), float(point[1]) - float(previous[1]))
+            previous = point
+        self.telemetry.report_route_success(
+            robot_label=label,
+            start_xy=start_xy,
+            goal_xy=target,
+            wp_count=len(waypoints),
+            planner_type=str(self.config.planner_type),
+            simplifier=str(self.config.path_simplifier),
+            length=length,
+            mapped_obstacle_count=len(self.mapped_obstacle_points),
         )
 
     def log_robot_motion(
@@ -2118,11 +2168,66 @@ class SimulationControllerMixin:
         if target is None:
             target = self.active_target_xy()
 
-        self.log_console_message(
-            f"{label} move @ t={now:.2f}s: pos=({float(robot.x):.2f}, {float(robot.y):.2f}), "
-            f"theta={float(robot.theta):.3f} rad, v={float(robot.v):.3f} m/s, "
-            f"target={self._xy_text(target)}, {self._control_text(control)}"
+        telemetry = self.telemetry
+        telemetry.report_move(
+            sim_time=now,
+            robot_label=label,
+            pos=(float(robot.x), float(robot.y)),
+            theta=float(robot.theta),
+            v=float(robot.v),
+            target=target,
+            control_text=self._control_text(control),
         )
+
+        agent = self.runtime_agent(robot_index)
+        path_goal = getattr(agent, "active_path_goal_xy", None) if agent is not None else None
+        wp_index, wp_total = self._waypoint_progress_for_robot(robot)
+
+        # No active exploration route (path_goal is None): the robot may
+        # still have a single "hold" waypoint pointing at its own current
+        # position (see set_robot_goal_or_waypoints() in the HOLD/exhausted
+        # decision handlers), but that is not a real destination -- do not
+        # report it as `target` in [STATE], or an exhausted/holding robot
+        # misleadingly looks like it is still driving somewhere.
+        holding_without_route = path_goal is None
+        state_target = None if holding_without_route else target
+        hold_pos = (float(robot.x), float(robot.y)) if holding_without_route else None
+        state_wp_index = 0 if holding_without_route else wp_index
+        state_wp_total = 0 if holding_without_route else wp_total
+
+        telemetry.report_state(
+            sim_time=now,
+            wall_time=time.perf_counter(),
+            speed_multiplier=float(getattr(self, "simulation_speed", 1.0)),
+            robot_label=label,
+            pos=(float(robot.x), float(robot.y)),
+            theta=float(robot.theta),
+            v=float(robot.v),
+            state=mode_name(robot),
+            target=state_target,
+            path_goal=path_goal,
+            hold_pos=hold_pos,
+            wp_index=state_wp_index,
+            wp_total=state_wp_total,
+            mapped_obstacle_count=len(self.mapped_obstacle_points),
+            explored_percent=self.estimated_explored_percent(),
+            force=force,
+        )
+
+    def _waypoint_progress_for_robot(self, robot) -> tuple[int, int]:
+        """(current 1-based index, total) waypoints for *robot*'s own route.
+
+        Mirrors remaining_waypoint_count()'s introspection, generalized to
+        any robot (not just self.robot), for [STATE] snapshots.
+        """
+        waypoint_manager = getattr(robot, "waypoints", None)
+        raw_waypoints = getattr(waypoint_manager, "waypoints", None)
+        current_index = getattr(waypoint_manager, "current_index", None)
+        if raw_waypoints is not None and isinstance(current_index, int):
+            total = len(raw_waypoints)
+            index = min(current_index + 1, total) if total else 0
+            return index, total
+        return (0, 0)
 
     def latest_decision_message(self) -> str:
         status = ""
@@ -4134,13 +4239,17 @@ class SimulationControllerMixin:
             if newly_discovered:
                 self.mapping_update_count += 1
             if newly_discovered and self.config.planner_type != "Direct":
-                if self.new_information_affects_current_route(newly_discovered):
+                route_affected = self.new_information_affects_current_route(newly_discovered)
+                self.telemetry.report_map_update(
+                    sim_time=float(self.simulation_time),
+                    new_points=newly_discovered,
+                    total_count=len(self.mapped_obstacle_points),
+                    route_affected=route_affected,
+                    explored_percent=self.estimated_explored_percent(),
+                )
+                if route_affected:
                     self.replan_after_new_information("New obstacle affects current route.")
                     return
-
-                self.canvas.set_status(
-                    f"Mapped {len(newly_discovered)} new obstacle boundary sample(s). Current route unchanged."
-                )
 
         robot_position = (float(self.robot.x), float(self.robot.y))
         robot_radius = self.safety_radius()
@@ -4511,11 +4620,14 @@ class SimulationControllerMixin:
         kind = decision.kind
 
         if kind != "FOLLOW_PATH":
-            self.log_console_message(
-                f"[NAV] kind={kind} brake={decision.brake} reason={decision.reason!r} "
-                f"active_target={getattr(agent, 'active_target', lambda: None)()} "
-                f"path_goal={getattr(agent, 'active_path_goal_xy', None)} "
-                f"pending_target={getattr(agent, 'pending_target_xy', None)}"
+            self.telemetry.report_nav_decision(
+                sim_time=float(self.simulation_time),
+                robot_label="R1",
+                kind=kind,
+                reason=decision.reason,
+                active_target=getattr(agent, "active_target", lambda: None)(),
+                path_goal=getattr(agent, "active_path_goal_xy", None),
+                pending_target=getattr(agent, "pending_target_xy", None),
             )
 
         if kind == "FOLLOW_PATH":
@@ -4619,10 +4731,13 @@ class SimulationControllerMixin:
                         f"Holding: repeated safety replan for the same target ({decision.reason}); "
                         "marking target as failed and re-selecting."
                     )
-                    self.log_console_message(
-                        f"R1 holding position at {self._xy_text(hold_xy)}; repeated safety replan "
-                        f"for the same target ({decision.reason}); attempted_target={attempted_target}; "
-                        "marking target as failed."
+                    self.telemetry.report_route_failure(
+                        robot_label="R1",
+                        start_xy=hold_xy,
+                        attempted_target=attempted_target,
+                        reason=f"repeated safety replan: {decision.reason}",
+                        planner_type=str(self.config.planner_type),
+                        mapped_obstacle_count=len(self.mapped_obstacle_points),
                     )
             return True  # always brake for safety replans
 

@@ -259,9 +259,21 @@ class ExplorationBehavior:
         # No exploration target assigned. Reached either on a genuine cold
         # start, or in recovery after a planner failure (or an earlier
         # empty retry) cleared exploration_target_xy via
-        # RobotAgent.invalidate_failed_exploration_route(). Gate
-        # re-selection behind a cooldown so a fully-explored map does not
-        # re-run frontier detection every single tick.
+        # RobotAgent.invalidate_failed_exploration_route().
+        map_signature = len(observation.mapped_obstacle_points)
+
+        # Exploration exhausted: enough consecutive recovery failures have
+        # happened with no new map information since we gave up. Stay in a
+        # stable hold instead of re-running frontier detection every
+        # cooldown cycle forever -- this is what distinguishes "one target
+        # failed, try another" from "nothing reachable remains, stop
+        # asking". exploration_exhausted() itself clears this state (and
+        # lets recovery resume) once map_signature changes.
+        if agent.exploration_exhausted(map_signature=map_signature):
+            return hold(reason="exploration exhausted: no reachable frontier candidates")
+
+        # Gate re-selection behind a cooldown so a fully-explored map does
+        # not re-run frontier detection every single tick.
         if agent.exploration_retry_on_cooldown(
             current_time=observation.current_time, cooldown=self._FAILURE_RETRY_COOLDOWN
         ):
@@ -272,6 +284,7 @@ class ExplorationBehavior:
         if next_target is None:
             agent.stop_count_exploration += 1
             agent.note_exploration_retry_attempt(observation.current_time)
+            agent.register_exploration_failure(map_signature=map_signature)
             return hold(reason="no reachable frontier candidates remain")
 
         return request_plan(

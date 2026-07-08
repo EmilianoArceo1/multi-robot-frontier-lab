@@ -1767,10 +1767,12 @@ class SimulationControllerMixin:
             # keeps returning the target that just failed to plan, and the
             # agent immediately re-requests a plan for it next tick.
             agent = self.runtime_agent(None)
+            attempted_target = agent.exploration_target_xy if agent is not None else None
             if agent is not None:
                 agent.invalidate_failed_exploration_route(
                     reason=f"planner failed: {reason}",
                     current_time=float(self.simulation_time),
+                    map_signature=len(self.mapped_obstacle_points),
                 )
 
             self.current_exploration_target = None
@@ -1780,7 +1782,8 @@ class SimulationControllerMixin:
                 f"Planner failed in exploration mode: {reason}. Holding current position; not falling back to G."
             )
             self.log_console_message(
-                f"R1 holding position at {self._xy_text(hold_xy)}; planner failed in exploration mode: {reason}"
+                f"R1 holding position at {self._xy_text(hold_xy)}; planner failed in exploration mode: {reason}; "
+                f"attempted_target={attempted_target}"
             )
             return
 
@@ -4510,10 +4513,12 @@ class SimulationControllerMixin:
                     # a fresh target instead of re-requesting the same
                     # route that keeps ending up blocked.
                     hold_xy = (float(robot.x), float(robot.y))
+                    attempted_target = agent.exploration_target_xy
                     self.set_robot_goal_or_waypoints(robot, [hold_xy])
                     agent.invalidate_failed_exploration_route(
                         reason=f"repeated safety replan: {decision.reason}",
                         current_time=float(self.simulation_time),
+                        map_signature=len(self.mapped_obstacle_points),
                     )
                     self.current_exploration_target = None
                     self.canvas.set_exploration_target(None)
@@ -4523,7 +4528,8 @@ class SimulationControllerMixin:
                     )
                     self.log_console_message(
                         f"R1 holding position at {self._xy_text(hold_xy)}; repeated safety replan "
-                        f"for the same target ({decision.reason}); marking target as failed."
+                        f"for the same target ({decision.reason}); attempted_target={attempted_target}; "
+                        "marking target as failed."
                     )
             return True  # always brake for safety replans
 

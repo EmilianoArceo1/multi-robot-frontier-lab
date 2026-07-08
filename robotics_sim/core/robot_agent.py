@@ -110,7 +110,19 @@ class RobotAgent:
     last_safety_replan_time: float = field(default=-1.0e9)
     last_safety_replan_signature: tuple[str, tuple[float, float] | None] | None = None
 
+    # Consecutive exploration-recovery failures (no successful route
+    # assigned in between). Reset by assign_path()/accept_pending_path() on
+    # any successful route. Once this reaches _EXPLORATION_FAILURE_BUDGET,
+    # exploration_exhausted() reports a stable exhaustion state instead of
+    # letting ExplorationBehavior keep retrying frontier selection every
+    # cooldown cycle forever.
+    consecutive_exploration_failures: int = 0
+    # Map signature (e.g. mapped-obstacle-point count) recorded at the
+    # moment exploration became exhausted. None means "not exhausted".
+    exploration_exhausted_map_signature: int | None = None
+
     _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
+    _EXPLORATION_FAILURE_BUDGET: ClassVar[int] = 3
 
     # Metrics counters (not displayed yet; available for future dashboard).
     stop_count_exploration: int = 0
@@ -230,6 +242,7 @@ class RobotAgent:
         reason: str = "",
         *,
         current_time: float = 0.0,
+        map_signature: int = 0,
     ) -> None:
         """Clear the active/pending route AND the exploration target that
         failed to produce a usable path.
@@ -242,15 +255,23 @@ class RobotAgent:
         planner-failure loop instead of falling back to HOLD and picking a
         fresh target on the next tick.
 
-        The failed target is also remembered (see mark_exploration_target_failed())
-        so the next target-selection attempt can exclude it and a short
-        retry cooldown can gate how soon that next attempt happens.
+        The failed target is remembered (see mark_exploration_target_failed())
+        so the next target-selection attempt can exclude it, and this
+        failure also counts toward the consecutive-failure budget (see
+        register_exploration_failure()) so a run of failures with no new
+        map information settles into a stable exhausted hold instead of
+        retrying forever.
+
+        map_signature should be a cheap, monotonically-changing summary of
+        the map (e.g. len(mapped_obstacle_points)) -- the caller (engine.py)
+        owns the map and passes it through, since RobotAgent does not.
         """
         failed_target = self.exploration_target_xy
         self.invalidate_route(reason=reason)
         self.exploration_target_xy = None
         if failed_target is not None:
             self.mark_exploration_target_failed(failed_target, current_time=current_time)
+        self.register_exploration_failure(map_signature=map_signature)
 
     # ------------------------------------------------------------------ exploration failure memory
 
@@ -295,6 +316,43 @@ class RobotAgent:
         """True when a recent failure/empty-retry means we should keep holding."""
         return (float(current_time) - self.last_exploration_failure_time) < float(cooldown)
 
+    # ------------------------------------------------------------------ exploration exhaustion
+
+    def register_exploration_failure(self, *, map_signature: int) -> int:
+        """Count one more consecutive exploration-recovery failure.
+
+        Once consecutive_exploration_failures reaches
+        _EXPLORATION_FAILURE_BUDGET, remember *map_signature* -- the map
+        state at the moment we gave up -- so exploration_exhausted() can
+        later tell "still the same unchanged map" from "new information
+        arrived, recovery may work now" apart.
+
+        Returns the updated consecutive-failure count.
+        """
+        self.consecutive_exploration_failures += 1
+        if self.consecutive_exploration_failures >= self._EXPLORATION_FAILURE_BUDGET:
+            self.exploration_exhausted_map_signature = int(map_signature)
+        return self.consecutive_exploration_failures
+
+    def exploration_exhausted(self, *, map_signature: int) -> bool:
+        """True when repeated recovery failures hit the budget and the map
+        has not changed since (same map_signature as when we gave up).
+
+        Distinguishes "a single failed target -- try another one" from
+        "exploration is genuinely exhausted -- stop requesting fresh
+        frontier plans until new map information appears". If
+        *map_signature* differs from the one recorded when exhaustion was
+        entered, this clears the exhausted state (and the failure counter)
+        and returns False, letting recovery resume.
+        """
+        if self.exploration_exhausted_map_signature is None:
+            return False
+        if int(map_signature) != self.exploration_exhausted_map_signature:
+            self.consecutive_exploration_failures = 0
+            self.exploration_exhausted_map_signature = None
+            return False
+        return True
+
     # ------------------------------------------------------------------ safety replan throttle
 
     def safety_replan_allowed(
@@ -338,6 +396,11 @@ class RobotAgent:
         self.waypoints.set_waypoints(waypoints)
         self.last_plan_reason = planner_reason
         self.status = "moving" if self.waypoints.has_path() else "finished"
+        # A route was successfully committed: exploration is progressing
+        # again, so the consecutive-failure/exhaustion state no longer
+        # applies.
+        self.consecutive_exploration_failures = 0
+        self.exploration_exhausted_map_signature = None
 
     def clear_if_planning_failed(self, reason: str) -> None:
         self.last_plan_reason = reason
@@ -419,6 +482,8 @@ class RobotAgent:
         self.pending_target_xy = None
         self.status = "moving"
         self.prefetch_success_count += 1
+        self.consecutive_exploration_failures = 0
+        self.exploration_exhausted_map_signature = None
         return waypoints
 
     def reject_pending_path(self, reason: str = "") -> None:

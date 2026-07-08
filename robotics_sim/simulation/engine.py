@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QObject, QRunnable
@@ -78,6 +79,8 @@ try:
 except ImportError:  # pragma: no cover
     RobotObservation = None  # type: ignore[assignment,misc]
     PlannerServices = None  # type: ignore[assignment]
+
+from robotics_sim.navigation.navigation_supervisor import NavigationSupervisor
 
 class PlannerWorkerSignals(QObject):
     route_ready = Signal(int, bool, str, list)
@@ -184,26 +187,14 @@ def route_reaches_goal(
 ) -> bool:
     """True when the route's final waypoint is within *tolerance* of *goal*.
 
-    A "successful" route (compute_planned_waypoints returning success=True,
-    e.g. after relocating an occupied goal cell to the nearest traversable
-    one) does not always actually terminate at the goal it was asked to
-    reach. Accepting such a route anyway means the robot follows it
-    faithfully to a DIFFERENT endpoint and then gets stuck there: whatever
-    tracks the route's intended destination (active_path_goal_xy /
-    pending_target_xy) keeps pointing at the original goal, so
-    distance-to-goal never drops below goal_tolerance and "frontier
-    reached" never fires -- the robot sits in STOP with the same stale
-    target/path_goal forever.
-
-    A module-level function (not a method) so it can be unit-tested without
-    instantiating the Qt-based simulation engine.
+    Thin backward-compatible delegate: the actual invariant now lives in
+    NavigationSupervisor.validate_route_endpoint(), the single place this
+    check is defined. Kept as a module-level function (rather than inlining
+    the supervisor call at each of this module's call sites) so existing
+    imports/tests referencing engine.route_reaches_goal keep working
+    unchanged.
     """
-    if not waypoints or goal is None:
-        return False
-    last = waypoints[-1]
-    return math.hypot(
-        float(last[0]) - float(goal[0]), float(last[1]) - float(goal[1])
-    ) <= float(tolerance)
+    return NavigationSupervisor.validate_route_endpoint(waypoints, goal, tolerance)
 
 
 def candidate_reachable_on_planning_grid(
@@ -4729,30 +4720,41 @@ class SimulationControllerMixin:
         """
         kind = decision.kind
 
-        if kind == "REPLAN_FOR_SAFETY" and not self.robots:
-            # REPLAN_FOR_SAFETY only makes sense when there is an active
-            # route to replan. RobotAgent.step() emits this decision
-            # unconditionally whenever active_segment_blocked/
-            # predicted_collision is set -- including with no active route
-            # at all (e.g. right after exploration_exhausted() put the
-            # agent into a stable HOLD) -- because that check runs before
-            # ExplorationBehavior.update() (and its own has_active_route
-            # guard) is ever reached. Normalize the decision kind here, at
-            # the engine boundary, BEFORE telemetry logs it and before any
-            # route-request/failure-marking logic runs below -- otherwise a
-            # route-less "REPLAN_FOR_SAFETY" still gets reported to the
-            # console and can still trip the safety-replan throttle even
-            # though nothing is actually being replanned. Scoped to
-            # single-robot mode (not self.robots) -- multi-robot has its own
-            # multi_safety_replan_allowed()/per-index route state and is
-            # untouched here.
-            has_active_route = (
-                agent is not None
-                and agent.active_path_goal_xy is not None
-                and agent.active_target() is not None
+        # NavigationSupervisor centralizes the two decision-level invariants
+        # that used to be separate inline checks scattered through this
+        # method: (1) REPLAN_FOR_SAFETY only makes sense with an active
+        # route -- RobotAgent.step() emits it unconditionally whenever
+        # active_segment_blocked/predicted_collision is set, even with
+        # nothing to replan (e.g. right after exploration_exhausted() put
+        # the agent into a stable HOLD), because that check runs before
+        # ExplorationBehavior.update() is ever reached; (2) REQUEST_PLAN to
+        # a target already within goal_tolerance produces a near-zero-length
+        # route that gets "reached" again within a tick. Both normalize to
+        # HOLD here, at the engine boundary, before telemetry logs the
+        # decision and before any route-request/failure-marking logic runs
+        # below. Scoped to single-robot mode (not self.robots) -- multi-robot
+        # has its own multi_safety_replan_allowed()/per-index route state
+        # and assign_route_to_multi_robot() dedup, untouched here.
+        if not self.robots:
+            original_kind = kind
+            decision = NavigationSupervisor.normalize_decision(
+                agent,
+                SimpleNamespace(robot_xy=(float(robot.x), float(robot.y))) if robot is not None else None,
+                decision,
+                float(self.config.goal_tolerance),
+                map_signature=len(self.mapped_obstacle_points),
             )
-            if not has_active_route:
-                kind = "HOLD"
+            kind = decision.kind
+            if original_kind == "REQUEST_PLAN" and kind == "HOLD" and agent is not None:
+                # normalize_decision() is pure and never mutates agent/canvas
+                # state; this mirrors what the REQUEST_PLAN-specific inline
+                # guard it replaces used to do here: an already-reached
+                # target must not linger in exploration_target_xy, or
+                # ExplorationBehavior step 6 (no active path) would propose
+                # the exact same already-reached target again next tick.
+                agent.exploration_target_xy = None
+                self.current_exploration_target = None
+                self.canvas.set_exploration_target(None)
 
         if kind != "FOLLOW_PATH":
             self.telemetry.report_nav_decision(
@@ -4805,29 +4807,11 @@ class SimulationControllerMixin:
                     force_new_exploration_target=True,
                 )
             else:
-                if self.is_exploration_mode() and decision.target is not None:
-                    robot_xy = (float(robot.x), float(robot.y))
-                    if math.hypot(
-                        decision.target[0] - robot_xy[0], decision.target[1] - robot_xy[1]
-                    ) <= float(self.config.goal_tolerance):
-                        # Final runtime boundary guard: never launch a route
-                        # request for a target the robot is already at/near,
-                        # regardless of which upstream code path produced it
-                        # (ExplorationBehavior, or engine.select_navigation_goal()'s
-                        # own independent re-derivation). Treat exactly like
-                        # "no valid next frontier" -- hold, let recovery pick
-                        # something else -- instead of a near-zero-length
-                        # ROUTE ok that gets "reached" again within a tick.
-                        self.set_robot_goal_or_waypoints(robot, [robot_xy])
-                        if agent is not None:
-                            agent.invalidate_route(
-                                reason="target already within goal_tolerance of robot position"
-                            )
-                            agent.exploration_target_xy = None
-                        self.current_exploration_target = None
-                        self.canvas.set_exploration_target(None)
-                        return False
-
+                # NavigationSupervisor.normalize_decision() above already
+                # guarantees that a REQUEST_PLAN reaching this point is not
+                # for an already-reached target (it would have been
+                # normalized to HOLD, which returns before this branch is
+                # ever entered) -- no redundant re-check needed here.
                 if decision.force_new_target and agent is not None:
                     # The frontier was just reached.  Clear exploration_target_xy
                     # so select_navigation_goal() inside request_route_async()
@@ -4852,10 +4836,10 @@ class SimulationControllerMixin:
                     )
             else:
                 # By this point kind can only still be "REPLAN_FOR_SAFETY"
-                # here if the route-less case was already normalized to
-                # "HOLD" above -- i.e. the agent is guaranteed to have an
-                # active route. (No redundant has_active_route check here;
-                # see the guard at the top of this method.)
+                # here if NavigationSupervisor.normalize_decision() above
+                # left it unchanged -- i.e. the agent is guaranteed to have
+                # an active route. (No redundant has_active_route check
+                # here; see the supervisor call at the top of this method.)
                 # Mirror multi_safety_replan_allowed(): throttle identical
                 # (reason, target) safety replans instead of launching a new
                 # planner request every single tick the segment stays

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import inspect
-from typing import Any, Mapping, Protocol, TYPE_CHECKING
+from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from robotics_sim.environment.occupancy_grid import OccupancyGrid
@@ -112,6 +112,7 @@ class TargetSelectionRequest:
     ipp_distance_penalty: float
     excluded_targets: tuple[Point2D, ...] = ()
     target_exclusion_radius: float = 0.0
+    is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -142,7 +143,14 @@ class PlannerServices:
     Provides planning services to RobotAgent.
 
     A single instance is created by the engine and passed into every
-    agent.step() call. It is intentionally stateless and safe to share.
+    agent.step() call, and is otherwise safe to share.
+
+    is_candidate_reachable is the one piece of mutable state: an optional
+    Callable[[Point2D], bool] the engine host may refresh each tick (see
+    engine.ensure_planner_services()) so select_exploration_target() can
+    reject exploration candidates the real navigation A* would immediately
+    fail on, without exploration_planners.py importing engine internals.
+    Left as None, behavior is unchanged from before this existed.
     """
 
     allowed_parameter_prefixes = (
@@ -155,6 +163,8 @@ class PlannerServices:
         "simulation.",
         "algorithm.",
     )
+
+    is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
 
     # ------------------------------------------------------------------ path
 
@@ -251,6 +261,7 @@ class PlannerServices:
         ipp_distance_penalty: float,
         excluded_targets: list[Point2D] | None = None,
         target_exclusion_radius: float | None = None,
+        is_candidate_reachable: "Callable[[Point2D], bool] | None" = None,
     ):
         """
         Select the next exploration frontier target.
@@ -261,12 +272,21 @@ class PlannerServices:
             .reason   str
 
         On failure returns a sentinel object with .success = False.
+
+        is_candidate_reachable: optional per-call override. When omitted
+        (the common case -- e.g. ExplorationBehavior._pick_next_target()
+        never passes it), falls back to self.is_candidate_reachable, which
+        the engine host may refresh every tick with a check backed by the
+        real navigation planning grid.
         """
         excluded = tuple(excluded_targets or ())
         exclusion_radius = (
             float(target_exclusion_radius)
             if target_exclusion_radius is not None
             else (max(float(robot_radius) * 2.0, 0.0) if excluded else 0.0)
+        )
+        reachability_check = (
+            is_candidate_reachable if is_candidate_reachable is not None else self.is_candidate_reachable
         )
 
         return self.select_exploration_target_request(
@@ -283,6 +303,7 @@ class PlannerServices:
                 ipp_distance_penalty=ipp_distance_penalty,
                 excluded_targets=excluded,
                 target_exclusion_radius=exclusion_radius,
+                is_candidate_reachable=reachability_check,
             )
         )
 
@@ -305,6 +326,7 @@ class PlannerServices:
             ipp_distance_penalty=request.ipp_distance_penalty,
             excluded_targets=list(request.excluded_targets),
             target_exclusion_radius=request.target_exclusion_radius,
+            is_candidate_reachable=request.is_candidate_reachable,
         )
 
     # ------------------------------------------------------------------ coordination / control hooks

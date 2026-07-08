@@ -176,6 +176,46 @@ def route_first_segment_blocked(
     return bool(report.collision)
 
 
+def candidate_reachable_on_planning_grid(
+    planning_grid,
+    planner_type: str,
+    start_xy: tuple[float, float],
+    candidate_xy: tuple[float, float],
+    *,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    robot_radius: float,
+) -> bool:
+    """True when compute_planned_waypoints() can find a route from start_xy
+    to candidate_xy on the given, already-built planning_grid.
+
+    Intended to be called with the SAME planning grid real single-robot
+    navigation A* uses (see build_planning_grid_for_robot()), which --
+    unlike the exploration planner's own internal scoring grid -- also
+    inflates around dense mapped-obstacle-point samples. Used to filter
+    exploration candidates the real planner would immediately reject with
+    "no path found", before one is ever requested.
+
+    A module-level function (not a method) so it can be unit-tested with a
+    plain OccupancyGrid, without instantiating the Qt-based simulation
+    engine.
+    """
+    if compute_planned_waypoints is None or planning_grid is None:
+        return True
+    success, _reason, waypoints = compute_planned_waypoints(
+        planner_type=planner_type,
+        start_xy=start_xy,
+        goal_xy=candidate_xy,
+        bounds=bounds,
+        resolution=resolution,
+        robot_radius=robot_radius,
+        planning_grid=planning_grid.copy(),
+        unknown_is_traversable=True,
+        obstacle_points=[],
+    )
+    return bool(success and waypoints)
+
+
 # ============================================================
 # METRICS WINDOW
 
@@ -4281,12 +4321,65 @@ class SimulationControllerMixin:
     # ========================================================
 
     def ensure_planner_services(self):
-        """Return the shared PlannerServices instance, creating it if needed."""
+        """Return the shared PlannerServices instance, creating it if needed.
+
+        Refreshes is_candidate_reachable on every call so exploration target
+        selection always checks against the current robot pose and map --
+        see make_exploration_reachability_check().
+        """
         if PlannerServices is None:
             return None
         if not hasattr(self, "_planner_services") or self._planner_services is None:
             self._planner_services = PlannerServices()
+        self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(
+            getattr(self, "robot", None)
+        )
         return self._planner_services
+
+    def make_exploration_reachability_check(self, robot):
+        """Build an is_candidate_reachable(xy) callback for PlannerServices,
+        backed by the SAME planning grid (belief + dense mapped-obstacle
+        samples, robot-radius padded) real single-robot navigation A* uses.
+
+        This is what lets FoV-aware target selection reject a candidate the
+        real planner would immediately fail on with "no path found",
+        without exploration_planners.py depending on engine.py. Returns
+        None (no filtering, existing behavior) when there is no live robot
+        or the planner package is unavailable.
+        """
+        if robot is None or compute_planned_waypoints is None:
+            return None
+
+        robot_radius = self.safety_radius_for_robot(robot)
+        resolution = float(self.config.grid_resolution)
+        start_xy = (float(robot.x), float(robot.y))
+
+        obstacle_points, _ = self.sanitize_planner_obstacle_points(
+            list(self.mapped_obstacle_points),
+            start_xy=start_xy,
+            robot_radius=robot_radius,
+            resolution=resolution,
+        )
+        planning_grid = self.build_planning_grid_for_robot(
+            robot,
+            obstacle_points=obstacle_points,
+            robot_radius=robot_radius,
+        )
+        planner_type = str(self.config.planner_type)
+        bounds = (WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX)
+
+        def _is_reachable(candidate_xy: tuple[float, float]) -> bool:
+            return candidate_reachable_on_planning_grid(
+                planning_grid,
+                planner_type,
+                start_xy,
+                (float(candidate_xy[0]), float(candidate_xy[1])),
+                bounds=bounds,
+                resolution=resolution,
+                robot_radius=robot_radius,
+            )
+
+        return _is_reachable
 
     def build_observation(self, robot, agent, robot_index=None):
         """

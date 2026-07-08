@@ -983,10 +983,58 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         if not scored:
             return ExplorationPlannerResult(False, None, "candidate targets existed, but no candidate path was valid", ())
 
-        best = max(scored, key=lambda item: item.score)
+        candidates_public = tuple(sorted(scored, key=lambda item: item.score, reverse=True))
+
+        # Optional reachability gate: the internal `planning_grid` above is
+        # built from the belief map alone (unknown traversable, only
+        # robot-radius padding). The real single-robot navigation A* also
+        # inflates around dense mapped-obstacle-point samples, so a
+        # candidate this scorer considers reachable can still come back
+        # "no path found" from the actual planner. When the caller supplies
+        # is_candidate_reachable(xy) -> bool (typically backed by the same
+        # planning grid engine.py's real A* uses), candidates it rejects
+        # are dropped here, before final selection, instead of being
+        # requested and failing downstream.
+        is_candidate_reachable = kwargs.get("is_candidate_reachable")
+        filtered_unreachable = 0
+
+        if callable(is_candidate_reachable):
+            reachable_scored: list[FrontierCandidate] = []
+            for item in scored:
+                try:
+                    reachable = bool(is_candidate_reachable(item.target))
+                except Exception:
+                    # A broken reachability callback must not take down
+                    # exploration -- treat it as "unknown, assume reachable".
+                    reachable = True
+                if reachable:
+                    reachable_scored.append(item)
+                else:
+                    filtered_unreachable += 1
+        else:
+            reachable_scored = scored
+
+        debug_counts = (
+            f"generated={len(candidates)}, excluded_recently_failed={len(reserved)}, "
+            f"filtered_unreachable={filtered_unreachable}"
+        )
+
+        if not reachable_scored:
+            return ExplorationPlannerResult(
+                False,
+                None,
+                (
+                    f"{self.name}: no reachable frontier candidates: all {len(scored)} "
+                    f"scored candidate(s) were rejected by the navigation reachability "
+                    f"check; {debug_counts}"
+                ),
+                candidates_public,
+            )
+
+        best = max(reachable_scored, key=lambda item: item.score)
         current_scored = None
 
-        for item in scored:
+        for item in reachable_scored:
             if current_target is not None and _distance(item.target, current_target) <= belief.resolution:
                 current_scored = item
                 break
@@ -1002,12 +1050,10 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             chosen = best
             prefix = "selected best FoV-aware target"
 
-        candidates_public = tuple(sorted(scored, key=lambda item: item.score, reverse=True))
-
         return ExplorationPlannerResult(
             True,
             chosen.target,
-            f"{self.name}: {prefix}; {chosen.reason}",
+            f"{self.name}: {prefix}; {chosen.reason}; {debug_counts}, selected={chosen.target}",
             candidates_public,
         )
 

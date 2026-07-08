@@ -177,6 +177,35 @@ def route_first_segment_blocked(
     return bool(report.collision)
 
 
+def route_reaches_goal(
+    waypoints: list[tuple[float, float]],
+    goal: tuple[float, float] | None,
+    tolerance: float,
+) -> bool:
+    """True when the route's final waypoint is within *tolerance* of *goal*.
+
+    A "successful" route (compute_planned_waypoints returning success=True,
+    e.g. after relocating an occupied goal cell to the nearest traversable
+    one) does not always actually terminate at the goal it was asked to
+    reach. Accepting such a route anyway means the robot follows it
+    faithfully to a DIFFERENT endpoint and then gets stuck there: whatever
+    tracks the route's intended destination (active_path_goal_xy /
+    pending_target_xy) keeps pointing at the original goal, so
+    distance-to-goal never drops below goal_tolerance and "frontier
+    reached" never fires -- the robot sits in STOP with the same stale
+    target/path_goal forever.
+
+    A module-level function (not a method) so it can be unit-tested without
+    instantiating the Qt-based simulation engine.
+    """
+    if not waypoints or goal is None:
+        return False
+    last = waypoints[-1]
+    return math.hypot(
+        float(last[0]) - float(goal[0]), float(last[1]) - float(goal[1])
+    ) <= float(tolerance)
+
+
 def candidate_reachable_on_planning_grid(
     planning_grid,
     planner_type: str,
@@ -527,12 +556,26 @@ class SimulationControllerMixin:
         # is not immediately re-selected here -- this call is independent
         # from ExplorationBehavior's own selection and must honor the same
         # blacklist, or the two can disagree and undo each other's recovery.
-        excluded_targets: list[tuple[float, float]] = []
+        #
+        # Also exclude the robot's own current position and the
+        # just-completed active_path_goal_xy, mirroring
+        # ExplorationBehavior._pick_next_target(): this call is independent
+        # from that one, so without the same exclusions it can re-propose a
+        # target ExplorationBehavior already rejected as "already reached",
+        # producing a near-zero-length ROUTE ok that gets "reached" again
+        # within a tick or two.
+        excluded_targets: list[tuple[float, float]] = [
+            (float(start_xy[0]), float(start_xy[1])),
+        ]
         if agent is not None:
-            excluded_targets = agent.recently_failed_exploration_targets(
-                current_time=float(self.simulation_time),
-                cooldown=ExplorationBehavior._FAILED_TARGET_EXCLUSION_WINDOW,
+            excluded_targets.extend(
+                agent.recently_failed_exploration_targets(
+                    current_time=float(self.simulation_time),
+                    cooldown=ExplorationBehavior._FAILED_TARGET_EXCLUSION_WINDOW,
+                )
             )
+            if agent.active_path_goal_xy is not None:
+                excluded_targets.append(agent.active_path_goal_xy)
 
         result = select_exploration_goal(
             planner_name,
@@ -579,6 +622,25 @@ class SimulationControllerMixin:
             return None, self.last_goal_selection_reason
 
         target = (float(result.target[0]), float(result.target[1]))
+
+        # Belt-and-suspenders: reject a candidate at/near the robot's
+        # current position outright, regardless of whether the exclusion
+        # above was actually honored internally -- this is the guarantee
+        # that stops a near-zero-length route from ever being requested,
+        # independent of exploration-planner internals. Mirrors
+        # ExplorationBehavior._pick_next_target()'s own hard check.
+        if math.hypot(
+            target[0] - float(start_xy[0]), target[1] - float(start_xy[1])
+        ) <= float(self.config.goal_tolerance):
+            self.current_exploration_target = None
+            self.last_goal_selection_reason = (
+                f"{result.reason}; rejected: candidate within goal_tolerance of robot position"
+            )
+            self.canvas.set_exploration_target(None)
+            if agent is not None:
+                agent.exploration_target_xy = None
+            return None, self.last_goal_selection_reason
+
         self.current_exploration_target = target
         self.last_goal_selection_reason = str(result.reason)
         self.canvas.set_exploration_target(target)
@@ -1745,8 +1807,28 @@ class SimulationControllerMixin:
                 list(self.mapped_obstacle_points),
                 self.safety_radius(),
             )
+
+            # Reject a route that claims success but whose final waypoint
+            # does not actually reach the exploration target it was asked
+            # to route to (e.g. compute_planned_waypoints() silently
+            # relocated an occupied goal cell to the nearest traversable
+            # one). Accepting it anyway would follow the route to a
+            # different endpoint and then get stuck there: active_path_goal_xy
+            # would still point at the original, unreached target, so
+            # "frontier reached" never fires and STATE keeps showing a
+            # stale target/path_goal forever.
+            misses_intended_goal = False
+            if not blocked_on_arrival and self.is_exploration_mode() and clean_waypoints:
+                intended_goal = self.current_exploration_target
+                if intended_goal is not None and not route_reaches_goal(
+                    clean_waypoints, intended_goal, float(self.config.goal_tolerance)
+                ):
+                    misses_intended_goal = True
+
             if blocked_on_arrival:
                 reason = f"{reason}; rejected: first segment blocked on arrival"
+            elif misses_intended_goal:
+                reason = f"{reason}; rejected: final waypoint does not reach path goal"
             else:
                 # Belt-and-suspenders: if the planner returned the target the robot
                 # just reached (hysteresis slipped through), refuse to reassign the
@@ -1881,9 +1963,23 @@ class SimulationControllerMixin:
         success, reason, waypoints = self.compute_route((self.robot.x, self.robot.y))
         self.apply_route_result(success, reason, waypoints)
 
-    def request_route_async(self, reason: str) -> bool:
+    def request_route_async(
+        self,
+        reason: str,
+        *,
+        target_override: tuple[float, float] | None = None,
+    ) -> bool:
         """
         Start a background replan and keep the GUI responsive.
+
+        target_override: when given (and planner_type != "Direct"),
+        skips select_navigation_goal()'s own independent target re-derivation
+        and plans directly to this target instead. ExplorationBehavior
+        already chose and validated this target (e.g. it is not within
+        goal_tolerance of the robot) -- re-deriving a target here via
+        select_navigation_goal() is a second, independent selection that
+        can disagree with ExplorationBehavior's and reintroduce exactly the
+        "already reached" target it just rejected.
         """
         if self.robot is None:
             return False
@@ -1907,7 +2003,21 @@ class SimulationControllerMixin:
 
         self.route_request_id += 1
         request_id = self.route_request_id
-        planner_kwargs = self.build_planner_kwargs((self.robot.x, self.robot.y))
+        start_xy = (float(self.robot.x), float(self.robot.y))
+
+        if target_override is not None:
+            goal_xy = (float(target_override[0]), float(target_override[1]))
+            goal_reason = "using ExplorationBehavior-selected target"
+            self.current_exploration_target = goal_xy
+            self.last_goal_selection_reason = goal_reason
+            self.canvas.set_exploration_target(goal_xy)
+            override_agent = self.runtime_agent(None)
+            if override_agent is not None:
+                override_agent.set_exploration_target(goal_xy, reason=goal_reason)
+            planner_kwargs = self.build_planner_kwargs_for_goal(start_xy, goal_xy, robot=self.robot)
+        else:
+            planner_kwargs = self.build_planner_kwargs(start_xy)
+
         if bool(planner_kwargs.get("__hold__", False)):
             self.apply_route_result(False, str(planner_kwargs.get("__hold_reason__", "holding position")), [])
             return False
@@ -4619,6 +4729,31 @@ class SimulationControllerMixin:
         """
         kind = decision.kind
 
+        if kind == "REPLAN_FOR_SAFETY" and not self.robots:
+            # REPLAN_FOR_SAFETY only makes sense when there is an active
+            # route to replan. RobotAgent.step() emits this decision
+            # unconditionally whenever active_segment_blocked/
+            # predicted_collision is set -- including with no active route
+            # at all (e.g. right after exploration_exhausted() put the
+            # agent into a stable HOLD) -- because that check runs before
+            # ExplorationBehavior.update() (and its own has_active_route
+            # guard) is ever reached. Normalize the decision kind here, at
+            # the engine boundary, BEFORE telemetry logs it and before any
+            # route-request/failure-marking logic runs below -- otherwise a
+            # route-less "REPLAN_FOR_SAFETY" still gets reported to the
+            # console and can still trip the safety-replan throttle even
+            # though nothing is actually being replanned. Scoped to
+            # single-robot mode (not self.robots) -- multi-robot has its own
+            # multi_safety_replan_allowed()/per-index route state and is
+            # untouched here.
+            has_active_route = (
+                agent is not None
+                and agent.active_path_goal_xy is not None
+                and agent.active_target() is not None
+            )
+            if not has_active_route:
+                kind = "HOLD"
+
         if kind != "FOLLOW_PATH":
             self.telemetry.report_nav_decision(
                 sim_time=float(self.simulation_time),
@@ -4670,12 +4805,38 @@ class SimulationControllerMixin:
                     force_new_exploration_target=True,
                 )
             else:
+                if self.is_exploration_mode() and decision.target is not None:
+                    robot_xy = (float(robot.x), float(robot.y))
+                    if math.hypot(
+                        decision.target[0] - robot_xy[0], decision.target[1] - robot_xy[1]
+                    ) <= float(self.config.goal_tolerance):
+                        # Final runtime boundary guard: never launch a route
+                        # request for a target the robot is already at/near,
+                        # regardless of which upstream code path produced it
+                        # (ExplorationBehavior, or engine.select_navigation_goal()'s
+                        # own independent re-derivation). Treat exactly like
+                        # "no valid next frontier" -- hold, let recovery pick
+                        # something else -- instead of a near-zero-length
+                        # ROUTE ok that gets "reached" again within a tick.
+                        self.set_robot_goal_or_waypoints(robot, [robot_xy])
+                        if agent is not None:
+                            agent.invalidate_route(
+                                reason="target already within goal_tolerance of robot position"
+                            )
+                            agent.exploration_target_xy = None
+                        self.current_exploration_target = None
+                        self.canvas.set_exploration_target(None)
+                        return False
+
                 if decision.force_new_target and agent is not None:
                     # The frontier was just reached.  Clear exploration_target_xy
                     # so select_navigation_goal() inside request_route_async()
                     # also sees current_target=None and cannot return it by hysteresis.
                     agent.exploration_target_xy = None
-                self.request_route_async(decision.reason or "agent requested plan")
+                self.request_route_async(
+                    decision.reason or "agent requested plan",
+                    target_override=decision.target if self.is_exploration_mode() else None,
+                )
             return bool(decision.brake)
 
         if kind == "REPLAN_FOR_SAFETY":
@@ -4690,6 +4851,11 @@ class SimulationControllerMixin:
                         force_new_exploration_target=bool(self.is_exploration_mode()),
                     )
             else:
+                # By this point kind can only still be "REPLAN_FOR_SAFETY"
+                # here if the route-less case was already normalized to
+                # "HOLD" above -- i.e. the agent is guaranteed to have an
+                # active route. (No redundant has_active_route check here;
+                # see the guard at the top of this method.)
                 # Mirror multi_safety_replan_allowed(): throttle identical
                 # (reason, target) safety replans instead of launching a new
                 # planner request every single tick the segment stays
@@ -4697,14 +4863,12 @@ class SimulationControllerMixin:
                 # still has its first segment blocked (e.g. by a
                 # newly-mapped obstacle sample) re-triggers REPLAN_FOR_SAFETY
                 # on the very next tick, forever.
-                allowed = True
-                if agent is not None:
-                    allowed = agent.safety_replan_allowed(
-                        reason=decision.reason or "",
-                        target=decision.target,
-                        current_time=float(self.simulation_time),
-                        cooldown=self.safety_replan_cooldown_seconds(),
-                    )
+                allowed = agent.safety_replan_allowed(
+                    reason=decision.reason or "",
+                    target=decision.target,
+                    current_time=float(self.simulation_time),
+                    cooldown=self.safety_replan_cooldown_seconds(),
+                )
                 if allowed:
                     self.replan_after_new_information(
                         f"safety replan: {decision.reason}"
@@ -4857,6 +5021,23 @@ class SimulationControllerMixin:
 
         if success and waypoints:
             clean_waypoints = [(float(p[0]), float(p[1])) for p in waypoints]
+
+            # Reject a "successful" prefetch route whose final waypoint does
+            # not actually reach agent.pending_target_xy -- accept_pending_path()
+            # sets active_path_goal_xy from pending_target_xy directly, not
+            # from the route's own endpoint, so a mismatch here means the
+            # robot would follow the route to a different point and then
+            # sit stuck there forever (STATE showing a stale, unreached
+            # path_goal). This is exactly the bug this check exists for.
+            if not route_reaches_goal(
+                clean_waypoints, agent.pending_target_xy, float(self.config.goal_tolerance)
+            ):
+                agent.reject_pending_path(f"{reason}; final waypoint does not reach path goal")
+                self.log_console_message(
+                    f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
+                )
+                return
+
             agent.pending_path = clean_waypoints
             # pending_target_xy was set when the worker launched; keep it.
             agent.prefetch_success_count += 1

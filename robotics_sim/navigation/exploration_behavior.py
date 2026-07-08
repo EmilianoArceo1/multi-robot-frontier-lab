@@ -161,7 +161,20 @@ class ExplorationBehavior:
           6. No path at all → REQUEST_PLAN (first frontier) or HOLD
         """
         # ── 1. Safety ────────────────────────────────────────────────────────
-        if observation.active_segment_blocked or observation.predicted_collision:
+        # REPLAN_FOR_SAFETY only makes sense when there is an active route to
+        # replan. predicted_collision/active_segment_blocked are computed
+        # from the robot's current physical motion independent of navigation
+        # state, so they can stay True while the robot is simply holding
+        # (e.g. after exploration_exhausted()) with nothing to replan.
+        # Without this guard, a route-less HOLD keeps re-emitting
+        # REPLAN_FOR_SAFETY(target=None) every tick; the engine's safety
+        # replan throttle eventually treats that as "repeated safety replan
+        # for the same target" and marks a target that never existed as
+        # failed. When there is no active route, ignore the safety flags
+        # here and let the normal decision flow below (steps 2-6) run --
+        # it resolves to whatever HOLD state already applies.
+        has_active_route = agent.active_path_goal_xy is not None and agent.active_target() is not None
+        if has_active_route and (observation.active_segment_blocked or observation.predicted_collision):
             reason = (
                 "predicted collision"
                 if observation.predicted_collision
@@ -336,6 +349,17 @@ class ExplorationBehavior:
             cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
         )
 
+        # Never re-propose something already effectively reached: the
+        # robot's own current position (a candidate "here" is not a
+        # frontier worth driving to), and the route that was just
+        # completed, if any. Without this, FoV-aware frontier detection can
+        # immediately re-select the exact same nearby point right after
+        # "frontier reached", producing a near-zero-length route that gets
+        # "reached" again within a tick or two -- a fast REQUEST_PLAN loop.
+        excluded.append(observation.robot_xy)
+        if agent.active_path_goal_xy is not None:
+            excluded.append(agent.active_path_goal_xy)
+
         result = planner_services.select_exploration_target(
             planner_name=agent.planner_mode,
             belief_map=observation.belief_map,
@@ -353,4 +377,16 @@ class ExplorationBehavior:
         if not result.success or result.target is None:
             return None
 
-        return (float(result.target[0]), float(result.target[1]))
+        candidate = (float(result.target[0]), float(result.target[1]))
+
+        # Belt-and-suspenders: reject a candidate at/near the robot's
+        # current position outright, regardless of whether the planner
+        # actually honored the exclusion above -- this is the guarantee
+        # that stops the near-zero-length route loop, independent of
+        # exploration-planner internals.
+        if math.hypot(
+            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
+        ) <= observation.goal_tolerance:
+            return None
+
+        return candidate

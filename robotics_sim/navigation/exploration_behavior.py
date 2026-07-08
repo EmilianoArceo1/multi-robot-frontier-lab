@@ -202,8 +202,23 @@ class ExplorationBehavior:
                     return accept_pending_path(reason=reason)
 
         # ── 3. Frontier reached — need a new target ───────────────────────
+        # "Reached" means the robot is at the FINAL destination of the
+        # active route (active_path_goal_xy / distance_to_active_path_goal()),
+        # not merely at whatever intermediate waypoint active_target()
+        # currently points to. A route can be reassigned mid-flight (safety
+        # replan, prefetch accept) with a fresh, shorter waypoint list that
+        # starts near the robot's current position -- active_target() then
+        # points at a waypoint close to the robot even though the true
+        # exploration target (active_path_goal_xy) is still far away.
+        # Treating that as "frontier reached" stops the robot prematurely,
+        # mid-route. active_target() is still the right thing for the
+        # low-level controller to track (see step 5, FOLLOW_PATH).
         target = agent.active_target()
-        if target is not None and agent.distance_to_active_target() <= observation.goal_tolerance:
+        path_goal_reached = (
+            agent.active_path_goal_xy is not None
+            and agent.distance_to_active_path_goal() <= observation.goal_tolerance
+        )
+        if path_goal_reached:
             agent.target_switch_count += 1
             # Clear the reached frontier so that neither _pick_next_target()
             # nor the engine's select_navigation_goal() can return it again

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import TYPE_CHECKING, Literal
+from typing import ClassVar, TYPE_CHECKING, Literal
 
 from robotics_sim.core.geometry import distance
 from robotics_sim.planning.waypoint_manager import WaypointManager
@@ -96,6 +96,21 @@ class RobotAgent:
     last_exploration_reason: str = ""
     last_prefetch_time: float = field(default=-1.0e9)
     last_replan_time: float = field(default=-1.0e9)
+
+    # Recently-failed exploration targets — (target, sim_time_of_failure).
+    # Bounded to _FAILED_TARGET_RETENTION_S so this cannot grow unbounded
+    # over a long run; the actual "still blacklisted" window used for
+    # re-selection is caller-supplied and typically much shorter (see
+    # ExplorationBehavior._FAILED_TARGET_EXCLUSION_WINDOW).
+    failed_exploration_targets: list[tuple[tuple[float, float], float]] = field(default_factory=list)
+    last_exploration_failure_time: float = field(default=-1.0e9)
+
+    # Throttle for identical REPLAN_FOR_SAFETY requests, mirroring the
+    # engine's multi_safety_replan_allowed() for the single-robot path.
+    last_safety_replan_time: float = field(default=-1.0e9)
+    last_safety_replan_signature: tuple[str, tuple[float, float] | None] | None = None
+
+    _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
 
     # Metrics counters (not displayed yet; available for future dashboard).
     stop_count_exploration: int = 0
@@ -210,7 +225,12 @@ class RobotAgent:
         if reason:
             self.last_plan_reason = reason
 
-    def invalidate_failed_exploration_route(self, reason: str = "") -> None:
+    def invalidate_failed_exploration_route(
+        self,
+        reason: str = "",
+        *,
+        current_time: float = 0.0,
+    ) -> None:
         """Clear the active/pending route AND the exploration target that
         failed to produce a usable path.
 
@@ -221,9 +241,89 @@ class RobotAgent:
         loop immediately re-requests a plan for it -- producing a repeated
         planner-failure loop instead of falling back to HOLD and picking a
         fresh target on the next tick.
+
+        The failed target is also remembered (see mark_exploration_target_failed())
+        so the next target-selection attempt can exclude it and a short
+        retry cooldown can gate how soon that next attempt happens.
         """
+        failed_target = self.exploration_target_xy
         self.invalidate_route(reason=reason)
         self.exploration_target_xy = None
+        if failed_target is not None:
+            self.mark_exploration_target_failed(failed_target, current_time=current_time)
+
+    # ------------------------------------------------------------------ exploration failure memory
+
+    def mark_exploration_target_failed(self, target, *, current_time: float) -> None:
+        """Remember that planning to *target* failed at *current_time*.
+
+        Also resets the retry-cooldown clock (see exploration_retry_on_cooldown()).
+        The list is pruned to _FAILED_TARGET_RETENTION_S so it cannot grow
+        unbounded over a long-running simulation.
+        """
+        self.failed_exploration_targets.append((_as_point(target), float(current_time)))
+        self.note_exploration_retry_attempt(current_time)
+        cutoff = float(current_time) - self._FAILED_TARGET_RETENTION_S
+        self.failed_exploration_targets = [
+            (point, failed_at) for point, failed_at in self.failed_exploration_targets
+            if failed_at >= cutoff
+        ]
+
+    def note_exploration_retry_attempt(self, current_time: float) -> None:
+        """Reset the retry-cooldown clock without adding a blacklist entry.
+
+        Used when a re-selection attempt itself finds no candidate, so the
+        agent backs off before trying frontier detection again instead of
+        re-running it every single tick.
+        """
+        self.last_exploration_failure_time = float(current_time)
+
+    def recently_failed_exploration_targets(
+        self,
+        *,
+        current_time: float,
+        cooldown: float,
+    ) -> list[tuple[float, float]]:
+        """Targets that failed to plan within the last *cooldown* seconds."""
+        return [
+            point
+            for point, failed_at in self.failed_exploration_targets
+            if (float(current_time) - failed_at) <= float(cooldown)
+        ]
+
+    def exploration_retry_on_cooldown(self, *, current_time: float, cooldown: float) -> bool:
+        """True when a recent failure/empty-retry means we should keep holding."""
+        return (float(current_time) - self.last_exploration_failure_time) < float(cooldown)
+
+    # ------------------------------------------------------------------ safety replan throttle
+
+    def safety_replan_allowed(
+        self,
+        *,
+        reason: str,
+        target: tuple[float, float] | None,
+        current_time: float,
+        cooldown: float,
+    ) -> bool:
+        """Throttle identical REPLAN_FOR_SAFETY requests for this robot.
+
+        Mirrors engine.multi_safety_replan_allowed(): a (reason, rounded
+        target) signature identifies "the same blocked segment/target as
+        last time". Returning False means the caller should brake and hold
+        this frame instead of launching another planner request for a
+        situation it just tried and failed to resolve.
+        """
+        target_key = None
+        if target is not None:
+            target_key = (round(float(target[0]), 2), round(float(target[1]), 2))
+        signature = (str(reason), target_key)
+        elapsed = float(current_time) - float(self.last_safety_replan_time)
+        same_signature = signature == self.last_safety_replan_signature
+        if same_signature and elapsed < float(cooldown):
+            return False
+        self.last_safety_replan_time = float(current_time)
+        self.last_safety_replan_signature = signature
+        return True
 
     def assign_path(
         self,

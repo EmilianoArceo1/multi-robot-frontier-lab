@@ -36,6 +36,7 @@ from robotics_sim.simulation.navigation_modes import (
     is_goal_seeking_planner,
     is_exploration_planner,
 )
+from robotics_sim.navigation.exploration_behavior import ExplorationBehavior
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
@@ -142,6 +143,37 @@ class PlannerWorker(QRunnable):
             [tuple(point) for point in waypoints],
         )
 
+
+
+def route_first_segment_blocked(
+    collision_checker,
+    start_xy: tuple[float, float],
+    target_xy: tuple[float, float] | None,
+    obstacle_points: list[tuple[float, float]],
+    robot_radius: float,
+) -> bool:
+    """True when the segment start_xy -> target_xy is unsafe by the same
+    CollisionChecker.check_segment_points() rule build_observation() uses to
+    compute active_segment_blocked.
+
+    Used by apply_route_result() to reject a newly-planned route before it
+    becomes the active path, instead of accepting it and letting the very
+    next tick's safety check immediately trip REPLAN_FOR_SAFETY again for
+    the route we just assigned.
+
+    A module-level function (not a method) so it can be unit-tested with a
+    plain CollisionChecker instance, without instantiating the Qt-based
+    simulation engine.
+    """
+    if collision_checker is None or target_xy is None:
+        return False
+    report = collision_checker.check_segment_points(
+        start=start_xy,
+        end=target_xy,
+        obstacle_points=list(obstacle_points),
+        robot_radius=float(robot_radius),
+    )
+    return bool(report.collision)
 
 
 # ============================================================
@@ -449,6 +481,18 @@ class SimulationControllerMixin:
         agent = self.runtime_agent(None)
         current_target = agent.exploration_target_xy if agent is not None else self.current_exploration_target
 
+        # Exclude this robot's own recently-failed targets so a target that
+        # just failed to plan (see RobotAgent.invalidate_failed_exploration_route())
+        # is not immediately re-selected here -- this call is independent
+        # from ExplorationBehavior's own selection and must honor the same
+        # blacklist, or the two can disagree and undo each other's recovery.
+        excluded_targets: list[tuple[float, float]] = []
+        if agent is not None:
+            excluded_targets = agent.recently_failed_exploration_targets(
+                current_time=float(self.simulation_time),
+                cooldown=ExplorationBehavior._FAILED_TARGET_EXCLUSION_WINDOW,
+            )
+
         result = select_exploration_goal(
             planner_name,
             belief_map=belief,
@@ -461,7 +505,12 @@ class SimulationControllerMixin:
             sensor_range=float(self.config.vision),
             vision_model=str(self.config.vision_model),
             ipp_distance_penalty=float(self.config.ipp_distance_penalty),
-            target_exclusion_radius=0.0,
+            excluded_targets=excluded_targets,
+            target_exclusion_radius=(
+                max(float(self.config.grid_resolution), 2.0 * float(self.config.goal_tolerance))
+                if excluded_targets
+                else 0.0
+            ),
         )
 
         if not result.success or result.target is None:
@@ -1625,67 +1674,84 @@ class SimulationControllerMixin:
                 else:
                     clean_waypoints = [self.final_goal_xy()]
 
-            # Belt-and-suspenders: if the planner returned the target the robot
-            # just reached (hysteresis slipped through), refuse to reassign the
-            # same route.  This prevents the infinite REQUEST_PLAN loop when
-            # exploration hysteresis returns "kind=current" with length=0.
-            if self.is_exploration_mode() and self.robot is not None and clean_waypoints:
-                agent_check = self.runtime_agent(None)
-                new_goal = clean_waypoints[-1]
-                old_goal = getattr(agent_check, "active_path_goal_xy", None) if agent_check is not None else None
-                robot_xy = (float(self.robot.x), float(self.robot.y))
-                same_target_radius = max(
-                    float(self.config.grid_resolution),
-                    2.0 * float(self.config.goal_tolerance),
-                )
-                if (
-                    old_goal is not None
-                    and math.hypot(new_goal[0] - old_goal[0], new_goal[1] - old_goal[1]) <= same_target_radius
-                    and math.hypot(robot_xy[0] - old_goal[0], robot_xy[1] - old_goal[1]) <= float(self.config.goal_tolerance) * 2.0
-                ):
-                    self.log_console_message(
-                        f"[NAV] apply_route_result: planner returned already-reached target "
-                        f"{new_goal}; forcing re-search."
-                    )
-                    if agent_check is not None:
-                        agent_check.exploration_target_xy = None
-                        agent_check.invalidate_route(reason="planner returned completed target; forcing re-search")
-                    self.current_exploration_target = None
-                    self.canvas.set_exploration_target(None)
-                    return
-
-            if hasattr(self.robot, "set_waypoints"):
-                self.robot.set_waypoints(clean_waypoints)
-            elif hasattr(self.robot, "set_goal"):
-                self.robot.set_goal(clean_waypoints[-1])
+            # Reject a route whose very first segment is already unsafe by the
+            # same rule build_observation() uses for active_segment_blocked.
+            # Accepting it anyway would let the very next tick's safety check
+            # immediately trip REPLAN_FOR_SAFETY again for the route we just
+            # assigned, producing a safety-replan loop instead of a working
+            # route. Falls through to the shared failure-handling code below.
+            start_xy = (float(self.robot.x), float(self.robot.y))
+            blocked_on_arrival = bool(clean_waypoints) and route_first_segment_blocked(
+                self.collision_checker,
+                start_xy,
+                clean_waypoints[0],
+                list(self.mapped_obstacle_points),
+                self.safety_radius(),
+            )
+            if blocked_on_arrival:
+                reason = f"{reason}; rejected: first segment blocked on arrival"
             else:
-                self.robot.goal = np.array(clean_waypoints[-1], dtype=float)
+                # Belt-and-suspenders: if the planner returned the target the robot
+                # just reached (hysteresis slipped through), refuse to reassign the
+                # same route.  This prevents the infinite REQUEST_PLAN loop when
+                # exploration hysteresis returns "kind=current" with length=0.
+                if self.is_exploration_mode() and self.robot is not None and clean_waypoints:
+                    agent_check = self.runtime_agent(None)
+                    new_goal = clean_waypoints[-1]
+                    old_goal = getattr(agent_check, "active_path_goal_xy", None) if agent_check is not None else None
+                    robot_xy = (float(self.robot.x), float(self.robot.y))
+                    same_target_radius = max(
+                        float(self.config.grid_resolution),
+                        2.0 * float(self.config.goal_tolerance),
+                    )
+                    if (
+                        old_goal is not None
+                        and math.hypot(new_goal[0] - old_goal[0], new_goal[1] - old_goal[1]) <= same_target_radius
+                        and math.hypot(robot_xy[0] - old_goal[0], robot_xy[1] - old_goal[1]) <= float(self.config.goal_tolerance) * 2.0
+                    ):
+                        self.log_console_message(
+                            f"[NAV] apply_route_result: planner returned already-reached target "
+                            f"{new_goal}; forcing re-search."
+                        )
+                        if agent_check is not None:
+                            agent_check.exploration_target_xy = None
+                            agent_check.invalidate_route(reason="planner returned completed target; forcing re-search")
+                        self.current_exploration_target = None
+                        self.canvas.set_exploration_target(None)
+                        return
 
-            # Sync RobotAgent so agent.active_target() is non-None next frame.
-            # Without this, agent.step() keeps emitting REQUEST_PLAN because
-            # agent.waypoints is never populated.
-            agent = self.runtime_agent(None)
-            if agent is not None and clean_waypoints:
-                agent.assign_path(
-                    target=clean_waypoints[-1],
-                    waypoints=clean_waypoints,
-                    planner_reason=reason,
+                if hasattr(self.robot, "set_waypoints"):
+                    self.robot.set_waypoints(clean_waypoints)
+                elif hasattr(self.robot, "set_goal"):
+                    self.robot.set_goal(clean_waypoints[-1])
+                else:
+                    self.robot.goal = np.array(clean_waypoints[-1], dtype=float)
+
+                # Sync RobotAgent so agent.active_target() is non-None next frame.
+                # Without this, agent.step() keeps emitting REQUEST_PLAN because
+                # agent.waypoints is never populated.
+                agent = self.runtime_agent(None)
+                if agent is not None and clean_waypoints:
+                    agent.assign_path(
+                        target=clean_waypoints[-1],
+                        waypoints=clean_waypoints,
+                        planner_reason=reason,
+                    )
+
+                self.canvas.set_planned_path([(self.robot.x, self.robot.y)] + clean_waypoints)
+                if self.is_exploration_mode() and clean_waypoints:
+                    self.canvas.set_exploration_target(clean_waypoints[-1])
+                self.canvas.set_status(
+                    f"Planner: {self.planner_label()}. {self.last_goal_selection_reason}. {reason}. "
+                    f"Mapped points: {len(self.mapped_obstacle_points)}."
                 )
-
-            self.canvas.set_planned_path([(self.robot.x, self.robot.y)] + clean_waypoints)
-            if self.is_exploration_mode() and clean_waypoints:
-                self.canvas.set_exploration_target(clean_waypoints[-1])
-            self.canvas.set_status(
-                f"Planner: {self.planner_label()}. {self.last_goal_selection_reason}. {reason}. "
-                f"Mapped points: {len(self.mapped_obstacle_points)}."
-            )
-            self.log_route_assignment(
-                None,
-                (float(self.robot.x), float(self.robot.y)),
-                clean_waypoints,
-                f"{self.last_goal_selection_reason}; {reason}",
-            )
-            return
+                self.log_route_assignment(
+                    None,
+                    (float(self.robot.x), float(self.robot.y)),
+                    clean_waypoints,
+                    f"{self.last_goal_selection_reason}; {reason}",
+                )
+                return
 
         if self.is_exploration_mode():
             hold_xy = (float(self.robot.x), float(self.robot.y))
@@ -1702,7 +1768,10 @@ class SimulationControllerMixin:
             # agent immediately re-requests a plan for it next tick.
             agent = self.runtime_agent(None)
             if agent is not None:
-                agent.invalidate_failed_exploration_route(reason=f"planner failed: {reason}")
+                agent.invalidate_failed_exploration_route(
+                    reason=f"planner failed: {reason}",
+                    current_time=float(self.simulation_time),
+                )
 
             self.current_exploration_target = None
             self.canvas.set_exploration_target(None)
@@ -2335,6 +2404,16 @@ class SimulationControllerMixin:
         elif len(self.multi_last_exploration_replan_sim_times) > count:
             self.multi_last_exploration_replan_sim_times = self.multi_last_exploration_replan_sim_times[:count]
 
+    def safety_replan_cooldown_seconds(self) -> float:
+        """Shared cooldown formula for throttling identical safety replans.
+
+        Used by both multi_safety_replan_allowed() (per-robot-index, engine
+        state) and the single-robot REPLAN_FOR_SAFETY branch of
+        apply_navigation_decision() (per-agent, RobotAgent.safety_replan_allowed()),
+        so the two throttles behave consistently.
+        """
+        return max(0.35, 0.75 * max(0.1, float(self.config.exploration_replan_cooldown)))
+
     def multi_safety_replan_allowed(
         self,
         robot_index: int,
@@ -2351,7 +2430,7 @@ class SimulationControllerMixin:
         if not (0 <= robot_index < len(self.multi_last_safety_replan_sim_times)):
             return True
 
-        cooldown = max(0.35, 0.75 * max(0.1, float(self.config.exploration_replan_cooldown)))
+        cooldown = self.safety_replan_cooldown_seconds()
         target_key = None
         if target is not None:
             target_key = (round(float(target[0]), 2), round(float(target[1]), 2))
@@ -4403,9 +4482,49 @@ class SimulationControllerMixin:
                         force_new_exploration_target=bool(self.is_exploration_mode()),
                     )
             else:
-                self.replan_after_new_information(
-                    f"safety replan: {decision.reason}"
-                )
+                # Mirror multi_safety_replan_allowed(): throttle identical
+                # (reason, target) safety replans instead of launching a new
+                # planner request every single tick the segment stays
+                # blocked. Without this, a route that gets accepted but
+                # still has its first segment blocked (e.g. by a
+                # newly-mapped obstacle sample) re-triggers REPLAN_FOR_SAFETY
+                # on the very next tick, forever.
+                allowed = True
+                if agent is not None:
+                    allowed = agent.safety_replan_allowed(
+                        reason=decision.reason or "",
+                        target=decision.target,
+                        current_time=float(self.simulation_time),
+                        cooldown=self.safety_replan_cooldown_seconds(),
+                    )
+                if allowed:
+                    self.replan_after_new_information(
+                        f"safety replan: {decision.reason}"
+                    )
+                elif agent is not None and self.is_exploration_mode():
+                    # Same blocked segment/target as last time, within the
+                    # cooldown: stop retrying it forever. Hold at the
+                    # current position and mark the exploration target
+                    # failed so ExplorationBehavior's recovery path
+                    # (cooldown + blacklist, see _pick_next_target()) picks
+                    # a fresh target instead of re-requesting the same
+                    # route that keeps ending up blocked.
+                    hold_xy = (float(robot.x), float(robot.y))
+                    self.set_robot_goal_or_waypoints(robot, [hold_xy])
+                    agent.invalidate_failed_exploration_route(
+                        reason=f"repeated safety replan: {decision.reason}",
+                        current_time=float(self.simulation_time),
+                    )
+                    self.current_exploration_target = None
+                    self.canvas.set_exploration_target(None)
+                    self.canvas.set_status(
+                        f"Holding: repeated safety replan for the same target ({decision.reason}); "
+                        "marking target as failed and re-selecting."
+                    )
+                    self.log_console_message(
+                        f"R1 holding position at {self._xy_text(hold_xy)}; repeated safety replan "
+                        f"for the same target ({decision.reason}); marking target as failed."
+                    )
             return True  # always brake for safety replans
 
         return False

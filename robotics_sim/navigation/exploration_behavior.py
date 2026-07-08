@@ -77,6 +77,16 @@ class ExplorationBehavior:
 
     _PREFETCH_COOLDOWN: float = 0.75  # seconds between consecutive prefetch attempts
 
+    # After a planner failure clears exploration_target_xy, wait this long
+    # before attempting frontier re-selection again -- avoids re-running
+    # frontier detection every single tick when nothing reachable exists.
+    _FAILURE_RETRY_COOLDOWN: float = 1.5
+
+    # How long a target that just failed to plan stays excluded from
+    # re-selection. Longer than _FAILURE_RETRY_COOLDOWN so it is still
+    # excluded on the very first retry attempt once the cooldown opens.
+    _FAILED_TARGET_EXCLUSION_WINDOW: float = 3.0
+
     def should_prefetch_next_target(
         self,
         agent: "RobotAgent",
@@ -243,11 +253,32 @@ class ExplorationBehavior:
 
         # ── 6. No path — need first plan ─────────────────────────────────
         desired = agent.desired_target_from_mode()
-        if desired is None:
-            agent.stop_count_exploration += 1
-            return hold(reason="no target available in current exploration mode")
+        if desired is not None:
+            return request_plan(desired, reason="no active path; requesting initial frontier plan")
 
-        return request_plan(desired, reason="no active path; requesting initial frontier plan")
+        # No exploration target assigned. Reached either on a genuine cold
+        # start, or in recovery after a planner failure (or an earlier
+        # empty retry) cleared exploration_target_xy via
+        # RobotAgent.invalidate_failed_exploration_route(). Gate
+        # re-selection behind a cooldown so a fully-explored map does not
+        # re-run frontier detection every single tick.
+        if agent.exploration_retry_on_cooldown(
+            current_time=observation.current_time, cooldown=self._FAILURE_RETRY_COOLDOWN
+        ):
+            agent.stop_count_exploration += 1
+            return hold(reason="recovering after planner failure; retry cooldown active")
+
+        next_target = self._pick_next_target(agent, observation, planner_services)
+        if next_target is None:
+            agent.stop_count_exploration += 1
+            agent.note_exploration_retry_attempt(observation.current_time)
+            return hold(reason="no reachable frontier candidates remain")
+
+        return request_plan(
+            next_target,
+            reason="recovered after planner failure; requesting fresh frontier",
+            force_new_target=True,
+        )
 
     # ------------------------------------------------------------------ private
 
@@ -268,6 +299,15 @@ class ExplorationBehavior:
             # Should not be called in goal-seeking, but guard defensively.
             return agent.final_goal_xy
 
+        # Exclude other robots' claimed targets (observation.excluded_targets)
+        # plus this agent's own recently-failed targets, so a target that
+        # just failed to plan is not immediately re-selected while an
+        # alternative frontier exists.
+        excluded = list(observation.excluded_targets) + agent.recently_failed_exploration_targets(
+            current_time=observation.current_time,
+            cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
+        )
+
         result = planner_services.select_exploration_target(
             planner_name=agent.planner_mode,
             belief_map=observation.belief_map,
@@ -279,7 +319,7 @@ class ExplorationBehavior:
             sensor_range=observation.sensor_range,
             vision_model=observation.vision_model,
             ipp_distance_penalty=observation.ipp_distance_penalty,
-            excluded_targets=list(observation.excluded_targets),
+            excluded_targets=excluded,
         )
 
         if not result.success or result.target is None:

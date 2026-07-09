@@ -16,6 +16,7 @@ Does NOT:
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import math
 from typing import ClassVar, TYPE_CHECKING, Literal
@@ -105,6 +106,49 @@ class RobotAgent:
     failed_exploration_targets: list[tuple[tuple[float, float], float]] = field(default_factory=list)
     last_exploration_failure_time: float = field(default=-1.0e9)
 
+    # Bounded history of positions recorded whenever a route was
+    # successfully assigned (assign_path()) or a prefetched route was
+    # promoted to active (accept_pending_path()) -- i.e. positions from
+    # which normal exploration was known to be working. Used by
+    # RecoveryPolicy as deterministic backtrack candidates when frontier
+    # selection fails from the robot's current (possibly stuck) position.
+    # Bounded to _RECENT_SAFE_POSITION_LIMIT so this cannot grow unbounded
+    # over a long run.
+    recent_safe_positions: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=RobotAgent._RECENT_SAFE_POSITION_LIMIT)
+    )
+
+    # Recovery targets already proposed during the current recovery
+    # episode -- so RecoveryPolicy does not keep re-proposing the same
+    # handful of recent_safe_positions back and forth (ping-pong) once
+    # frontier selection starts failing repeatedly.
+    #
+    # Scoped to a recovery EPISODE, not to raw map_signature: an earlier
+    # design cleared this memory whenever map_signature (mapped-obstacle-
+    # point count) changed, on the theory that new map information might
+    # make a previously-rejected target useful again. In practice,
+    # map_signature changes on nearly every tick from routine sensor
+    # updates picking up a handful of new boundary samples -- completely
+    # unrelated to whether these particular recovery targets are still
+    # worth avoiding. That wiped the memory almost every cycle and let
+    # already-tried targets become "fresh" again within a tick or two,
+    # reproducing the exact ping-pong this memory exists to prevent.
+    #
+    # A recovery episode instead ends only when ExplorationBehavior finds
+    # a normal frontier target again (see clear_recovery_memory()) --
+    # i.e. when exploration is actually making progress, not merely when
+    # a few more obstacle points were sensed.
+    #
+    # Bounded to _RECENT_SAFE_POSITION_LIMIT (same as recent_safe_positions)
+    # so it can never evict a still-relevant entry within one episode --
+    # recovery targets are always drawn from recent_safe_positions, so
+    # this can never need to hold more distinct entries than that does,
+    # which guarantees the candidate pool strictly shrinks every attempt
+    # (bounded, terminating) instead of cycling.
+    recent_recovery_targets: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=RobotAgent._RECENT_SAFE_POSITION_LIMIT)
+    )
+
     # Throttle for identical REPLAN_FOR_SAFETY requests, mirroring the
     # engine's multi_safety_replan_allowed() for the single-robot path.
     last_safety_replan_time: float = field(default=-1.0e9)
@@ -123,6 +167,7 @@ class RobotAgent:
 
     _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
     _EXPLORATION_FAILURE_BUDGET: ClassVar[int] = 3
+    _RECENT_SAFE_POSITION_LIMIT: ClassVar[int] = 20
 
     # Metrics counters (not displayed yet; available for future dashboard).
     stop_count_exploration: int = 0
@@ -316,6 +361,32 @@ class RobotAgent:
         """True when a recent failure/empty-retry means we should keep holding."""
         return (float(current_time) - self.last_exploration_failure_time) < float(cooldown)
 
+    # ------------------------------------------------------------------ recovery memory
+
+    def mark_recovery_target_attempted(self, target: tuple[float, float]) -> None:
+        """Remember that *target* was proposed as a recovery target during
+        the current recovery episode.
+
+        Not reset by map_signature changes -- see clear_recovery_memory().
+        """
+        self.recent_recovery_targets.append(_as_point(target))
+
+    def recovery_targets(self) -> list[tuple[float, float]]:
+        """Recovery targets already attempted during the current recovery episode."""
+        return list(self.recent_recovery_targets)
+
+    def clear_recovery_memory(self) -> None:
+        """End the current recovery episode.
+
+        Called by ExplorationBehavior when a normal frontier target (from
+        _pick_next_target(), not RecoveryPolicy) is found again -- that is
+        what "useful exploration resumed" means here, deliberately NOT a
+        raw change in mapped-obstacle-point count. See the comment on
+        recent_recovery_targets above for why map_signature was the wrong
+        reset trigger.
+        """
+        self.recent_recovery_targets.clear()
+
     # ------------------------------------------------------------------ exploration exhaustion
 
     def register_exploration_failure(self, *, map_signature: int) -> int:
@@ -391,6 +462,9 @@ class RobotAgent:
         planner_reason: str = "",
     ) -> None:
         """Accept a newly computed path and start tracking it."""
+        # Record the position a route was successfully planned FROM, before
+        # updating anything else -- RecoveryPolicy's backtrack candidates.
+        self.recent_safe_positions.append(self.position)
         self.active_path_goal_xy = _as_point(target)
         self.active_path_mode = self.planner_mode
         self.waypoints.set_waypoints(waypoints)
@@ -473,6 +547,9 @@ class RobotAgent:
         """
         if self.pending_path is None:
             return None
+        # Record the position a prefetched route was successfully promoted
+        # FROM -- same bookkeeping as assign_path(), see recent_safe_positions.
+        self.recent_safe_positions.append(self.position)
         waypoints = list(self.pending_path)
         self.waypoints.set_waypoints(waypoints)
         if self.pending_target_xy is not None:

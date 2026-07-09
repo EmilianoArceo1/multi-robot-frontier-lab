@@ -197,6 +197,26 @@ def route_reaches_goal(
     return NavigationSupervisor.validate_route_endpoint(waypoints, goal, tolerance)
 
 
+def effective_planning_clearance(robot_radius: float, safety_radius: float) -> float:
+    """The clearance radius used to inflate obstacles for planning/reachability.
+
+    Semantics (confirmed against config.py's own clamp, main_window.py's
+    radius-consistency enforcement, simulation_canvas.py's safety-radius
+    circle rendering, and the GUI slider label itself, "Safety Radius r
+    (m)"): config.safety_radius is the TOTAL clearance radius from the
+    robot's center, not an extra margin layered on top of the robot's own
+    body -- it is clamped to never be smaller than robot_radius (the
+    physical body radius) so a misconfigured safety_radius can never shrink
+    the robot's effective footprint below its own physical size.
+
+    Deliberately max(...), not robot_radius + safety_radius -- adding them
+    would double-count the body radius safety_radius already includes,
+    over-inflating every obstacle and narrow corridor by an extra
+    robot_radius beyond what the configured "r" value calls for.
+    """
+    return max(float(robot_radius), float(safety_radius))
+
+
 def candidate_reachable_on_planning_grid(
     planning_grid,
     planner_type: str,
@@ -206,9 +226,12 @@ def candidate_reachable_on_planning_grid(
     bounds: tuple[float, float, float, float],
     resolution: float,
     robot_radius: float,
+    goal_tolerance: float,
 ) -> bool:
     """True when compute_planned_waypoints() can find a route from start_xy
-    to candidate_xy on the given, already-built planning_grid.
+    to candidate_xy on the given, already-built planning_grid, AND that
+    route's final waypoint actually reaches candidate_xy within
+    goal_tolerance.
 
     Intended to be called with the SAME planning grid real single-robot
     navigation A* uses (see build_planning_grid_for_robot()), which --
@@ -216,6 +239,16 @@ def candidate_reachable_on_planning_grid(
     inflates around dense mapped-obstacle-point samples. Used to filter
     exploration candidates the real planner would immediately reject with
     "no path found", before one is ever requested.
+
+    The endpoint check matters just as much as "a path exists":
+    compute_planned_waypoints() can return success=True after silently
+    relocating an occupied goal cell to the nearest traversable one (see
+    planner_registry._nearest_traversable_cell()) -- a route to THAT cell,
+    not to candidate_xy. Without this check, a candidate could be accepted
+    as "reachable" here and then be rejected moments later by the exact
+    same endpoint rule apply_route_result()/on_prefetch_route_ready() apply
+    via NavigationSupervisor.validate_route_endpoint() -- wasting a
+    REQUEST_PLAN/PREFETCH cycle on a candidate that was never going to work.
 
     A module-level function (not a method) so it can be unit-tested with a
     plain OccupancyGrid, without instantiating the Qt-based simulation
@@ -234,7 +267,9 @@ def candidate_reachable_on_planning_grid(
         unknown_is_traversable=True,
         obstacle_points=[],
     )
-    return bool(success and waypoints)
+    if not success or not waypoints:
+        return False
+    return NavigationSupervisor.validate_route_endpoint(waypoints, candidate_xy, goal_tolerance)
 
 
 # ============================================================
@@ -3429,8 +3464,8 @@ class SimulationControllerMixin:
         target_robot = self.robot if robot is None else robot
         body = self.body_radius_for_robot(target_robot)
         if target_robot is not None and hasattr(target_robot, "_sim_safety_radius"):
-            return max(float(target_robot._sim_safety_radius), body)
-        return max(float(self.config.safety_radius), body)
+            return effective_planning_clearance(body, float(target_robot._sim_safety_radius))
+        return effective_planning_clearance(body, float(self.config.safety_radius))
 
     def body_radius(self) -> float:
         """Backward-compatible alias for the current robot body radius."""
@@ -4577,6 +4612,7 @@ class SimulationControllerMixin:
         )
         planner_type = str(self.config.planner_type)
         bounds = (WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX)
+        goal_tolerance = float(self.config.goal_tolerance)
 
         def _is_reachable(candidate_xy: tuple[float, float]) -> bool:
             return candidate_reachable_on_planning_grid(
@@ -4587,6 +4623,7 @@ class SimulationControllerMixin:
                 bounds=bounds,
                 resolution=resolution,
                 robot_radius=robot_radius,
+                goal_tolerance=goal_tolerance,
             )
 
         return _is_reachable
@@ -5016,7 +5053,20 @@ class SimulationControllerMixin:
             if not route_reaches_goal(
                 clean_waypoints, agent.pending_target_xy, float(self.config.goal_tolerance)
             ):
+                rejected_target = agent.pending_target_xy
                 agent.reject_pending_path(f"{reason}; final waypoint does not reach path goal")
+                # reject_pending_path() only clears pending_path/pending_target_xy
+                # -- it does not blacklist the target, so without this the exact
+                # same unreachable target could be immediately re-proposed by the
+                # very next prefetch/REQUEST_PLAN cycle. Use the same
+                # failed-target memory _pick_next_target()/select_navigation_goal()
+                # already consult, so the exclusion window applies here exactly
+                # like it does for a REQUEST_PLAN endpoint-mismatch failure (see
+                # apply_route_result() -> invalidate_failed_exploration_route()).
+                if rejected_target is not None:
+                    agent.mark_exploration_target_failed(
+                        rejected_target, current_time=float(self.simulation_time)
+                    )
                 self.log_console_message(
                     f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
                 )

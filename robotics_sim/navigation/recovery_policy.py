@@ -47,6 +47,7 @@ class RecoveryPolicy:
         *,
         active_path_goal: Point2D | None = None,
         pending_target: Point2D | None = None,
+        last_completed_path_goal: Point2D | None = None,
     ) -> Point2D | None:
         """Return a deterministic fallback target, or None if none qualifies.
 
@@ -76,6 +77,17 @@ class RecoveryPolicy:
               every attempt instead of cycling. The caller (RobotAgent)
               decides when an episode ends -- this function has no opinion
               on that, it only excludes whatever list it is given.
+            - last_completed_path_goal -- the point the robot's active
+              route most recently ended at. Distance-based exclusion
+              against robot_xy alone only protects against a candidate
+              close to the robot's CURRENT position; it says nothing about
+              "this exact point was just a route destination" once the
+              robot has since drifted, or once recovery is evaluated a few
+              ticks after that route finished. recent_safe_positions can
+              still contain that same point (recorded by a later, unrelated
+              successful route assignment made from that same resting
+              position -- see RobotAgent.assign_path()), so it needs its
+              own explicit exclusion independent of current distance.
         """
         for candidate in reversed(list(recent_safe_positions)):
             if RecoveryPolicy._is_valid_candidate(
@@ -86,6 +98,7 @@ class RecoveryPolicy:
                 recent_recovery_targets,
                 active_path_goal,
                 pending_target,
+                last_completed_path_goal,
             ):
                 return candidate
         return None
@@ -99,6 +112,7 @@ class RecoveryPolicy:
         recent_recovery_targets: Iterable[Point2D],
         active_path_goal: Point2D | None,
         pending_target: Point2D | None,
+        last_completed_path_goal: Point2D | None = None,
     ) -> bool:
         if RecoveryPolicy._within(candidate, robot_xy, goal_tolerance):
             return False
@@ -111,6 +125,10 @@ class RecoveryPolicy:
         if active_path_goal is not None and RecoveryPolicy._within(candidate, active_path_goal, goal_tolerance):
             return False
         if pending_target is not None and RecoveryPolicy._within(candidate, pending_target, goal_tolerance):
+            return False
+        if last_completed_path_goal is not None and RecoveryPolicy._within(
+            candidate, last_completed_path_goal, goal_tolerance
+        ):
             return False
         return True
 

@@ -233,6 +233,16 @@ class ExplorationBehavior:
             and agent.distance_to_active_path_goal() <= observation.goal_tolerance
         )
         if path_goal_reached:
+            # Remember what was just reached, independent of the robot's
+            # current precise distance to it -- used by RecoveryPolicy
+            # (step 6) to exclude this exact point on its own terms, since
+            # recent_safe_positions can still contain it (recorded by a
+            # later, unrelated successful route assignment made from this
+            # same resting position -- see RobotAgent.assign_path()) even
+            # after the robot has since drifted away by more than
+            # goal_tolerance.
+            agent.last_completed_path_goal_xy = agent.active_path_goal_xy
+
             # A valid prefetched route already exists -- accept it
             # immediately instead of even attempting a fresh frontier
             # search. Step 2 above is the usual place a pending path gets
@@ -372,6 +382,7 @@ class ExplorationBehavior:
                 agent.recovery_targets(),
                 active_path_goal=agent.active_path_goal_xy,
                 pending_target=agent.pending_target_xy,
+                last_completed_path_goal=agent.last_completed_path_goal_xy,
             )
             if recovery_target is not None:
                 agent.mark_recovery_target_attempted(recovery_target)

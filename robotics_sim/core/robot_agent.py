@@ -86,6 +86,16 @@ class RobotAgent:
     exploration_target_xy: tuple[float, float] | None = None
     active_path_goal_xy: tuple[float, float] | None = None
 
+    # The path_goal most recently reached (set by ExplorationBehavior.update()
+    # step 3 when path_goal_reached fires, before active_path_goal_xy is
+    # cleared for the next selection cycle). Used by RecoveryPolicy to
+    # exclude "the point the robot just finished a route at" on its own
+    # terms -- distance-based exclusion alone only protects against a
+    # target close to the robot's CURRENT position, not against this exact
+    # point being re-proposed once the robot has since drifted, or once
+    # recovery is evaluated a few ticks after path_goal was reached.
+    last_completed_path_goal_xy: tuple[float, float] | None = None
+
     # Prefetch state — next path computed before the current target is reached.
     pending_path: list[tuple[float, float]] | None = None
     pending_target_xy: tuple[float, float] | None = None

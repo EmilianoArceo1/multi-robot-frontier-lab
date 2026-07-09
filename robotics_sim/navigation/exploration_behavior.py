@@ -29,6 +29,7 @@ from robotics_sim.navigation.navigation_decision import (
     replan_for_safety,
     request_plan,
 )
+from robotics_sim.navigation.recovery_policy import RecoveryPolicy
 from robotics_sim.simulation.navigation_modes import is_goal_seeking_planner
 
 if TYPE_CHECKING:
@@ -242,6 +243,10 @@ class ExplorationBehavior:
             if next_target is None:
                 agent.stop_count_exploration += 1
                 return hold(reason="frontier reached; no valid next frontier available")
+            # A normal frontier target (from _pick_next_target(), not
+            # RecoveryPolicy) was found here too -- end any recovery
+            # episode from before this frontier was reached, same as step 6.
+            agent.clear_recovery_memory()
             return request_plan(
                 next_target,
                 reason="frontier reached; requesting next frontier",
@@ -310,11 +315,67 @@ class ExplorationBehavior:
 
         next_target = self._pick_next_target(agent, observation, planner_services)
         if next_target is None:
+            # Normal frontier selection found nothing this cycle -- before
+            # treating that as a failure (and counting towards exhaustion),
+            # try a small, deterministic fallback: a nearby position the
+            # robot itself knows was reachable, because a route was
+            # successfully planned from it before. This is what stops
+            # exploration from giving up prematurely on a single failed
+            # frontier-selection attempt. A recovery target that itself
+            # fails to plan still flows through apply_route_result()'s
+            # normal failure handling (invalidate_failed_exploration_route()
+            # -> register_exploration_failure()), so this cannot dodge
+            # exhaustion forever -- only add one bounded extra attempt.
+            #
+            # agent.recovery_targets() is scoped to the current RECOVERY
+            # EPISODE, not to map_signature: a target already attempted for
+            # recovery stays excluded until a normal frontier target is
+            # found again (agent.clear_recovery_memory(), below), not merely
+            # until a few more obstacle samples are mapped. Routine sensor
+            # updates change map_signature on nearly every tick -- scoping
+            # this memory to it would wipe "already tried" almost
+            # immediately and let two safe positions ping-pong forever:
+            # reaching A makes B the "most recent not-at-robot" candidate
+            # and vice versa, since each successful move adds a fresh entry
+            # to recent_safe_positions.
+            recovery_target = RecoveryPolicy.propose_recovery_target(
+                observation.robot_xy,
+                observation.goal_tolerance,
+                agent.recent_safe_positions,
+                agent.recently_failed_exploration_targets(
+                    current_time=observation.current_time,
+                    cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
+                ),
+                agent.recovery_targets(),
+                active_path_goal=agent.active_path_goal_xy,
+                pending_target=agent.pending_target_xy,
+            )
+            if recovery_target is not None:
+                agent.mark_recovery_target_attempted(recovery_target)
+                return request_plan(
+                    recovery_target,
+                    reason="recovery: trying recent safe target before exhaustion",
+                    force_new_target=True,
+                )
+
             agent.stop_count_exploration += 1
             agent.note_exploration_retry_attempt(observation.current_time)
             agent.register_exploration_failure(map_signature=map_signature)
+            # This specific tick is the one where recovery itself just ran
+            # out of candidates (not merely "no frontier"), so say so
+            # explicitly -- distinct from the early-exit check above, whose
+            # "...no reachable frontier candidates" wording is depended on
+            # verbatim by existing tests (test_exploration_exhaustion_recovery.py)
+            # for the steady-state tick that follows this one.
+            if agent.exploration_exhausted(map_signature=map_signature):
+                return hold(reason="exploration exhausted: no reachable frontier candidates after recovery")
             return hold(reason="no reachable frontier candidates remain")
 
+        # A normal frontier target was found: exploration is making real
+        # progress again, so the recovery episode (if any) is over. This is
+        # the ONLY place recovery memory is cleared -- deliberately not on
+        # any map_signature change, see recent_recovery_targets above.
+        agent.clear_recovery_memory()
         return request_plan(
             next_target,
             reason="recovered after planner failure; requesting fresh frontier",

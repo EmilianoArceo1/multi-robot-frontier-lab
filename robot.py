@@ -294,6 +294,30 @@ class Robot:
 
         self.advance_waypoint_if_needed()
 
+    def force_stop(self, reason: str = "") -> None:
+        """
+        Immediately zero velocity, bypassing the gradual deceleration model.
+
+        brake_control() only decelerates gradually: acceleration = -v
+        (clamped to max_acceleration), and DynamicUnicycle2D.step() advances
+        POSITION using the velocity from BEFORE this tick's acceleration is
+        applied (x_{k+1} = x_k + v_k*cos(theta_k)*dt, THEN v_{k+1} = v_k +
+        a_k*dt). So even a textbook brake control still lets the robot
+        travel v_k*dt further on the very tick braking starts, and can take
+        multiple ticks to fully stop -- exactly how a robot already
+        committed to a safety HOLD can still coast into a collision.
+
+        This exists for safety-critical situations where residual motion
+        itself is the hazard (predicted collision, repeated safety replan,
+        route invalidated for safety): it sets velocity to zero directly,
+        then resets the controller's state machine so the next control
+        computation starts from a clean STOP/IDLE mode rather than a stale
+        TRACK/ROTATE one. reason is kept for caller-side logging/debugging;
+        this method does not log anything itself.
+        """
+        self.state.v = 0.0
+        self.state_machine.reset()
+
     @staticmethod
     def wrap_angle(angle: float) -> float:
         return wrap_angle(angle)

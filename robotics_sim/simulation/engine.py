@@ -4848,6 +4848,18 @@ class SimulationControllerMixin:
         if kind == "HOLD":
             hold_xy = (float(robot.x), float(robot.y))
             self.set_robot_goal_or_waypoints(robot, [hold_xy])
+            # Route invalidation alone does not stop the robot: brake_control()
+            # only decelerates gradually, and the dynamics model advances
+            # position using the velocity from BEFORE this tick's
+            # deceleration is applied -- so residual velocity can still
+            # carry the robot into a collision after navigation has already
+            # decided to hold (see Robot.force_stop()). Every HOLD is
+            # treated as a hard stop here: NavigationDecision draws no
+            # distinction between a "normal" HOLD (no valid next frontier)
+            # and a safety-driven one (predicted collision normalized by
+            # NavigationSupervisor) -- both reach this exact branch.
+            if hasattr(robot, "force_stop"):
+                robot.force_stop(reason=decision.reason or "hold")
             agent.invalidate_route(reason=decision.reason or "hold")
             return False
 
@@ -4940,6 +4952,14 @@ class SimulationControllerMixin:
                     hold_xy = (float(robot.x), float(robot.y))
                     attempted_target = agent.exploration_target_xy
                     self.set_robot_goal_or_waypoints(robot, [hold_xy])
+                    # Same hard-stop reasoning as the generic HOLD branch
+                    # above: this route is being invalidated specifically
+                    # because it kept ending up blocked/unsafe, so residual
+                    # velocity here is exactly the "coast into a collision
+                    # after safety logic already decided to stop" scenario
+                    # this fix exists for.
+                    if hasattr(robot, "force_stop"):
+                        robot.force_stop(reason=f"repeated safety replan: {decision.reason}")
                     agent.invalidate_failed_exploration_route(
                         reason=f"repeated safety replan: {decision.reason}",
                         current_time=float(self.simulation_time),

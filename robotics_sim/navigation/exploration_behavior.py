@@ -233,6 +233,29 @@ class ExplorationBehavior:
             and agent.distance_to_active_path_goal() <= observation.goal_tolerance
         )
         if path_goal_reached:
+            # A valid prefetched route already exists -- accept it
+            # immediately instead of even attempting a fresh frontier
+            # search. Step 2 above is the usual place a pending path gets
+            # accepted, but it gates on distance_to_active_target(), and
+            # active_target() (the agent's own shadow WaypointManager's
+            # current waypoint) is never advanced as the robot physically
+            # moves -- it can stay pinned to an already-passed intermediate
+            # waypoint, so its distance to the robot may never drop below
+            # step 2's threshold even once the robot has genuinely reached
+            # active_path_goal_xy (what path_goal_reached, above, actually
+            # checks). Without this, a successful prefetch sitting right
+            # there got silently ignored and the robot held instead of
+            # continuing on a route it already had ready, causing
+            # premature exploration exhaustion.
+            if agent.pending_path and agent.pending_target_xy is not None:
+                sharp = self.should_brake_for_turn(agent, agent.pending_path)
+                reason = (
+                    "frontier reached; accepting already-prefetched path; sharp turn handled by robot controller"
+                    if sharp
+                    else "frontier reached; accepting already-prefetched path"
+                )
+                return accept_pending_path(reason=reason)
+
             agent.target_switch_count += 1
             # Clear the reached frontier so that neither _pick_next_target()
             # nor the engine's select_navigation_goal() can return it again

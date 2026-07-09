@@ -149,6 +149,26 @@ class PlannerWorker(QRunnable):
 
 
 
+def current_route_repair_goal(agent) -> tuple[float, float] | None:
+    """The goal a route-repair replan (route_affected / REPLAN_FOR_SAFETY)
+    must preserve, or None if there is nothing active to preserve.
+
+    route_affected and safety replans exist to fix the CURRENT route, not
+    to pick a new destination -- unlike REQUEST_PLAN ("frontier reached" /
+    initial plan) or PREFETCH_NEXT_TARGET, which legitimately choose a
+    fresh target. Preferring active_path_goal_xy (the route actually being
+    tracked) over exploration_target_xy (which can be set slightly ahead of
+    active_path_goal_xy, e.g. mid-prefetch) keeps repair replans targeting
+    exactly what the robot was already navigating to.
+
+    A module-level function (not a method) so it can be unit-tested
+    without instantiating the Qt-based simulation engine.
+    """
+    if agent is None:
+        return None
+    return agent.active_path_goal_xy or agent.exploration_target_xy
+
+
 def route_first_segment_blocked(
     collision_checker,
     start_xy: tuple[float, float],
@@ -4011,6 +4031,19 @@ class SimulationControllerMixin:
         The robot should not stop permanently when a local segment is blocked. It
         should update its map and ask the selected planner for a new route from
         its current state.
+
+        This is a REPAIR replan (route_affected / REPLAN_FOR_SAFETY), not a
+        fresh target selection: it must preserve the goal the robot was
+        already navigating to (current_route_repair_goal()) via
+        target_override, the same mechanism REQUEST_PLAN decisions already
+        use. Without this, request_route_async() would fall back to
+        select_navigation_goal() -- an independent frontier re-selection
+        that has no idea a route repair, not a new destination, was asked
+        for -- and could switch the robot to a completely different
+        frontier just because a newly-mapped obstacle grazed its current
+        route. Only when there is nothing active to repair
+        (current_route_repair_goal() returns None) does this fall back to
+        that normal target-selection behavior, unchanged.
         """
         if self.robot is None:
             return False
@@ -4019,8 +4052,10 @@ class SimulationControllerMixin:
             return False
 
         self.safety_replan_count += 1
+        repair_goal = current_route_repair_goal(self.runtime_agent(None))
         return self.request_route_async(
-            f"{reason} Replanning with {len(self.mapped_obstacle_points)} mapped boundary sample(s)."
+            f"{reason} Replanning with {len(self.mapped_obstacle_points)} mapped boundary sample(s).",
+            target_override=repair_goal,
         )
 
     def inter_robot_clearance_violation(self) -> tuple[bool, str]:

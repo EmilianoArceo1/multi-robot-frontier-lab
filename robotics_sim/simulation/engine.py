@@ -42,6 +42,7 @@ from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.simulation.telemetry import TelemetryLogger
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
+from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
 from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
 from robotics_sim.simulation.coordination import (
@@ -82,6 +83,40 @@ except ImportError:  # pragma: no cover
 
 from robotics_sim.navigation.navigation_supervisor import NavigationSupervisor
 
+# Minimum wall-clock gap between pushing occupancy snapshots into the
+# canvas's grid overlay. The belief grid can be large, and copying it more
+# often than the overlay could ever visibly refresh just burns CPU for no
+# visual benefit -- 10 Hz is already faster than a human can perceive a
+# grid-color change, and well above typical GUI paint cadence.
+GRID_OVERLAY_SNAPSHOT_INTERVAL_S = 0.1
+# While the canvas has degraded the overlay to grid-lines-only (visible
+# cells over MAX_GRID_OVERLAY_CELLS), no cell coloring is ever drawn from
+# the snapshot -- pushing one at 10 Hz would just be copying the belief
+# grid for nothing. Falls back to a much slower cadence instead of
+# skipping entirely, so a snapshot is still available the moment the user
+# zooms in enough to leave degraded mode.
+GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S = 1.0
+
+
+def occupancy_grid_snapshot_from_belief(belief_map) -> dict | None:
+    """Build a read-only debug snapshot of *belief_map* for the canvas's
+    optional "Show Grid" overlay only.
+
+    Returns a plain dict (resolution, bounds, grid) rather than the
+    BeliefMap itself, and copies the grid array, so the canvas can never
+    hold a live reference to -- or accidentally mutate -- the real
+    belief/occupancy state that planning, routing, and exploration read.
+    """
+    if belief_map is None:
+        return None
+
+    return {
+        "resolution": float(belief_map.resolution),
+        "bounds": tuple(belief_map.bounds),
+        "grid": belief_map.grid.copy(),
+    }
+
+
 class PlannerWorkerSignals(QObject):
     route_ready = Signal(int, bool, str, list)
 
@@ -99,6 +134,10 @@ class PlannerWorker(QRunnable):
         self.setAutoDelete(False)
         self.request_id = int(request_id)
         self.planner_kwargs = dict(planner_kwargs)
+        # Sideband key for [PERF] logging only -- not a real planner
+        # parameter, so it is popped out here and never reaches
+        # compute_planned_waypoints(**self.planner_kwargs) below.
+        self.perf_reason = str(self.planner_kwargs.pop("__perf_reason__", "route_replan"))
         self.path_simplifier = str(path_simplifier)
         self.signals = PlannerWorkerSignals()
 
@@ -121,6 +160,15 @@ class PlannerWorker(QRunnable):
             )
             return
 
+        # Timed strictly around this existing call boundary -- never inside
+        # compute_planned_waypoints/A* itself. Stored as plain attributes,
+        # not printed and not appended to any GUI widget: this runs on a
+        # background QRunnable thread, and touching Qt widgets or the
+        # terminal from here is exactly what must not happen. The GUI
+        # thread's route_ready handler (on_async_route_ready) can read
+        # these attributes off the worker after the signal fires, once
+        # run() has already returned.
+        perf_start = time.perf_counter()
         try:
             supports_simplifier = False
             try:
@@ -139,6 +187,21 @@ class PlannerWorker(QRunnable):
             success = False
             reason = f"planner worker failed: {exc}"
             waypoints = []
+
+        # Not printed and not emitted by default (see class docstring/task
+        # notes): route_plan_ms/route_plan_perf_line are stored for optional
+        # later inspection only. format_route_plan_perf_line is still the
+        # formatter used to build the stored text, so it stays exercised
+        # and testable even though nothing routes it to stdout or the GUI.
+        self.route_plan_ms = (time.perf_counter() - perf_start) * 1000.0
+        self.route_plan_result = "ok" if success else "fail"
+        self.route_plan_perf_line = format_route_plan_perf_line(
+            route_plan_ms=self.route_plan_ms,
+            reason=self.perf_reason,
+            grid_resolution=float(self.planner_kwargs.get("resolution", 0.0) or 0.0),
+            mapped_obs=len(self.planner_kwargs.get("obstacle_points") or []),
+            result=self.route_plan_result,
+        )
 
         self.signals.route_ready.emit(
             self.request_id,
@@ -385,6 +448,51 @@ class SimulationControllerMixin:
             self.reset_belief_map(robot_count=max(1, count))
         return self.belief_map
 
+    def occupancy_grid_snapshot(self) -> dict | None:
+        """Read-only snapshot of the current belief/occupancy grid, for the
+        canvas's optional "Show Grid" overlay only.
+
+        Purely visual/debug: never mutated, never fed back into planning,
+        routing, or exploration, and does not create or rebuild the belief
+        map -- returns None if none exists yet.
+        """
+        return occupancy_grid_snapshot_from_belief(getattr(self, "belief_map", None))
+
+    def push_grid_overlay_snapshot_if_due(self) -> None:
+        """Push a fresh occupancy snapshot into the canvas's grid overlay,
+        but only when the overlay is enabled, and at a rate that depends on
+        whether the overlay is currently degraded (grid-lines-only, no cell
+        coloring drawn -- see MAX_GRID_OVERLAY_CELLS in simulation_canvas.py):
+        GRID_OVERLAY_SNAPSHOT_INTERVAL_S (10 Hz) normally, or the much
+        slower GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S (1 Hz) while
+        degraded, since a degraded overlay never uses the snapshot's cell
+        colors anyway. Automatically returns to the fast rate as soon as
+        the canvas reports it is no longer degraded (e.g. the user zoomed
+        in below the visible-cell cap).
+
+        Purely visual/debug, read-only, and rate-limited: the overlay
+        cannot refresh visibly faster than this anyway, so throttling here
+        avoids copying the (potentially large) belief grid on every single
+        simulation tick for no visible benefit.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or not getattr(canvas, "grid_overlay_enabled", False):
+            return
+
+        is_degraded = getattr(canvas, "is_grid_overlay_degraded", None)
+        degraded = bool(is_degraded()) if callable(is_degraded) else False
+        interval = (
+            GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S if degraded else GRID_OVERLAY_SNAPSHOT_INTERVAL_S
+        )
+
+        now = time.perf_counter()
+        last_push = getattr(self, "_grid_overlay_snapshot_last_push_time", None)
+        if last_push is not None and (now - last_push) < interval:
+            return
+
+        self._grid_overlay_snapshot_last_push_time = now
+        canvas.set_grid_overlay_snapshot(self.occupancy_grid_snapshot())
+
     def sync_legacy_map_views_from_belief(self) -> None:
         """Update legacy views without destroying boundary obstacle samples.
 
@@ -434,7 +542,7 @@ class SimulationControllerMixin:
             ipp_distance_penalty=max(0.0, float(self.ipp_lambda_input.value())),
             vision_model=self.vision_combo.currentText(),
             agent_mode=self.top_bar.mode_selector.currentText(),
-            grid_resolution=self.config.grid_resolution,
+            grid_resolution=max(0.10, float(self.grid_resolution_input.value())),
             obstacles=list(self.config.obstacles),
             show_goal_preview=self.preview_switch.isChecked(),
             show_path=True,
@@ -505,6 +613,7 @@ class SimulationControllerMixin:
             self.coordinator_combo.setCurrentText(config.coordinator_type)
         self.exploration_cooldown_input.setValue(config.exploration_replan_cooldown)
         self.ipp_lambda_input.setValue(config.ipp_distance_penalty)
+        self.grid_resolution_input.setValue(config.grid_resolution)
         self.vision_combo.setCurrentText(config.vision_model)
         self.top_bar.mode_selector.setCurrentText(config.agent_mode)
 
@@ -2064,6 +2173,10 @@ class SimulationControllerMixin:
         else:
             planner_kwargs = self.build_planner_kwargs(start_xy)
 
+        # [PERF]-logging only (see PlannerWorker.__init__); popped before the
+        # real compute_planned_waypoints(**planner_kwargs) call.
+        planner_kwargs["__perf_reason__"] = str(reason)
+
         if bool(planner_kwargs.get("__hold__", False)):
             self.apply_route_result(False, str(planner_kwargs.get("__hold_reason__", "holding position")), [])
             return False
@@ -3215,6 +3328,7 @@ class SimulationControllerMixin:
 
         self.running = True
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(True)
         self.set_configuration_locked(True)
         self.update_start_pause_button()
         self.speed_button.setText(f"Speed {self.simulation_speed:.2f}x")
@@ -3324,6 +3438,7 @@ class SimulationControllerMixin:
 
         self.running = True
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(True)
         self.set_configuration_locked(True)
 
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -3359,6 +3474,7 @@ class SimulationControllerMixin:
         self.robot_agents = self.ensure_runtime_robot_registry().agents
         self.running = False
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(False)
         self.set_configuration_locked(False)
 
         self.collision_checker = CollisionChecker() if CollisionChecker is not None else None
@@ -3580,6 +3696,7 @@ class SimulationControllerMixin:
         """
         self.running = False
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(False)
         self.last_control = self.brake_control_for_collision()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status(message)
@@ -4591,6 +4708,8 @@ class SimulationControllerMixin:
             simulation_time=self.simulation_time,
             simulation_speed=self.simulation_speed,
         )
+
+        self.push_grid_overlay_snapshot_if_due()
 
     # ========================================================
     # NEW POO INTERFACE — gradual migration helpers

@@ -523,6 +523,25 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.update_relevant_parameter_visibility()
         self.update_preview()
 
+    def on_grid_resolution_control_changed(self, value: float) -> None:
+        """Show the temporary red grid preview while the user adjusts
+        grid_resolution. Purely visual -- update_preview() (already
+        connected to this same control via numeric_widgets) is what
+        actually applies the value into self.config; this only drives the
+        canvas overlay, and never rebuilds any occupancy/planning grid
+        mid-run."""
+        self.canvas.show_grid_resolution_preview(float(value))
+        self.canvas.set_grid_overlay_resolution(float(value))
+
+    def on_grid_overlay_toggled(self, enabled: bool) -> None:
+        """Toggle the persistent "Show Grid" overlay.
+
+        Rendering-only: it never touches self.config, never rebuilds the
+        belief/occupancy or planning grid, and is intentionally allowed to
+        change while the simulation is running (see grid_overlay_toggle's
+        exclusion from locked_during_run_widgets in config_panel.py)."""
+        self.canvas.set_grid_overlay_enabled(bool(enabled))
+
     def move_robot_from_canvas(self, index: int, x: float, y: float) -> None:
         if self.running or self.robot is not None or bool(getattr(self, "robots", [])):
             return

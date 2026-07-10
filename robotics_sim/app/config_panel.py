@@ -37,6 +37,7 @@ from robotics_sim.app.widgets import (
     NumericStepper,
     SectionCard,
     SliderValueRow,
+    SteppedSliderRow,
     ToggleSwitch,
     make_icon,
 )
@@ -348,6 +349,42 @@ def build_config_panel(window):
         0,
         1,
         2,
+    )
+
+    # Planning grid cell size. Not a planning-algorithm change -- purely
+    # exposes the existing SimulationConfig.grid_resolution field (already
+    # used throughout the planning grid / reachability pipeline and already
+    # serialized in .sim files) so 0.50 vs 0.25 m/cell can be compared via
+    # manual A/B testing without hand-editing a scenario file.
+    window.grid_resolution_input = SteppedSliderRow(
+        "Grid resolution",
+        window.config.grid_resolution,
+        0.10,
+        1.00,
+        0.05,
+        unit_suffix="m/cell",
+    )
+    window.grid_resolution_field = window.grid_resolution_input
+    options_grid.addWidget(
+        window.grid_resolution_field,
+        9,
+        0,
+        1,
+        2,
+    )
+
+    # "Show Grid" is a rendering-only toggle: it keeps the (otherwise
+    # auto-hiding) grid preview visible persistently and, while the
+    # simulation is running, layers translucent occupied/free/unknown cell
+    # colors on top. It never touches SimulationConfig, so it is
+    # deliberately left out of both numeric_widgets and
+    # locked_during_run_widgets below -- it must stay interactive while a
+    # simulation is running.
+    window.grid_overlay_toggle = ToggleSwitch(False)
+    options_grid.addWidget(
+        labeled_toggle("Show Grid", window.grid_overlay_toggle),
+        10,
+        0,
     )
 
     options_grid.setColumnStretch(0, 1)
@@ -700,6 +737,7 @@ def build_config_panel(window):
         window.accel_gain_input,
         window.exploration_cooldown_input,
         window.ipp_lambda_input,
+        window.grid_resolution_input,
         window.goal_x_input,
         window.goal_y_input,
         window.v_slider,
@@ -738,6 +776,8 @@ def build_config_panel(window):
     window.explored_area_switch.toggled.connect(window.update_preview)
     window.body_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
     window.safety_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
+    window.grid_resolution_input.valueChanged.connect(window.on_grid_resolution_control_changed)
+    window.grid_overlay_toggle.toggled.connect(window.on_grid_overlay_toggled)
     window.top_bar.mode_selector.currentTextChanged.connect(window.on_agent_mode_changed)
     window.robot_count_input.valueChanged.connect(window.on_robot_count_changed)
     window.same_config_switch.toggled.connect(window.on_same_config_toggled)
@@ -789,6 +829,7 @@ def build_config_panel(window):
         window.multi_goal_tol_input,
         window.exploration_cooldown_input,
         window.ipp_lambda_input,
+        window.grid_resolution_input,
         window.x_input,
         window.y_input,
         window.theta_input,

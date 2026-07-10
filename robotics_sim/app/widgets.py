@@ -701,6 +701,124 @@ class NumericStepper(QWidget):
             self.input.setText(self.format_value(value))
 
 
+GRID_RESOLUTION_MIN = 0.10
+GRID_RESOLUTION_MAX = 1.00
+GRID_RESOLUTION_STEP = 0.05
+
+
+def grid_resolution_from_slider(tick: int) -> float:
+    """Map a discrete slider tick to a grid_resolution value.
+
+    Tick 0 -> 0.10, tick 1 -> 0.15, ..., tick 18 -> 1.00 (0.05 m/cell steps).
+    """
+    tick_count = int(round((GRID_RESOLUTION_MAX - GRID_RESOLUTION_MIN) / GRID_RESOLUTION_STEP))
+    tick = int(clamp(tick, 0, tick_count))
+    return round(GRID_RESOLUTION_MIN + tick * GRID_RESOLUTION_STEP, 2)
+
+
+def slider_value_from_grid_resolution(resolution: float) -> int:
+    """Inverse of grid_resolution_from_slider: snap a resolution to its tick."""
+    tick_count = int(round((GRID_RESOLUTION_MAX - GRID_RESOLUTION_MIN) / GRID_RESOLUTION_STEP))
+    ratio = (float(resolution) - GRID_RESOLUTION_MIN) / GRID_RESOLUTION_STEP
+    return int(clamp(round(ratio), 0, tick_count))
+
+
+class SteppedSliderRow(QWidget):
+    """
+    Horizontal slider that snaps to a fixed number of discrete steps, with
+    the current value shown inline in the label (e.g. "Grid resolution:
+    0.25 m/cell") instead of a separate text box.
+
+    Unlike SliderValueRow (continuous internal 0-1000 range, free-form text
+    entry), this widget is for controls where a small, well-defined set of
+    values matters -- the slider's integer tick position IS the value,
+    there is no intermediate continuous state to round.
+    """
+
+    valueChanged = Signal(float)
+
+    def __init__(
+        self,
+        label: str,
+        value: float,
+        minimum: float,
+        maximum: float,
+        step: float,
+        decimals: int = 2,
+        unit_suffix: str = "",
+    ):
+        super().__init__()
+
+        self.minimum = float(minimum)
+        self.maximum = float(maximum)
+        self.step = float(step)
+        self.decimals = decimals
+        self._label_prefix = label
+        self._unit_suffix = unit_suffix
+        self._tick_count = int(round((self.maximum - self.minimum) / self.step))
+        self._value = self._tick_to_value(self._value_to_tick(clamp(float(value), self.minimum, self.maximum)))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.label = QLabel(self._format_label(self._value))
+        self.label.setObjectName("fieldLabel")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, self._tick_count)
+        self.slider.setSingleStep(1)
+        self.slider.setPageStep(1)
+        self.slider.setValue(self._value_to_tick(self._value))
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.slider)
+
+        self.slider.valueChanged.connect(self._on_slider_changed)
+
+    def _format_label(self, value: float) -> str:
+        text = f"{self._label_prefix}: {value:.{self.decimals}f}"
+        if self._unit_suffix:
+            text += f" {self._unit_suffix}"
+        return text
+
+    def _value_to_tick(self, value: float) -> int:
+        ratio = (value - self.minimum) / self.step
+        return int(round(clamp(ratio, 0, self._tick_count)))
+
+    def _tick_to_value(self, tick: int) -> float:
+        value = self.minimum + tick * self.step
+        return round(clamp(value, self.minimum, self.maximum), self.decimals)
+
+    def _on_slider_changed(self, tick: int):
+        value = self._tick_to_value(tick)
+        changed = abs(value - self._value) > 1e-9
+
+        self._value = value
+        self.label.setText(self._format_label(value))
+
+        if changed:
+            self.valueChanged.emit(self._value)
+
+    def value(self) -> float:
+        return self._value
+
+    def setValue(self, value: float):
+        tick = self._value_to_tick(clamp(float(value), self.minimum, self.maximum))
+        snapped = self._tick_to_value(tick)
+        changed = abs(snapped - self._value) > 1e-9
+
+        blocked = self.slider.blockSignals(True)
+        self.slider.setValue(tick)
+        self.slider.blockSignals(blocked)
+
+        self._value = snapped
+        self.label.setText(self._format_label(snapped))
+
+        if changed:
+            self.valueChanged.emit(self._value)
+
+
 class SliderValueRow(QWidget):
     valueChanged = Signal(float)
 

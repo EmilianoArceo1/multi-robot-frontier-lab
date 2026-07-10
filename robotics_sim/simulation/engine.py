@@ -5055,6 +5055,7 @@ class SimulationControllerMixin:
                     target=decision.target,
                     current_time=float(self.simulation_time),
                     cooldown=self.safety_replan_cooldown_seconds(),
+                    route_generation=agent.route_generation,
                 )
                 if allowed:
                     self.replan_after_new_information(

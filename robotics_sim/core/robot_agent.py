@@ -163,6 +163,21 @@ class RobotAgent:
     # engine's multi_safety_replan_allowed() for the single-robot path.
     last_safety_replan_time: float = field(default=-1.0e9)
     last_safety_replan_signature: tuple[str, tuple[float, float] | None] | None = None
+    # Bumped by assign_path() every time a route is actually accepted.
+    # safety_replan_allowed() uses this to tell "the same route, already
+    # tried, still predicting collision" (repeated_safety_replan should
+    # fire) apart from "a fresh route was just accepted and hasn't had a
+    # tick to execute yet" (the cooldown throttle alone cannot tell these
+    # apart, since both look like the same (reason, target) signature
+    # recurring within the cooldown window).
+    route_generation: int = 0
+    last_safety_replan_route_generation: int | None = None
+    # Records the (reason, target) signature that has already used its one
+    # route-generation grace pass (see safety_replan_allowed()), so a target
+    # that is genuinely, repeatedly unsafe -- where every retried route
+    # keeps predicting collision again -- cannot bypass the throttle
+    # forever just because each retry happens to accept a "new" route.
+    _safety_replan_grace_used_for: tuple[str, tuple[float, float] | None] | None = None
 
     # Consecutive exploration-recovery failures (no successful route
     # assigned in between). Reset by assign_path()/accept_pending_path() on
@@ -443,6 +458,7 @@ class RobotAgent:
         target: tuple[float, float] | None,
         current_time: float,
         cooldown: float,
+        route_generation: int | None = None,
     ) -> bool:
         """Throttle identical REPLAN_FOR_SAFETY requests for this robot.
 
@@ -451,6 +467,25 @@ class RobotAgent:
         last time". Returning False means the caller should brake and hold
         this frame instead of launching another planner request for a
         situation it just tried and failed to resolve.
+
+        route_generation (see RobotAgent.route_generation, bumped by
+        assign_path()) distinguishes two situations that otherwise look
+        identical -- the same (reason, target) signature recurring within
+        cooldown: a route that was tried and is genuinely still blocked,
+        versus a brand new route that was JUST accepted for this exact
+        target and hasn't had a single tick to execute yet. When
+        route_generation has advanced since this signature was last
+        recorded, exactly ONE such recurrence is let through (a one-time
+        grace pass per signature, tracked in
+        _safety_replan_grace_used_for) so the new route gets a chance to
+        run instead of being killed in the same acceptance cycle. Once
+        that grace pass has been used for this signature, further
+        recurrences are denied as before, regardless of route_generation
+        -- so a target where every retried route keeps predicting
+        collision again still trips repeated_safety_replan; this cannot
+        be bypassed forever just by each retry happening to accept a
+        technically-new route. Callers that omit route_generation get the
+        original signature+cooldown-only behavior unchanged.
         """
         target_key = None
         if target is not None:
@@ -458,10 +493,27 @@ class RobotAgent:
         signature = (str(reason), target_key)
         elapsed = float(current_time) - float(self.last_safety_replan_time)
         same_signature = signature == self.last_safety_replan_signature
+
         if same_signature and elapsed < float(cooldown):
+            generation_advanced = (
+                route_generation is not None
+                and int(route_generation) != self.last_safety_replan_route_generation
+            )
+            grace_available = signature != self._safety_replan_grace_used_for
+            if generation_advanced and grace_available:
+                self._safety_replan_grace_used_for = signature
+                self.last_safety_replan_time = float(current_time)
+                self.last_safety_replan_route_generation = int(route_generation)
+                return True
             return False
+
         self.last_safety_replan_time = float(current_time)
         self.last_safety_replan_signature = signature
+        if route_generation is not None:
+            self.last_safety_replan_route_generation = int(route_generation)
+        if not same_signature:
+            # A genuinely different target: give it its own fresh grace budget.
+            self._safety_replan_grace_used_for = None
         return True
 
     def assign_path(
@@ -478,6 +530,9 @@ class RobotAgent:
         self.active_path_goal_xy = _as_point(target)
         self.active_path_mode = self.planner_mode
         self.waypoints.set_waypoints(waypoints)
+        # A genuinely new route was just accepted -- see
+        # safety_replan_allowed()'s route_generation grace period.
+        self.route_generation += 1
         self.last_plan_reason = planner_reason
         self.status = "moving" if self.waypoints.has_path() else "finished"
         # A route was successfully committed: exploration is progressing

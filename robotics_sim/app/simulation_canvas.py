@@ -43,6 +43,18 @@ from robotics_sim.app.render_perf import (
 # large visible area can never freeze the UI trying to draw every cell.
 MAX_GRID_OVERLAY_CELLS = 20000
 
+# Radii (px) of planned-route markers: the small numbered waypoint dots,
+# the active/current waypoint (larger so it still stands out, but not so
+# large it dominates the route), and the S (start) / F,G (frontier or
+# final-goal endpoint) markers. Purely visual -- none of these affect
+# waypoint coordinates, route geometry, or planning in any way.
+WAYPOINT_MARKER_RADIUS = 4
+MULTI_ROBOT_WAYPOINT_MARKER_RADIUS = 3
+ACTIVE_WAYPOINT_MARKER_RADIUS = 6
+ACTIVE_WAYPOINT_HALO_PADDING = 6
+START_MARKER_RADIUS = 6
+FRONTIER_OR_ENDPOINT_MARKER_RADIUS = 7
+
 class SimulationCanvas(QWidget):
     goalClicked = Signal(float, float)
     robotDragged = Signal(int, float, float)
@@ -2744,7 +2756,7 @@ class SimulationCanvas(QWidget):
 
             if i == 0:
                 label = "S"
-                radius = 9
+                radius = START_MARKER_RADIUS
                 fill = QColor(BLUE_DARK)
                 stroke = QColor("white")
                 text_color = QColor("white")
@@ -2752,22 +2764,23 @@ class SimulationCanvas(QWidget):
                 goal_xy = self.current_goal_xy()
                 is_final_goal = math.hypot(point[0] - goal_xy[0], point[1] - goal_xy[1]) <= max(0.20, self.config.goal_tolerance)
                 label = "G" if is_final_goal else "F"
-                radius = 10
+                radius = FRONTIER_OR_ENDPOINT_MARKER_RADIUS
                 fill = QColor(GREEN) if is_final_goal else QColor(146, 62, 160)
                 stroke = QColor("white")
                 text_color = QColor("white")
             else:
                 label = str(i)
-                radius = 7
+                radius = WAYPOINT_MARKER_RADIUS
                 fill = QColor("white")
                 stroke = QColor(ORANGE)
                 text_color = QColor(MAROON)
 
             if i == active_index:
+                halo_radius = ACTIVE_WAYPOINT_MARKER_RADIUS + ACTIVE_WAYPOINT_HALO_PADDING
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(225, 126, 38, 55)))
-                painter.drawEllipse(QRectF(sx - 17, sy - 17, 34, 34))
-                radius = 11
+                painter.drawEllipse(QRectF(sx - halo_radius, sy - halo_radius, 2 * halo_radius, 2 * halo_radius))
+                radius = ACTIVE_WAYPOINT_MARKER_RADIUS
                 fill = QColor(ORANGE)
                 stroke = QColor("white")
                 text_color = QColor("white")
@@ -2808,7 +2821,7 @@ class SimulationCanvas(QWidget):
                 sx, sy = self.world_to_screen(*point)
                 if i == 0:
                     label = f"S{robot_index + 1}"
-                    radius = 8
+                    radius = START_MARKER_RADIUS
                     fill = QColor(color)
                     stroke = QColor("white")
                     text_color = QColor("white")
@@ -2816,13 +2829,13 @@ class SimulationCanvas(QWidget):
                     goal_xy = self.current_goal_xy()
                     is_final_goal = math.hypot(point[0] - goal_xy[0], point[1] - goal_xy[1]) <= max(0.20, self.config.goal_tolerance)
                     label = "G" if is_final_goal else "F"
-                    radius = 9
+                    radius = FRONTIER_OR_ENDPOINT_MARKER_RADIUS
                     fill = QColor(GREEN) if is_final_goal else QColor(146, 62, 160)
                     stroke = QColor("white")
                     text_color = QColor("white")
                 else:
                     label = str(i)
-                    radius = 6
+                    radius = MULTI_ROBOT_WAYPOINT_MARKER_RADIUS
                     fill = QColor("white")
                     stroke = QColor(color)
                     text_color = QColor(MAROON)

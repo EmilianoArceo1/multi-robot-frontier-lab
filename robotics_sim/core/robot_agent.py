@@ -99,6 +99,16 @@ class RobotAgent:
     # Prefetch state — next path computed before the current target is reached.
     pending_path: list[tuple[float, float]] | None = None
     pending_target_xy: tuple[float, float] | None = None
+    # Context stamped when a pending path is requested (see
+    # mark_pending_path_requested()), checked by accept_pending_path() so a
+    # prefetch computed under an OLD route context cannot be silently
+    # promoted after something stronger (a safety replan, a route-repair
+    # replan) has since changed the active route -- e.g. the robot's
+    # active_path_goal_xy was just repaired to A, but a stale prefetch to
+    # unrelated target B, requested before the repair, is still sitting in
+    # pending_path/pending_target_xy.
+    pending_path_route_generation: int | None = None
+    pending_path_created_for_active_goal: tuple[float, float] | None = None
 
     status: RobotStatus = "idle"
     waypoints: WaypointManager = field(default_factory=WaypointManager)
@@ -189,6 +199,14 @@ class RobotAgent:
     # Map signature (e.g. mapped-obstacle-point count) recorded at the
     # moment exploration became exhausted. None means "not exhausted".
     exploration_exhausted_map_signature: int | None = None
+
+    # Diagnostics only -- read by engine.py to log an [EXHAUSTION_DIAG]
+    # line at the moment exploration_exhausted() actually fires, without
+    # ExplorationBehavior needing a logger of its own or NavigationDecision
+    # needing new fields. Never used for any decision logic.
+    last_frontier_selection_reason: str = ""
+    last_frontier_candidate_count: int = 0
+    last_map_wide_fallback_attempted: bool = False
 
     _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
     _EXPLORATION_FAILURE_BUDGET: ClassVar[int] = 3
@@ -303,9 +321,38 @@ class RobotAgent:
         self.active_path_mode = None
         self.pending_path = None
         self.pending_target_xy = None
+        self.pending_path_route_generation = None
+        self.pending_path_created_for_active_goal = None
         self.status = "idle"
         if reason:
             self.last_plan_reason = reason
+
+    def invalidate_pending_path(self, reason: str = "") -> None:
+        """Discard a prefetched path without touching the active route.
+
+        Use this when something STRONGER than prefetch is about to change
+        the route -- a safety replan (REPLAN_FOR_SAFETY) or a route-repair
+        replan for newly-mapped obstacles (route_affected) -- so a pending
+        path computed under the OLD context cannot later be silently
+        promoted via accept_pending_path() and overwrite the repaired
+        active_path_goal_xy with a stale, unrelated target. The active
+        route itself is left alone: it may still be perfectly valid while
+        the replan is only just being requested.
+        """
+        self.pending_path = None
+        self.pending_target_xy = None
+        self.pending_path_route_generation = None
+        self.pending_path_created_for_active_goal = None
+        if reason:
+            self.last_plan_reason = reason
+
+    def mark_pending_path_requested(self, target: tuple[float, float]) -> None:
+        """Record that a prefetch for *target* was just requested, stamping
+        the route context (route_generation, active_path_goal_xy) it was
+        requested under -- see accept_pending_path()'s staleness check."""
+        self.pending_target_xy = _as_point(target)
+        self.pending_path_route_generation = self.route_generation
+        self.pending_path_created_for_active_goal = self.active_path_goal_xy
 
     def invalidate_failed_exploration_route(
         self,
@@ -607,11 +654,34 @@ class RobotAgent:
         Switch to the prefetched path.
 
         Returns the waypoint list that was accepted, or None if there was no
-        pending path.  The engine must call set_robot_goal_or_waypoints() with
-        the returned list to push the change into the Robot object.
+        pending path (or it was stale and rejected instead -- see below).
+        The engine must call set_robot_goal_or_waypoints() with the
+        returned list to push the change into the Robot object.
         """
         if self.pending_path is None:
             return None
+
+        # Staleness guard: the route context (a new route accepted via
+        # assign_path() -- e.g. a safety replan or route-repair replan --
+        # or the active path_goal itself) may have changed since this
+        # prefetch was requested (see mark_pending_path_requested()). A
+        # None stamp means "no context recorded" (e.g. an older caller
+        # that set pending_target_xy directly) -- treated as trusted,
+        # unchanged behavior, rather than rejected.
+        generation_changed = (
+            self.pending_path_route_generation is not None
+            and self.pending_path_route_generation != self.route_generation
+        )
+        goal_context_changed = (
+            self.pending_path_created_for_active_goal is not None
+            and self.pending_path_created_for_active_goal != self.active_path_goal_xy
+        )
+        if generation_changed or goal_context_changed:
+            self.reject_pending_path(
+                reason="pending path context stale (route changed since prefetch was requested)"
+            )
+            return None
+
         # Record the position a prefetched route was successfully promoted
         # FROM -- same bookkeeping as assign_path(), see recent_safe_positions.
         self.recent_safe_positions.append(self.position)
@@ -622,6 +692,8 @@ class RobotAgent:
             self.exploration_target_xy = self.pending_target_xy
         self.pending_path = None
         self.pending_target_xy = None
+        self.pending_path_route_generation = None
+        self.pending_path_created_for_active_goal = None
         self.status = "moving"
         self.prefetch_success_count += 1
         self.consecutive_exploration_failures = 0
@@ -632,6 +704,8 @@ class RobotAgent:
         """Discard the prefetched path without touching the current active route."""
         self.pending_path = None
         self.pending_target_xy = None
+        self.pending_path_route_generation = None
+        self.pending_path_created_for_active_goal = None
         self.prefetch_fail_count += 1
         if reason:
             self.last_plan_reason = f"prefetch rejected: {reason}"

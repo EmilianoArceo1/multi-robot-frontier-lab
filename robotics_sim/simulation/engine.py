@@ -40,7 +40,7 @@ from robotics_sim.simulation.navigation_modes import (
 from robotics_sim.navigation.exploration_behavior import ExplorationBehavior
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.simulation.telemetry import TelemetryLogger
-from robotics_sim.environment.belief_map import BeliefMap
+from robotics_sim.environment.belief_map import UNKNOWN, BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
@@ -4536,6 +4536,18 @@ class SimulationControllerMixin:
                     explored_percent=self.estimated_explored_percent(),
                 )
                 if route_affected:
+                    # A route-repair replan is a stronger event than
+                    # prefetch: discard any pending path computed under the
+                    # OLD route context so it cannot be silently promoted
+                    # via ACCEPT_PENDING_PATH once the repaired route is
+                    # accepted (same reasoning as the REPLAN_FOR_SAFETY
+                    # branch in apply_navigation_decision()). Does not
+                    # touch the active route itself.
+                    route_affected_agent = self.runtime_agent(None)
+                    if route_affected_agent is not None:
+                        route_affected_agent.invalidate_pending_path(
+                            reason="route_affected: new obstacle affects current route"
+                        )
                     self.replan_after_new_information("New obstacle affects current route.")
                     return
 
@@ -4958,6 +4970,24 @@ class SimulationControllerMixin:
                 pending_target=getattr(agent, "pending_target_xy", None),
             )
 
+        # Diagnostics only, DEBUG-level (never spams normal/quiet consoles):
+        # logged once, exactly at the tick exploration_exhausted() actually
+        # fires, using data already computed for this decision -- never a
+        # new per-tick candidate-generation pass. Read-only check against
+        # decision.reason's existing text; does not change what that text
+        # is or how it is decided.
+        if kind == "HOLD" and agent is not None and "exploration exhausted" in str(decision.reason):
+            belief = getattr(self, "belief_map", None)
+            unknown_cells = int(np.count_nonzero(belief.grid == UNKNOWN)) if belief is not None else -1
+            self.telemetry.debug(
+                f"[EXHAUSTION_DIAG] unknown_cells={unknown_cells} "
+                f"recovery_candidates={len(agent.recovery_targets())} "
+                f"map_wide_fallback_tried={bool(agent.last_map_wide_fallback_attempted)} "
+                f"last_frontier_candidates={int(agent.last_frontier_candidate_count)} "
+                f'last_frontier_reason="{agent.last_frontier_selection_reason}" '
+                f'reason="{decision.reason}"'
+            )
+
         if kind == "FOLLOW_PATH":
             return False
 
@@ -5043,6 +5073,17 @@ class SimulationControllerMixin:
                 # left it unchanged -- i.e. the agent is guaranteed to have
                 # an active route. (No redundant has_active_route check
                 # here; see the supervisor call at the top of this method.)
+                # A safety replan is a stronger event than prefetch: any
+                # pending path (computed for a different, unrelated target
+                # under the OLD route context) is no longer trustworthy and
+                # must not be silently promoted later via
+                # ACCEPT_PENDING_PATH once the safety route is accepted.
+                # Does not touch the active route itself -- only the
+                # planner request below (if allowed) or the
+                # elif/invalidate_failed_exploration_route() branch further
+                # down decide what happens to that.
+                agent.invalidate_pending_path(reason=f"safety replan: {decision.reason}")
+
                 # Mirror multi_safety_replan_allowed(): throttle identical
                 # (reason, target) safety replans instead of launching a new
                 # planner request every single tick the segment stays
@@ -5138,8 +5179,8 @@ class SimulationControllerMixin:
 
         # "Direct" planner needs no A* — store the path immediately.
         if self.config.planner_type == "Direct":
+            agent.mark_pending_path_requested(target)
             agent.pending_path = [target]
-            agent.pending_target_xy = target
             agent.prefetch_success_count += 1
             self.log_console_message(f"[PREFETCH] direct route to target={target}")
             return True
@@ -5178,8 +5219,11 @@ class SimulationControllerMixin:
             self.prefetch_workers = {}
         self.prefetch_workers[idx] = worker
 
-        # Store target now so agent.step() can track pending_target_xy.
-        agent.pending_target_xy = target
+        # Store target now so agent.step() can track pending_target_xy, and
+        # stamp the route context this prefetch was requested under (see
+        # RobotAgent.mark_pending_path_requested()/accept_pending_path()'s
+        # staleness check).
+        agent.mark_pending_path_requested(target)
 
         self.thread_pool.start(worker)
         self.log_console_message(f"[PREFETCH] requested target={target}")

@@ -2,7 +2,8 @@
 Simulation canvas and rendering logic.
 
 This module draws the current simulator snapshot: grid, obstacles, mapped
-points, explored area, robots, FoV/LiDAR, routes, frontiers, and telemetry.
+points, explored area, robots, FoV/LiDAR, routes, and frontiers. Runtime
+controls are real child widgets registered by MainWindow.
 It emits interaction events, but it does not choose frontiers or compute routes.
 """
 
@@ -283,10 +284,13 @@ class SimulationCanvas(QWidget):
         self._nav_debug_history_position: tuple[int | None, int] = (None, 0)
         self._nav_debug_overlay_cache: dict | None = None
         self._nav_debug_overlay_cache_key: tuple | None = None
-        # Optional standalone window the full field breakdown is forwarded
+        # Optional docked panel the full field breakdown is forwarded
         # to -- see set_navigation_reasoning_window(). None until
         # main_window.py registers one.
         self._navigation_reasoning_window = None
+        # MainWindow registers a real QWidget action bar that occupies the
+        # footer previously used by the painted telemetry strip.
+        self._action_bar = None
 
         # History step buttons: real Qt widgets (not QPainter-drawn), so
         # they are always crisp and reliably clickable regardless of the
@@ -303,15 +307,10 @@ class SimulationCanvas(QWidget):
             step_button.setEnabled(False)
             step_button.setVisible(False)
             step_button.raise_()
-            # Holding the button down repeats the click (Qt's built-in
-            # auto-repeat) so it keeps stepping through history until
-            # released, instead of requiring one press per step.
-            # step_navigation_debug_history() already clamps at the
-            # history bounds, so holding past the oldest/newest entry
-            # simply stops advancing rather than erroring.
-            step_button.setAutoRepeat(True)
-            step_button.setAutoRepeatDelay(350)
-            step_button.setAutoRepeatInterval(70)
+            # MainWindow owns press-and-hold acceleration (1x -> 3x) with a
+            # single timer. Disable Qt's fixed-rate auto-repeat so one press
+            # cannot trigger two independent repeat loops.
+            step_button.setAutoRepeat(False)
             step_button.setStyleSheet(
                 "QPushButton { background-color: rgba(255,255,255,215); border: 1px solid "
                 f"{BORDER}; border-radius: 4px; font-weight: 600; }}"
@@ -446,6 +445,7 @@ class SimulationCanvas(QWidget):
         self.invalidate_mapped_points_cache()
         self.invalidate_obstacles_cache()
         self._position_navigation_debug_step_buttons()
+        self._position_action_bar()
         super().resizeEvent(event)
 
     def _position_navigation_debug_step_buttons(self) -> None:
@@ -458,6 +458,35 @@ class SimulationCanvas(QWidget):
         forward = self.navigation_debug_step_forward_button
         forward.move(self.width() - margin - forward.width(), margin)
         back.move(forward.x() - gap - back.width(), margin)
+
+    def set_action_bar(self, action_bar: QWidget | None) -> None:
+        """Register the real runtime-control footer owned by MainWindow."""
+        previous = getattr(self, "_action_bar", None)
+        if previous is not None and previous is not action_bar:
+            previous.hide()
+        self._action_bar = action_bar
+        if action_bar is not None:
+            action_bar.setParent(self)
+            action_bar.show()
+            action_bar.raise_()
+            self._position_action_bar()
+
+    def set_action_bar_visible(self, visible: bool) -> None:
+        bar = getattr(self, "_action_bar", None)
+        if bar is not None:
+            bar.setVisible(bool(visible))
+            if visible:
+                bar.raise_()
+
+    def _position_action_bar(self) -> None:
+        bar = getattr(self, "_action_bar", None)
+        if bar is None:
+            return
+        rect = self.telemetry_rect()
+        if isinstance(rect, QRectF):
+            rect = rect.toAlignedRect()
+        bar.setGeometry(rect)
+        bar.raise_()
 
     def invalidate_static_plot_cache(self):
         self._static_plot_cache = None
@@ -917,8 +946,9 @@ class SimulationCanvas(QWidget):
         return x, y
 
     def telemetry_rect(self):
+        """Footer rectangle now occupied by the runtime action bar."""
         r = self.rect()
-        return r.adjusted(30, r.height() - 50, -30, -16)
+        return r.adjusted(30, r.height() - 58, -30, -12)
 
     def metrics_rect(self) -> QRectF:
         """
@@ -1483,9 +1513,9 @@ class SimulationCanvas(QWidget):
 
         self.draw_plot(painter)
 
-        _telemetry_start = time.perf_counter()
-        self.draw_telemetry(painter)
-        telemetry_ms = (time.perf_counter() - _telemetry_start) * 1000.0
+        # The footer is now a real QWidget action bar. Keep the render-perf
+        # bucket for compatibility, but there is no painted telemetry work.
+        telemetry_ms = 0.0
         self._render_layer_ms["telemetry"] = telemetry_ms
 
         # Card/title/telemetry chrome is small, one-off UI decoration, not
@@ -2018,7 +2048,10 @@ class SimulationCanvas(QWidget):
         # richer diagnostic layer). The executed trail line and the FOV
         # heading arrow were dropped entirely, not merged, per explicit
         # request -- they cluttered the view without explaining a decision.
-        if self.robots and "Multiple" in self.config.agent_mode:
+        history_position, _history_total = self._nav_debug_history_position
+        if self.navigation_debug_enabled and history_position is not None:
+            self.draw_historical_planned_route(painter)
+        elif self.robots and "Multiple" in self.config.agent_mode:
             self.draw_multi_planned_routes(painter)
         else:
             self.draw_planned_route(painter)
@@ -2268,7 +2301,7 @@ class SimulationCanvas(QWidget):
         return bool(self.navigation_debug_enabled)
 
     def set_navigation_reasoning_window(self, window) -> None:
-        """Register the standalone NavigationReasoningWindow so the 3
+        """Register the docked NavigationReasoningWindow so the 3
         setters below can forward pushes to it too. Optional -- None (the
         default) just skips forwarding, so tests that never construct the
         window are unaffected."""
@@ -3514,6 +3547,51 @@ class SimulationCanvas(QWidget):
         painter.setBrush(QBrush(fill))
         painter.drawEllipse(QRectF(sx - radius, sy - radius, 2 * radius, 2 * radius))
 
+    def draw_historical_planned_route(self, painter: QPainter):
+        """Draw the route frozen inside the selected history snapshot.
+
+        Never combine a historical robot pose with the current live route. The
+        occupancy/heatmap background remains the current map, but motion,
+        active waypoint and route all come from the same immutable snapshot.
+        """
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None:
+            return
+
+        path_points = list(snapshot.path.active_path)
+        active_index = snapshot.path.active_waypoint_index
+        if active_index is None:
+            active_index = 0
+        active_index = max(0, min(int(active_index), len(path_points)))
+        future_points = [
+            (float(point[0]), float(point[1]))
+            for point in path_points[active_index:]
+        ]
+        if not future_points and snapshot.path.active_segment is not None:
+            future_points = [tuple(map(float, snapshot.path.active_segment[1]))]
+        if not future_points:
+            return
+
+        start = (float(snapshot.robot_pose.x), float(snapshot.robot_pose.y))
+        route_points = [start, *future_points]
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        route_color = QColor(ORANGE)
+        route_color.setAlpha(215)
+        painter.setPen(QPen(route_color, 2.2, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawPath(self._rebuild_route_path(route_points))
+        for offset, point in enumerate(future_points):
+            self._draw_waypoint_marker(
+                painter,
+                point,
+                active=(offset == 0),
+                endpoint=(offset == len(future_points) - 1),
+                endpoint_is_goal=False,
+                color=QColor(ORANGE),
+            )
+        painter.restore()
+
     def draw_planned_route(self, painter: QPainter):
         """Draw exactly one authoritative route: the remaining accepted path.
 
@@ -3734,6 +3812,18 @@ class SimulationCanvas(QWidget):
         self._route_detail["executed_trail_paint_ms"] = (time.perf_counter() - _paint_start) * 1000.0
 
     def draw_goal_and_robot(self, painter: QPainter):
+        history_position, _history_total = self._nav_debug_history_position
+        if self.navigation_debug_enabled and history_position is not None and self._nav_debug_snapshot is not None:
+            snapshot = self._nav_debug_snapshot
+            rx, ry = self.world_to_screen(snapshot.robot_pose.x, snapshot.robot_pose.y)
+            body_px = max(5.0, float(snapshot.safety.robot_radius) * self.pixels_per_meter())
+            painter.save()
+            painter.setPen(QPen(QColor("white"), 2.0))
+            painter.setBrush(QBrush(QColor(BLUE)))
+            painter.drawEllipse(QRectF(rx - body_px, ry - body_px, 2 * body_px, 2 * body_px))
+            painter.restore()
+            return
+
         x, y, theta, _ = self.current_robot_pose()
         gx, gy = self.current_goal_xy()
 
@@ -3875,39 +3965,6 @@ class SimulationCanvas(QWidget):
         painter.drawEllipse(QRectF(rx - body_px, ry - body_px, 2 * body_px, 2 * body_px))
         painter.restore()
 
-    def draw_telemetry(self, painter: QPainter):
-        rect = QRectF(self.telemetry_rect())
-        path = QPainterPath()
-        path.addRoundedRect(rect, 7, 7)
-        painter.fillPath(path, QColor("#FAFBFD"))
-        painter.setPen(QPen(QColor(BORDER), 1))
-        painter.drawPath(path)
-
-        painter.setFont(QFont("Consolas", 9))
-        painter.setPen(QColor(TEXT))
-
-        if self.robot is None:
-            text = (
-                "state: CONFIG     x: --     y: --     theta: --     "
-                "v: --     a: --     omega: --     distance: --"
-            )
-        else:
-            gx, gy = self.current_goal_xy()
-            distance = np.linalg.norm(self.robot.displacement(gx, gy))
-            text = (
-                f"state: {mode_name(self.robot)}     "
-                f"x: {self.robot.x: .2f}     "
-                f"y: {self.robot.y: .2f}     "
-                f"theta: {self.robot.theta: .3f}     "
-                f"v: {self.robot.v: .3f}     "
-                f"a: {self.last_control[0, 0]: .3f}     "
-                f"omega: {self.last_control[1, 0]: .3f}     "
-                f"distance: {distance: .3f}     "
-                f"mapped pts: {len(self.mapped_obstacle_points)}"
-            )
-
-        painter.drawText(rect.adjusted(12, 0, -12, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
-
     def _navigation_debug_pick_live_terms(self, snapshot):
         """Pick whichever safety check is most relevant to show as the live
         formula next to the robot: a currently-blocked predicted-motion
@@ -4002,7 +4059,7 @@ class SimulationCanvas(QWidget):
     def draw_navigation_debug_robot_label(self, painter: QPainter):
         """Compact floating readout anchored above the robot, following it
         every frame like a nameplate -- short formulas only (the full
-        breakdown lives in the standalone NavigationReasoningWindow).
+        breakdown lives in the docked NavigationReasoningWindow).
         Nothing here is computed: every value is read straight off the
         snapshot. Background is translucent and the label is offset past
         the safety-radius ring so it never covers the robot or the map
@@ -4085,8 +4142,7 @@ class SimulationCanvas(QWidget):
     # The full field breakdown ("NAVIGATION REASONING") now lives in the
     # standalone NavigationReasoningWindow (see navigation_reasoning_
     # window.py) instead of a fixed card drawn on top of the canvas -- a
-    # separate OS window cannot overlap the map/title/FPS the way an
-    # in-canvas overlay could. main_window.py forwards snapshot/event/
+    # side panel does not overlap the map/title/FPS. main_window.py forwards snapshot/event/
     # history-position pushes to it directly; the canvas keeps only the
     # compact near-robot label and the world-space annotations.
 

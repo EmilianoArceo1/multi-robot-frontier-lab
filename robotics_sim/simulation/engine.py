@@ -49,6 +49,7 @@ from robotics_sim.simulation.robot_trace import (
 )
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
 from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
+from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
 from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
@@ -1177,13 +1178,14 @@ class SimulationControllerMixin:
 
         # Project the independent continuous hazard layer into this derived
         # binary planning grid. BeliefMap.grid is never modified.
-        hazard_service = self.ensure_hazard_service()
-        apply_hazard_to_planning_grid(
-            planning_grid,
-            hazard_service.field,
-            block_threshold=hazard_service.block_threshold,
-            inflate_radius=max(0.0, radius),
-        )
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None:
+            apply_hazard_to_planning_grid(
+                planning_grid,
+                hazard_service.field,
+                block_threshold=hazard_service.block_threshold,
+                inflate_radius=max(0.0, radius),
+            )
         return planning_grid
 
     def planner_accepts_path_simplifier(self) -> bool:
@@ -2046,15 +2048,56 @@ class SimulationControllerMixin:
         end: tuple[float, float],
         obstacle_points: list[tuple[float, float]],
     ) -> bool:
-        if self.collision_checker is None:
+        collision_checker = getattr(self, "collision_checker", None)
+        if collision_checker is None:
             return True
-        report = self.collision_checker.check_segment_points(
+        report = collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
             end=(float(end[0]), float(end[1])),
             obstacle_points=list(obstacle_points),
             robot_radius=float(self.safety_radius_for_robot(robot)),
         )
         return not bool(report.collision)
+
+    def planning_line_of_sight_clear_for_robot(
+        self,
+        robot,
+        target: tuple[float, float],
+        obstacle_points: list[tuple[float, float]],
+    ) -> bool:
+        """Check a current-pose shortcut against the same derived grid as A*/Dijkstra.
+
+        Production uses BeliefMap occupancy, UNKNOWN policy, inflated mapped
+        obstacles and the hazard layer. Lightweight test doubles that do not
+        expose the grid builder fall back to the existing point-clearance
+        check rather than inventing a second map representation.
+        """
+        start = (float(robot.x), float(robot.y))
+        builder = getattr(self, "build_planning_grid_for_robot", None)
+        if callable(builder):
+            planning_grid = builder(
+                robot,
+                obstacle_points=list(obstacle_points),
+                robot_radius=float(self.safety_radius_for_robot(robot)),
+            )
+            start_cell = planning_grid.world_to_grid(*start, clamp=True)
+            target_cell = planning_grid.world_to_grid(
+                float(target[0]), float(target[1]), clamp=True
+            )
+            if not planning_grid.in_bounds(start_cell) or not planning_grid.in_bounds(target_cell):
+                return False
+            # The physical robot already occupies the start position. A stale
+            # quantized obstacle sample must not prevent a local visibility
+            # query, matching planner_registry's start-cell handling.
+            if not planning_grid.is_traversable(start_cell):
+                planning_grid.set_value(start_cell, FREE)
+            if not planning_grid.is_traversable(target_cell):
+                return False
+            return bool(line_of_sight_grid_safe(planning_grid, start_cell, target_cell))
+
+        return SimulationControllerMixin.segment_clear_for_robot_against_points(
+            self, robot, start, target, obstacle_points
+        )
 
     def clean_waypoints_for_robot(
         self,
@@ -2080,10 +2123,28 @@ class SimulationControllerMixin:
         if not cleaned:
             return []
 
+        points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None:
+            points_for_clearance.extend(hazard_service.blocked_world_points())
+
+        # Runtime invariant: if the final target is directly safe from the
+        # robot's CURRENT pose, never execute an older/grid-artifact detour.
+        # Raw/simplified planner paths remain available in diagnostics; only
+        # the executable route is shortened. This also fixes prefetched routes
+        # whose start pose became stale before promotion.
+        final_target = cleaned[-1]
+        if (
+            getattr(self, "collision_checker", None) is not None
+            and SimulationControllerMixin.planning_line_of_sight_clear_for_robot(
+                self, robot, final_target, points_for_clearance
+            )
+        ):
+            return [final_target]
+
         if self.config.path_simplifier != "Line of sight grid-safe":
             return cleaned
 
-        points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
         simplified: list[tuple[float, float]] = []
         current = start
         index = 0
@@ -2162,10 +2223,15 @@ class SimulationControllerMixin:
         if self.collision_checker is None:
             return True
 
+        obstacle_points = list(self.mapped_obstacle_points)
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None:
+            obstacle_points.extend(hazard_service.blocked_world_points())
+
         report = self.collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
             end=(float(end[0]), float(end[1])),
-            obstacle_points=list(self.mapped_obstacle_points),
+            obstacle_points=obstacle_points,
             robot_radius=float(self.safety_radius()),
         )
         return not bool(report.collision)
@@ -2211,9 +2277,19 @@ class SimulationControllerMixin:
         if not cleaned:
             return []
 
-        # The most aggressive simplifier should be allowed to remove the
-        # artificial cell-center waypoint produced by grid planning when the
-        # continuous segment is actually safe.
+        # The executable route must never preserve a huge detour when the
+        # intended final target is directly safe from the CURRENT pose. This
+        # is a post-planning invariant, not a replacement for A*/Dijkstra; the
+        # raw and configured-simplifier paths stay visible in diagnostics.
+        if (
+            getattr(self, "collision_checker", None) is not None
+            and SimulationControllerMixin.segment_clear_against_current_map(
+                self, start, cleaned[-1]
+            )
+        ):
+            return [cleaned[-1]]
+
+        # For non-direct cases, preserve the user's selected simplifier.
         if self.config.path_simplifier != "Line of sight grid-safe":
             return cleaned
 
@@ -2702,6 +2778,7 @@ class SimulationControllerMixin:
             tracking_mode=tracking_mode,
             rotate_threshold=rotate_threshold,
             explanation=explanation,
+            mapped_obstacle_points_count=len(getattr(self, "mapped_obstacle_points", ())),
         )
 
         # The ring buffer records every tick (a full in-memory history for
@@ -2735,6 +2812,32 @@ class SimulationControllerMixin:
     def navigation_debug_history_length(self) -> int:
         log = getattr(self, "navigation_debug_log", None)
         return len(log) if log is not None else 0
+
+    def reset_navigation_debug_run_state(self) -> None:
+        """Clear the in-memory replay and put the panel back on the robot/live state."""
+        self.navigation_debug_log = NavigationDebugEventLog()
+        self._nav_debug_seq = 0
+        self._nav_debug_history_index = None
+        self._nav_debug_last_accepted_plan = None
+        self._nav_debug_live_snapshot = None
+        self._nav_debug_pending_plan_capture_by_robot = {}
+
+        stop_scrub = getattr(self, "stop_navigation_history_scrub", None)
+        if callable(stop_scrub):
+            stop_scrub()
+
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            if hasattr(canvas, "set_navigation_debug_snapshot"):
+                canvas.set_navigation_debug_snapshot(None)
+            if hasattr(canvas, "set_navigation_debug_last_event"):
+                canvas.set_navigation_debug_last_event(None)
+            if hasattr(canvas, "set_navigation_debug_history_position"):
+                canvas.set_navigation_debug_history_position(None, 0)
+
+        updater = getattr(self, "update_navigation_debug_step_buttons", None)
+        if callable(updater):
+            updater()
 
     def _push_navigation_debug_history_view(self, index: int) -> None:
         """Push the snapshot/event at `index` in the bounded event log to
@@ -3714,13 +3817,13 @@ class SimulationControllerMixin:
         reset.
         """
         if not self.running:
-            self.start_button.setText("Start Simulation")
+            self.start_button.setText("Start")
             self.start_button.setIcon(make_icon("play", "white"))
         elif self.paused:
-            self.start_button.setText("Resume Simulation")
+            self.start_button.setText("Resume")
             self.start_button.setIcon(make_icon("play", "white"))
         else:
-            self.start_button.setText("Pause Simulation")
+            self.start_button.setText("Pause")
             self.start_button.setIcon(make_icon("pause", "white"))
 
     def update_navigation_debug_step_buttons(self) -> None:
@@ -3735,14 +3838,26 @@ class SimulationControllerMixin:
             and length > 0
         )
         current = getattr(self, "_nav_debug_history_index", None)
-        back_button = getattr(canvas, "navigation_debug_step_back_button", None)
-        forward_button = getattr(canvas, "navigation_debug_step_forward_button", None)
-        if back_button is not None:
-            back_button.setVisible(active)
-            back_button.setEnabled(active and (current is None or current > 0))
-        if forward_button is not None:
-            forward_button.setVisible(active)
-            forward_button.setEnabled(active and current is not None)
+        back_enabled = active and (current is None or current > 0)
+        forward_enabled = active and current is not None
+
+        # The visible controls belong to the docked Navigation Reasoning
+        # panel. Legacy canvas buttons remain hidden for compatibility with
+        # older tests/plugins, but no longer occupy map space.
+        reasoning_panel = getattr(self, "navigation_reasoning_window", None)
+        setter = getattr(reasoning_panel, "set_history_controls", None)
+        if callable(setter):
+            setter(
+                visible=active,
+                back_enabled=back_enabled,
+                forward_enabled=forward_enabled,
+            )
+
+        for name in ("navigation_debug_step_back_button", "navigation_debug_step_forward_button"):
+            legacy_button = getattr(canvas, name, None)
+            if legacy_button is not None:
+                legacy_button.setVisible(False)
+                legacy_button.setEnabled(False)
 
     def handle_start_pause_button(self) -> None:
         has_runtime_robot = self.robot is not None or bool(getattr(self, "robots", []))
@@ -4630,12 +4745,7 @@ class SimulationControllerMixin:
         self.last_goal_selection_reason = "using final mission goal"
         self.route_request_count = 0
         self.route_result_count = 0
-        self.navigation_debug_log = NavigationDebugEventLog()
-        self._nav_debug_seq = 0
-        self._nav_debug_history_index = None
-        self._nav_debug_last_accepted_plan = None
-        self._nav_debug_live_snapshot = None
-        self._nav_debug_pending_plan_capture_by_robot = {}
+        self.reset_navigation_debug_run_state()
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -6740,13 +6850,34 @@ class SimulationControllerMixin:
             return False
 
         if kind == "ACCEPT_PENDING_PATH":
+            robot_index = 0
+            dynamic_points: list[tuple[float, float]] = []
+            if getattr(self, "robots", None):
+                robot_index = next((i for i, candidate in enumerate(self.robots) if candidate is robot), 0)
+                dynamic_points = self.dynamic_robot_obstacle_points_for_robot(robot_index)
+
+            # A prefetch may have been planned from a pose that is already
+            # stale by the time it is promoted. Normalize it against the
+            # robot's CURRENT pose before RobotAgent installs the waypoints.
+            # If the final frontier is directly safe, this collapses the old
+            # detour to one segment instead of making the robot drive back to
+            # the prefetch origin.
+            if agent.pending_path:
+                normalized_pending = SimulationControllerMixin.clean_waypoints_for_robot(
+                    self,
+                    robot,
+                    list(agent.pending_path),
+                    obstacle_points=list(self.mapped_obstacle_points) + dynamic_points,
+                )
+                if not normalized_pending:
+                    agent.reject_pending_path("pending path obsolete at handoff")
+                    return False
+                agent.pending_path = normalized_pending
+
             _pending_accept_perf_start = time.perf_counter()
             waypoints = agent.accept_pending_path()
             _record_perf(self, "pending_path_acceptance", time.perf_counter() - _pending_accept_perf_start)
             if waypoints:
-                robot_index = 0
-                if getattr(self, "robots", None):
-                    robot_index = next((i for i, candidate in enumerate(self.robots) if candidate is robot), 0)
                 pending_captures = getattr(self, "_nav_debug_pending_plan_capture_by_robot", {})
                 promoted_plan_capture = pending_captures.pop(robot_index, None)
                 if promoted_plan_capture is not None:

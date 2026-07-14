@@ -13,7 +13,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QSize, QThreadPool
-from PySide6.QtGui import QColor, QFont, QPen
+from PySide6.QtGui import QAction, QColor, QFont, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -22,9 +22,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -109,6 +111,17 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self._nav_debug_live_snapshot = None
         self._nav_debug_pending_plan_capture_by_robot: dict[int, object] = {}
 
+        # Press-and-hold history scrubbing. The first press moves one frame,
+        # then a single-shot timer repeats with a smooth 1x -> 3x ramp.
+        self._nav_history_scrub_direction = 0
+        self._nav_history_scrub_started_at = 0.0
+        self._nav_history_scrub_initial_delay_ms = 320
+        self._nav_history_scrub_base_interval_ms = 180
+        self._nav_history_scrub_ramp_seconds = 1.8
+        self._nav_history_scrub_timer = QTimer(self)
+        self._nav_history_scrub_timer.setSingleShot(True)
+        self._nav_history_scrub_timer.timeout.connect(self._continue_navigation_history_scrub)
+
         # RuntimeHazardService is created lazily by reset_belief_map(), using
         # the same bounds/resolution as the logical occupancy belief. Temporary
         # fire sources never live inside BeliefMap.grid.
@@ -125,6 +138,12 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.editor_panel = None
         self.simulation_panel = None
         self.side_panel_container = None
+        # Panel visibility is explicit UI state. Do not infer it with
+        # QWidget.isVisible(): during build_ui() the parent window is not yet
+        # shown, so isVisible() returns False even for a child that is intended
+        # to be visible. That previously hid the whole side column and made the
+        # gear-menu action unable to recover it.
+        self._configuration_panel_visible = True
 
         # Simulation clock and speed multiplier. The GUI still targets 60 FPS;
         # this multiplier changes simulated dt, not the QTimer interval.
@@ -270,33 +289,128 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas.editor_obstacle_move_started.connect(self.push_editor_undo_state)
         self.canvas.editor_obstacle_moved.connect(self.on_editor_obstacle_moved)
         self.canvas.editor_view_changed.connect(self.refresh_editor_status_label)
-        self.canvas.navigation_debug_step_back_button.clicked.connect(self.on_navigation_debug_step_back)
-        self.canvas.navigation_debug_step_forward_button.clicked.connect(self.on_navigation_debug_step_forward)
         self.canvas.navigationDebugToggleRequested.connect(self.on_navigation_debug_eye_clicked)
         self.canvas.fireToggleRequested.connect(self.on_fire_toggle_requested)
+        self._build_canvas_action_bar()
 
-        # Standalone window for the full "Navigation Reasoning" breakdown --
-        # a separate OS window instead of a card drawn on the canvas so it
-        # can never overlap the map/title/FPS. Hidden until the eye icon
-        # turns Navigation Debug on (see on_navigation_debug_toggled()).
         self.navigation_reasoning_window = NavigationReasoningWindow(self)
+        self.navigation_reasoning_window.closeRequested.connect(
+            lambda: self.on_navigation_debug_toggled(False)
+        )
+        self.navigation_reasoning_window.step_back_button.pressed.connect(
+            lambda: self.start_navigation_history_scrub(-1)
+        )
+        self.navigation_reasoning_window.step_back_button.released.connect(
+            self.stop_navigation_history_scrub
+        )
+        self.navigation_reasoning_window.step_forward_button.pressed.connect(
+            lambda: self.start_navigation_history_scrub(1)
+        )
+        self.navigation_reasoning_window.step_forward_button.released.connect(
+            self.stop_navigation_history_scrub
+        )
         self.canvas.set_navigation_reasoning_window(self.navigation_reasoning_window)
 
         self.simulation_panel = self.build_config_panel()
         self.editor_panel = self.build_editor_panel()
+
+        self.config_panel_stack = QWidget()
+        self.config_panel_stack.setObjectName("configPanelStack")
+        config_stack_layout = QVBoxLayout(self.config_panel_stack)
+        config_stack_layout.setContentsMargins(0, 0, 0, 0)
+        config_stack_layout.setSpacing(0)
+        config_stack_layout.addWidget(self.simulation_panel)
+        config_stack_layout.addWidget(self.editor_panel)
+
+        self._install_config_panel_close_button(self.simulation_panel)
+        self._install_config_panel_close_button(self.editor_panel)
+
+        # A narrow side column cannot support two vertically stacked, content-
+        # heavy panels without making both unpleasant to use. Keep each panel
+        # full-height and switch between them with tabs when both are enabled.
+        self.side_panel_tabs = QTabWidget()
+        self.side_panel_tabs.setObjectName("sidePanelTabs")
+        self.side_panel_tabs.setDocumentMode(True)
+        self.side_panel_tabs.setMovable(False)
+        self.side_panel_tabs.setTabsClosable(False)
+        self.side_panel_tabs.tabBar().setExpanding(True)
+
         self.side_panel_container = QWidget()
         self.side_panel_container.setObjectName("sidePanelContainer")
+        self.side_panel_container.setFixedWidth(SIDE_PANEL_WIDTH)
         self.side_panel_container_layout = QVBoxLayout(self.side_panel_container)
         self.side_panel_container_layout.setContentsMargins(0, 0, 0, 0)
         self.side_panel_container_layout.setSpacing(0)
-        self.side_panel_container_layout.addWidget(self.simulation_panel)
-        self.side_panel_container_layout.addWidget(self.editor_panel)
+        self.side_panel_container_layout.addWidget(self.side_panel_tabs)
+
+        self._build_panel_visibility_menu()
         self.switch_panel_to_simulation()
+        # Configuration is the default panel. Keep this as explicit state
+        # rather than relying on effective visibility before the window has
+        # been shown.
+        self._configuration_panel_visible = True
+        self.config_panel_stack.setVisible(True)
+        self.navigation_reasoning_window.hide()
 
         body_layout.addWidget(self.canvas, 1)
         body_layout.addWidget(self.side_panel_container, 0)
 
         outer.addWidget(body, 1)
+        self._sync_side_panel_layout()
+        QTimer.singleShot(0, self._sync_side_panel_layout)
+
+    def _build_canvas_action_bar(self) -> None:
+        """Create the primary runtime controls in the canvas footer.
+
+        The old telemetry strip was passive and duplicated state that now
+        belongs in Navigation Reasoning. These are real Qt buttons placed in
+        the same reserved footer region, so they remain usable even when the
+        configuration panel is hidden.
+        """
+        bar = QFrame(self.canvas)
+        bar.setObjectName("canvasActionBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(9, 5, 9, 5)
+        layout.setSpacing(8)
+
+        self.start_button = QPushButton("Start")
+        self.start_button.setObjectName("canvasStartButton")
+        self.start_button.setIcon(make_icon("play", "white"))
+        self.start_button.setIconSize(QSize(18, 18))
+        self.start_button.clicked.connect(self.handle_start_pause_button)
+
+        self.reset_button = QPushButton("Restart")
+        self.reset_button.setObjectName("canvasActionButton")
+        self.reset_button.setIcon(make_icon("reset", TEXT))
+        self.reset_button.setIconSize(QSize(16, 16))
+        self.reset_button.clicked.connect(self.restart_simulation)
+
+        self.speed_button = QPushButton(f"Speed {self.simulation_speed:.2f}x")
+        self.speed_button.setObjectName("canvasActionButton")
+        self.speed_button.setIcon(make_icon("gear", TEXT))
+        self.speed_button.setIconSize(QSize(16, 16))
+        self.speed_button.clicked.connect(self.cycle_simulation_speed)
+
+        self.metrics_button = QPushButton("Metrics")
+        self.metrics_button.setObjectName("canvasActionButton")
+        self.metrics_button.setIcon(make_icon("maximize", TEXT))
+        self.metrics_button.setIconSize(QSize(16, 16))
+        self.metrics_button.clicked.connect(self.open_metrics_window)
+
+        self.console_button = QPushButton("Console")
+        self.console_button.setObjectName("canvasActionButton")
+        self.console_button.setIcon(make_icon("console", TEXT))
+        self.console_button.setIconSize(QSize(16, 16))
+        self.console_button.clicked.connect(self.open_console_window)
+
+        layout.addWidget(self.start_button, 2)
+        layout.addWidget(self.reset_button, 1)
+        layout.addWidget(self.speed_button, 1)
+        layout.addWidget(self.metrics_button, 1)
+        layout.addWidget(self.console_button, 1)
+
+        self.canvas_action_bar = bar
+        self.canvas.set_action_bar(bar)
 
     def build_config_panel(self):
         """Build the right-side simulation configuration panel."""
@@ -305,6 +419,184 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
     def build_editor_panel(self):
         from robotics_sim.app.config_panel import build_editor_panel
         return build_editor_panel(self)
+
+    def _install_config_panel_close_button(self, panel: QWidget) -> None:
+        """Attach a small close control without modifying the panel builders."""
+        button = QPushButton("×", panel)
+        button.setObjectName("panelCloseButton")
+        button.setFixedSize(26, 24)
+        button.move(max(0, SIDE_PANEL_WIDTH - 34), 8)
+        button.setToolTip("Close configuration panel")
+        button.setStyleSheet(
+            "QPushButton { border: none; background: rgba(255,255,255,185); "
+            "color: #5E6672; border-radius: 5px; font-size: 18px; font-weight: 600; }"
+            "QPushButton:hover { background: rgba(255,255,255,235); color: #22252A; }"
+        )
+        button.clicked.connect(lambda: self.set_configuration_panel_visible(False))
+        button.raise_()
+
+    def _build_panel_visibility_menu(self) -> None:
+        """Use the previously-unused top-bar gear as the panel selector."""
+        self.panel_visibility_menu = QMenu(self)
+
+        self.configuration_panel_action = QAction("Configuration", self)
+        self.configuration_panel_action.setCheckable(True)
+        self.configuration_panel_action.setChecked(True)
+        self.configuration_panel_action.toggled.connect(self.set_configuration_panel_visible)
+        self.panel_visibility_menu.addAction(self.configuration_panel_action)
+
+        self.navigation_reasoning_panel_action = QAction("Navigation Reasoning", self)
+        self.navigation_reasoning_panel_action.setCheckable(True)
+        self.navigation_reasoning_panel_action.setChecked(False)
+        self.navigation_reasoning_panel_action.toggled.connect(self.on_navigation_debug_toggled)
+        self.panel_visibility_menu.addAction(self.navigation_reasoning_panel_action)
+
+        self.panel_visibility_menu.addSeparator()
+        self.load_sim_action = QAction(make_icon("reset", TEXT), "Load .sim…", self)
+        self.load_sim_action.triggered.connect(self.load_simulation_config)
+        self.panel_visibility_menu.addAction(self.load_sim_action)
+
+        self.save_sim_action = QAction(make_icon("save", TEXT), "Save .sim…", self)
+        self.save_sim_action.triggered.connect(self.save_simulation_config)
+        self.panel_visibility_menu.addAction(self.save_sim_action)
+
+        self.top_bar.gear_button.setToolTip("Panels and simulation files")
+        self.top_bar.gear_button.clicked.connect(self._show_panel_visibility_menu)
+
+    def _show_panel_visibility_menu(self) -> None:
+        button = self.top_bar.gear_button
+        position = button.mapToGlobal(button.rect().bottomLeft())
+        self.panel_visibility_menu.exec(position)
+
+    @staticmethod
+    def _set_action_checked(action: QAction | None, checked: bool) -> None:
+        if action is None or action.isChecked() == bool(checked):
+            return
+        action.blockSignals(True)
+        action.setChecked(bool(checked))
+        action.blockSignals(False)
+
+    def set_configuration_panel_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        self._configuration_panel_visible = visible
+        stack = getattr(self, "config_panel_stack", None)
+        if stack is not None:
+            stack.setVisible(visible)
+        self._set_action_checked(getattr(self, "configuration_panel_action", None), visible)
+        self._sync_side_panel_layout()
+        if visible:
+            tabs = getattr(self, "side_panel_tabs", None)
+            if tabs is not None and stack is not None and tabs.indexOf(stack) >= 0:
+                tabs.setCurrentWidget(stack)
+        QTimer.singleShot(0, self._sync_side_panel_layout)
+
+    def _ensure_side_panel_tab(
+        self,
+        widget: QWidget | None,
+        *,
+        title: str,
+        visible: bool,
+        preferred_index: int,
+    ) -> None:
+        """Add/remove one panel tab without deleting the panel widget."""
+        tabs = getattr(self, "side_panel_tabs", None)
+        if tabs is None or widget is None:
+            return
+
+        current_index = tabs.indexOf(widget)
+        if visible:
+            if current_index < 0:
+                # Clear any explicit hidden state before QTabWidget takes
+                # ownership of page visibility.
+                widget.setVisible(True)
+                tabs.insertTab(min(preferred_index, tabs.count()), widget, title)
+        else:
+            if current_index >= 0:
+                tabs.removeTab(current_index)
+            widget.setVisible(False)
+
+    def _sync_side_panel_layout(self) -> None:
+        """Synchronize the adaptive right-side panel deck.
+
+        Panel visibility is explicit state. When both panels are enabled they
+        are presented as full-height tabs, not a 50/50 vertical split. This
+        preserves the complete configuration workflow and gives Navigation
+        Reasoning enough room for readable diagnostics.
+        """
+        container = getattr(self, "side_panel_container", None)
+        tabs = getattr(self, "side_panel_tabs", None)
+        config_stack = getattr(self, "config_panel_stack", None)
+        reasoning = getattr(self, "navigation_reasoning_window", None)
+        if container is None or tabs is None:
+            return
+
+        config_visible = bool(
+            getattr(self, "_configuration_panel_visible", True)
+            and config_stack is not None
+        )
+        reasoning_visible = bool(
+            getattr(self, "navigation_debug_enabled", False)
+            and reasoning is not None
+        )
+
+        self._ensure_side_panel_tab(
+            config_stack,
+            title="Configuration",
+            visible=config_visible,
+            preferred_index=0,
+        )
+        self._ensure_side_panel_tab(
+            reasoning,
+            title="Navigation",
+            visible=reasoning_visible,
+            preferred_index=1,
+        )
+
+        # A single visible panel does not need a tab bar; hiding it returns the
+        # vertical space to the panel content. With two panels the tab bar is
+        # the compact, predictable switcher.
+        tabs.tabBar().setVisible(tabs.count() > 1)
+        container.setVisible(tabs.count() > 0)
+
+        if tabs.count() == 1:
+            tabs.setCurrentIndex(0)
+
+    @staticmethod
+    def navigation_history_scrub_multiplier(elapsed_seconds: float, ramp_seconds: float = 1.8) -> float:
+        """Smoothly ramp hold-to-scrub speed from 1x to a hard 3x cap."""
+        elapsed = max(0.0, float(elapsed_seconds))
+        ramp = max(1e-6, float(ramp_seconds))
+        return min(3.0, 1.0 + 2.0 * min(1.0, elapsed / ramp))
+
+    def start_navigation_history_scrub(self, direction: int) -> None:
+        direction = -1 if int(direction) < 0 else 1
+        if not self.navigation_debug_enabled or not self.paused:
+            return
+        self.stop_navigation_history_scrub()
+        self._nav_history_scrub_direction = direction
+        self._nav_history_scrub_started_at = time.perf_counter()
+        self.step_navigation_debug_history(direction)
+        self._nav_history_scrub_timer.start(self._nav_history_scrub_initial_delay_ms)
+
+    def _continue_navigation_history_scrub(self) -> None:
+        direction = int(getattr(self, "_nav_history_scrub_direction", 0))
+        if direction == 0 or not self.navigation_debug_enabled or not self.paused:
+            self.stop_navigation_history_scrub()
+            return
+
+        self.step_navigation_debug_history(direction)
+        elapsed = time.perf_counter() - float(self._nav_history_scrub_started_at)
+        multiplier = self.navigation_history_scrub_multiplier(
+            elapsed, self._nav_history_scrub_ramp_seconds
+        )
+        interval_ms = max(20, int(round(self._nav_history_scrub_base_interval_ms / multiplier)))
+        self._nav_history_scrub_timer.start(interval_ms)
+
+    def stop_navigation_history_scrub(self) -> None:
+        timer = getattr(self, "_nav_history_scrub_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._nav_history_scrub_direction = 0
 
     def read_config(self) -> SimulationConfig:
         """Read GUI configuration and preserve editor camera settings."""
@@ -343,6 +635,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             self.editor_panel.setVisible(True)
             self.editor_panel.setEnabled(True)
         self.refresh_editor_status_label()
+        self._sync_side_panel_layout()
 
     def switch_panel_to_simulation(self) -> None:
         if self.editor_panel is not None:
@@ -351,6 +644,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         if self.simulation_panel is not None:
             self.simulation_panel.setVisible(True)
             self.simulation_panel.setEnabled(True)
+        self._sync_side_panel_layout()
 
     def toggle_editor_mode_from_button(self) -> None:
         self.set_editor_mode(not self.editor_mode)
@@ -595,30 +889,27 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.on_navigation_debug_toggled(not self.navigation_debug_enabled)
 
     def on_navigation_debug_toggled(self, enabled: bool) -> None:
-        """Apply the navigation debug on/off state.
+        """Enable capture and show/hide the embedded reasoning panel."""
+        enabled = bool(enabled)
+        self.navigation_debug_enabled = enabled
+        self.canvas.set_navigation_debug_enabled(enabled)
+        self._set_action_checked(
+            getattr(self, "navigation_reasoning_panel_action", None), enabled
+        )
 
-        Gates both snapshot capture (engine.py checks
-        self.navigation_debug_enabled before building a
-        NavigationDebugCapture at all -- zero cost while off) and its
-        rendering (canvas checks its own mirrored flag before drawing).
-        Never touches self.config, robot/agent state, or the simulation
-        itself -- only which values get computed for display -- so it is
-        intentionally allowed to change while paused or running. The
-        canvas eye icon is always visible (unlike a side-panel control),
-        so this can fire at any time, running or paused."""
-        self.navigation_debug_enabled = bool(enabled)
-        self.canvas.set_navigation_debug_enabled(bool(enabled))
+        panel = getattr(self, "navigation_reasoning_window", None)
+
         if not enabled:
+            self.stop_navigation_history_scrub()
             self.resume_navigation_debug_live_view()
-        self.update_navigation_debug_step_buttons()
 
-        window = getattr(self, "navigation_reasoning_window", None)
-        if window is not None:
-            if enabled:
-                window.show()
-                window.raise_()
-            else:
-                window.hide()
+        self.update_navigation_debug_step_buttons()
+        self._sync_side_panel_layout()
+        if enabled:
+            tabs = getattr(self, "side_panel_tabs", None)
+            if tabs is not None and panel is not None and tabs.indexOf(panel) >= 0:
+                tabs.setCurrentWidget(panel)
+        QTimer.singleShot(0, self._sync_side_panel_layout)
 
     def on_navigation_debug_step_back(self) -> None:
         self.step_navigation_debug_history(-1)
@@ -763,6 +1054,10 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         for widget in widgets:
             widget.setEnabled(not locked and not self.editor_mode)
 
+        load_action = getattr(self, "load_sim_action", None)
+        if load_action is not None:
+            load_action.setEnabled(not locked and not self.editor_mode)
+
         if hasattr(self, "editor_tool_combo"):
             self.editor_tool_combo.setEnabled(not locked and self.editor_mode)
         if hasattr(self.top_bar, "editor_button"):
@@ -774,6 +1069,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
     def set_editor_mode(self, enabled: bool) -> None:
         self.editor_mode = bool(enabled)
         self.canvas.set_editor_mode(self.editor_mode)
+        self.canvas.set_action_bar_visible(not self.editor_mode)
         if self.editor_mode:
             self.switch_panel_to_editor()
             if hasattr(self, "editor_tool_combo"):
@@ -1317,6 +1613,54 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             border-radius: 14px;
         }}
 
+        QWidget#sidePanelContainer {{
+            background: {CARD};
+            border: 1px solid {BORDER};
+            border-radius: 14px;
+        }}
+
+        QTabWidget#sidePanelTabs {{
+            background: transparent;
+            border: none;
+        }}
+
+        QTabWidget#sidePanelTabs::pane {{
+            background: {CARD};
+            border: none;
+            border-radius: 12px;
+            top: -1px;
+        }}
+
+        QTabWidget#sidePanelTabs QTabBar::tab {{
+            background: #F2F3F6;
+            color: {TEXT_MUTED};
+            border: 1px solid {BORDER};
+            border-bottom: none;
+            padding: 8px 12px;
+            min-width: 120px;
+            font-size: 10px;
+            font-weight: 850;
+        }}
+
+        QTabWidget#sidePanelTabs QTabBar::tab:first {{
+            border-top-left-radius: 10px;
+        }}
+
+        QTabWidget#sidePanelTabs QTabBar::tab:last {{
+            border-top-right-radius: 10px;
+        }}
+
+        QTabWidget#sidePanelTabs QTabBar::tab:selected {{
+            background: {CARD};
+            color: {MAROON};
+            border-color: {BORDER};
+        }}
+
+        QTabWidget#sidePanelTabs QTabBar::tab:hover:!selected {{
+            background: #E9ECF2;
+            color: {TEXT};
+        }}
+
         QScrollArea#configScroll {{
             background: transparent;
             border: none;
@@ -1511,6 +1855,41 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
         QCheckBox::indicator:checked {{
             background: {MAROON};
+        }}
+
+        QFrame#canvasActionBar {{
+            background: rgba(250, 251, 253, 245);
+            border: 1px solid {BORDER};
+            border-radius: 9px;
+        }}
+
+        QPushButton#canvasStartButton {{
+            background: {MAROON};
+            color: white;
+            border: none;
+            border-radius: 7px;
+            min-height: 30px;
+            font-size: 11px;
+            font-weight: 900;
+        }}
+
+        QPushButton#canvasStartButton:hover {{
+            background: #6A0000;
+        }}
+
+        QPushButton#canvasActionButton {{
+            background: white;
+            color: {TEXT};
+            border: 1px solid {BORDER};
+            border-radius: 7px;
+            min-height: 30px;
+            font-size: 10px;
+            font-weight: 800;
+        }}
+
+        QPushButton#canvasActionButton:hover {{
+            background: #F5F6F8;
+            border-color: #BBC4D0;
         }}
 
         QPushButton#startButton {{

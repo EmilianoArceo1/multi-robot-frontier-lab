@@ -30,6 +30,7 @@ from robotics_sim.planning.grid_planners import AStarPlanner, DijkstraPlanner
 from robotics_sim.planning.path_simplifier import (
     DEFAULT_PATH_SIMPLIFIER,
     grid_path_to_world_path,
+    line_of_sight_grid_safe,
     simplify_grid_path,
 )
 
@@ -295,6 +296,40 @@ def compute_planned_waypoints(
         adjusted_goal = True
 
     assert selected_planner is not None
+
+    # A*/Dijkstra search is unnecessary when the selected target is already
+    # visible through the exact derived planning grid. This check uses the
+    # same UNKNOWN policy, obstacle inflation, dynamic obstacles and hazard
+    # projection as the planner, so it cannot create a shortcut through a
+    # cell that A*/Dijkstra considers blocked. It also prevents grid-search
+    # tie-breaking from returning a long loop for a frontier immediately
+    # behind the robot: the executable action is simply rotate, then follow
+    # the clear segment to the target.
+    if line_of_sight_grid_safe(grid, start_cell, goal_cell):
+        direct_goal = _as_point(goal_xy)
+        if debug_capture is not None:
+            start_world = grid.grid_to_world(start_cell)
+            debug_capture.planner_name = planner_name
+            debug_capture.simplifier_name = str(path_simplifier)
+            debug_capture.raw_world_path = (start_world, direct_goal)
+            debug_capture.simplified_world_path = (start_world, direct_goal)
+            debug_capture.start_cell = start_cell
+            debug_capture.start_cell_world = start_world
+            debug_capture.first_waypoint_cell = goal_cell
+            debug_capture.first_waypoint_world = direct_goal
+            debug_capture.unknown_is_traversable = bool(unknown_is_traversable)
+            debug_capture.start_cell_cleared = bool(start_was_occupied)
+
+        reason_parts = [
+            f"direct line-of-sight route with {planner_name}",
+            f"simplifier={path_simplifier}",
+            f"unknown_is_traversable={unknown_is_traversable}",
+        ]
+        if adjusted_goal:
+            reason_parts.append("goal adjusted to nearest traversable cell")
+        if start_was_occupied:
+            reason_parts.append("start cell cleared because robot is already there")
+        return True, "; ".join(reason_parts), [direct_goal]
 
     result = selected_planner.plan(
         grid=grid,

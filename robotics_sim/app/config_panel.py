@@ -642,80 +642,9 @@ def build_config_panel(window):
 
     main_layout.addWidget(scroll, 1)
 
-    # Bottom actions
-    actions = QFrame()
-    actions.setObjectName("actionPanelBottom")
-
-    actions_layout = QVBoxLayout(actions)
-    actions_layout.setContentsMargins(12, 12, 12, 12)
-    actions_layout.setSpacing(8)
-
-    window.start_button = QPushButton("Start Simulation")
-    window.start_button.setObjectName("startButton")
-    window.start_button.setIcon(make_icon("play", "white"))
-    window.start_button.setIconSize(QSize(22, 22))
-    window.start_button.clicked.connect(window.handle_start_pause_button)
-
-    bottom_buttons = QHBoxLayout()
-    bottom_buttons.setSpacing(8)
-
-    file_buttons = QHBoxLayout()
-    file_buttons.setSpacing(8)
-
-    window.reset_button = QPushButton("Restart")
-    window.reset_button.setObjectName("secondaryButton")
-    window.reset_button.setIcon(make_icon("reset", TEXT))
-    window.reset_button.setIconSize(QSize(18, 18))
-    window.reset_button.clicked.connect(window.restart_simulation)
-
-    window.speed_button = QPushButton(f"Speed {window.simulation_speed:.2f}x")
-    window.speed_button.setObjectName("secondaryButton")
-    window.speed_button.setIcon(make_icon("gear", TEXT))
-    window.speed_button.setIconSize(QSize(18, 18))
-    window.speed_button.clicked.connect(window.cycle_simulation_speed)
-
-    window.metrics_button = QPushButton("Metrics")
-    window.metrics_button.setObjectName("secondaryButton")
-    window.metrics_button.setIcon(make_icon("maximize", TEXT))
-    window.metrics_button.setIconSize(QSize(18, 18))
-    window.metrics_button.clicked.connect(window.open_metrics_window)
-
-    window.console_button = QPushButton("Console")
-    window.console_button.setObjectName("secondaryButton")
-    window.console_button.setIcon(make_icon("console", TEXT))
-    window.console_button.setIconSize(QSize(18, 18))
-    window.console_button.clicked.connect(window.open_console_window)
-
-    window.load_button = QPushButton("Load .sim")
-    window.load_button.setObjectName("secondaryButton")
-    window.load_button.setIcon(make_icon("reset", TEXT))
-    window.load_button.setIconSize(QSize(18, 18))
-    window.load_button.clicked.connect(window.load_simulation_config)
-
-    window.save_button = QPushButton("Save .sim")
-    window.save_button.setObjectName("secondaryButton")
-    window.save_button.setIcon(make_icon("save", TEXT))
-    window.save_button.setIconSize(QSize(18, 18))
-    window.save_button.clicked.connect(window.save_simulation_config)
-
-    monitor_buttons = QHBoxLayout()
-    monitor_buttons.setSpacing(8)
-
-    bottom_buttons.addWidget(window.reset_button)
-    bottom_buttons.addWidget(window.speed_button)
-
-    monitor_buttons.addWidget(window.metrics_button)
-    monitor_buttons.addWidget(window.console_button)
-
-    file_buttons.addWidget(window.load_button)
-    file_buttons.addWidget(window.save_button)
-
-    actions_layout.addWidget(window.start_button)
-    actions_layout.addLayout(bottom_buttons)
-    actions_layout.addLayout(monitor_buttons)
-    actions_layout.addLayout(file_buttons)
-
-    main_layout.addWidget(actions)
+    # Runtime actions live in the canvas action bar. The configuration panel
+    # now contains only configuration fields; Load/Save are exposed from the
+    # top-bar gear menu.
 
     # Signals
     numeric_widgets = [
@@ -832,7 +761,6 @@ def build_config_panel(window):
         window.goal_tol_input,
         window.goal_x_input,
         window.goal_y_input,
-        window.load_button,
         window.top_bar.single_mode_button,
         window.top_bar.multi_mode_button,
     ]

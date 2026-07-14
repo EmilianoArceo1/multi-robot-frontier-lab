@@ -203,3 +203,7 @@ class NavigationDebugSnapshot:
     # snapshot (never a separate inference) -- see
     # engine._navigation_debug_explanation().
     explanation: str = ""
+    # Count of physical obstacle samples currently stored by the runtime.
+    # Kept in the immutable snapshot so historical views do not mix the
+    # current map count with an older robot/control state.
+    mapped_obstacle_points_count: int = 0

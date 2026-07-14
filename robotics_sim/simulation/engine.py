@@ -47,6 +47,7 @@ from robotics_sim.simulation.robot_trace import (
     slug_route_failure_reason,
 )
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
+from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
@@ -2376,12 +2377,67 @@ class SimulationControllerMixin:
             self.log_console_message(message)
             trace.print_line(message)
 
+    def ensure_perf_monitor(self) -> PerfMonitor:
+        """Return the shared PerfMonitor, creating it if needed.
+
+        Reads SIM_PERF_LOG once, at first use -- disabled (silent) unless
+        explicitly set. Independent of ROBOT_TRACE/belief-trace artifacts
+        and of render_perf.py's own paint_fps/paint_ms measurement (this
+        is the engine-side sim_step/sensor/route_affected/trace-queue
+        timing; see on_simulation_tick()).
+        """
+        if not hasattr(self, "_perf_monitor") or self._perf_monitor is None:
+            self._perf_monitor = PerfMonitor()
+        return self._perf_monitor
+
+    def on_simulation_tick(self) -> None:
+        """QTimer callback: times the whole simulation_step() call, then
+        (at most once every couple of seconds, and only when SIM_PERF_LOG
+        is enabled) logs a compact [PERF] summary combining sim_step
+        timing, the render-side paint_ms render_perf.py already measures,
+        and the belief-trace background queue's size/drop pressure.
+
+        Kept as a thin wrapper around simulation_step() specifically so
+        none of simulation_step()'s own control flow/indentation needs to
+        change for this instrumentation -- zero effect on navigation
+        behavior.
+        """
+        monitor = self.ensure_perf_monitor()
+        start = time.perf_counter()
+        self.simulation_step()
+        monitor.record("sim_step", time.perf_counter() - start)
+        monitor.note_tick()
+
+        canvas = getattr(self, "canvas", None)
+        perf_status = getattr(canvas, "latest_perf_status", None) if canvas is not None else None
+        render_ms = float(perf_status["paint_ms"]) if perf_status else 0.0
+
+        trace = getattr(self, "_robot_trace", None)
+        writer = getattr(trace, "writer", None) if trace is not None else None
+        trace_queue_size = writer.queue_size if writer is not None else 0
+        dropped_trace_events = writer.dropped_total if writer is not None else 0
+
+        monitor.maybe_log_summary(
+            render_ms=render_ms,
+            trace_queue_size=trace_queue_size,
+            dropped_trace_events=dropped_trace_events,
+            log=self.log_console_message,
+        )
+
     def _build_belief_trace_snapshot(self) -> dict | None:
         """Best-effort belief_final.json (+ belief_grid_final.npz) payload
         for RobotTrace.maybe_snapshot_belief(). Only ever called lazily
         when a snapshot write is actually due (see the call site in
         simulation_step()) -- diagnostics/output only, never touches
         mapping/planning state, only reads it.
+
+        Snapshot safety: the belief-trace writer now runs on a background
+        thread (AsyncTraceWriter), so this snapshot dict can sit in a
+        queue while the simulation thread keeps mutating live state.
+        Every value here is already an independent plain float/int/str/
+        list -- except the grid array below, which is explicitly .copy()'d
+        so the background thread never reads/serializes the SAME array
+        object the belief map continues to write into concurrently.
         """
         points = list(getattr(self, "mapped_obstacle_points", []))
         snapshot: dict = {
@@ -2408,7 +2464,10 @@ class SimulationControllerMixin:
             snapshot["known_free_count"] = int(np.count_nonzero(grid == FREE))
             snapshot["known_occupied_count"] = int(np.count_nonzero(grid == OCCUPIED))
             snapshot["unknown_count"] = int(np.count_nonzero(grid == UNKNOWN))
-            snapshot["_grid"] = grid
+            # .copy(): never hand the background writer thread a live
+            # reference to the belief map's own mutable array (see
+            # docstring above).
+            snapshot["_grid"] = grid.copy()
         return snapshot
 
     def log_console_message(self, message: str, *, visible_status: bool = False) -> None:
@@ -4723,8 +4782,12 @@ class SimulationControllerMixin:
         run_sensor_update = self.should_run_sensor_update(now)
         if run_sensor_update:
             self.sensor_update_count += 1
+            _sensor_update_perf_start = time.perf_counter()
             self.record_explored_area(force=False)
             newly_discovered = self.update_sensed_obstacles(force_status=False)
+            self.ensure_perf_monitor().record(
+                "sensor_update", time.perf_counter() - _sensor_update_perf_start
+            )
             if newly_discovered:
                 self.mapping_update_count += 1
 
@@ -4763,7 +4826,11 @@ class SimulationControllerMixin:
                 )
 
             if newly_discovered and self.config.planner_type != "Direct":
+                _route_affected_check_perf_start = time.perf_counter()
                 route_affected = self.new_information_affects_current_route(newly_discovered)
+                self.ensure_perf_monitor().record(
+                    "route_affected_check", time.perf_counter() - _route_affected_check_perf_start
+                )
                 self.telemetry.report_map_update(
                     sim_time=float(self.simulation_time),
                     new_points=newly_discovered,

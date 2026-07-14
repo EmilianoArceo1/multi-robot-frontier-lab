@@ -584,6 +584,7 @@ def test_robot_trace_env_only_controls_stdout_categories(tmp_path, capsys):
         "ROBOT_TRACE unset must never print routine [TRACE ...] terminal lines"
     )
 
+    trace.writer.flush()  # AsyncTraceWriter: wait for the background queue to drain
     route_csv = (trace.file_output_dir / "route_events.csv").read_text(encoding="utf-8")
     assert "R1" in route_csv, (
         "artifact files must still be populated even when ROBOT_TRACE is unset"
@@ -604,6 +605,7 @@ def test_robot_trace_env_enabled_prints_terminal_trace_and_keeps_files(tmp_path,
     captured = capsys.readouterr()
     assert "[TRACE ROUTE" in captured.out
 
+    trace.writer.flush()
     route_csv = (trace.file_output_dir / "route_events.csv").read_text(encoding="utf-8")
     assert "R1" in route_csv and "ok" in route_csv
 

@@ -55,6 +55,44 @@ ACTIVE_WAYPOINT_HALO_PADDING = 6
 START_MARKER_RADIUS = 6
 FRONTIER_OR_ENDPOINT_MARKER_RADIUS = 7
 
+DEFAULT_RENDER_THROTTLE_FPS = 30.0
+
+
+class RenderThrottler:
+    """Decides whether a high-frequency, simulation-driven repaint request
+    should actually trigger self.update() right now, or be coalesced
+    (skipped) because a repaint already happened recently enough to hit
+    target_fps.
+
+    Pure/Qt-free on purpose (no QWidget dependency) so it is unit-testable
+    without a running Qt application. Coalescing loses nothing visually:
+    Qt's paintEvent always paints the CURRENT widget/simulation state, not
+    a queue of past ones, so skipping an update() call between two accepted
+    calls only skips a redundant repaint of state that either looked
+    identical or is about to be superseded by the next accepted call.
+
+    Only wired into the two per-tick setters (set_runtime_state()/
+    set_multi_runtime_state()) that the engine calls every simulation
+    tick while running and unpaused -- every other self.update() call in
+    this class (mouse/editor interactions, status/config changes, which
+    already only ever fire on user action or while not actively
+    simulating) is untouched and stays immediate, matching "render
+    immediately after user interactions".
+    """
+
+    def __init__(self, target_fps: float = DEFAULT_RENDER_THROTTLE_FPS):
+        self.target_fps = float(target_fps)
+        self._min_interval = (1.0 / self.target_fps) if self.target_fps > 0 else 0.0
+        self._last_render_time: float | None = None
+
+    def should_render(self, now: float | None = None, *, force: bool = False) -> bool:
+        now = time.perf_counter() if now is None else float(now)
+        if force or self._last_render_time is None or (now - self._last_render_time) >= self._min_interval:
+            self._last_render_time = now
+            return True
+        return False
+
+
 class SimulationCanvas(QWidget):
     goalClicked = Signal(float, float)
     robotDragged = Signal(int, float, float)
@@ -192,6 +230,12 @@ class SimulationCanvas(QWidget):
         # console, via _perf_gui_warning_gate.
         self._render_perf_monitor = RenderPerfMonitor()
         self._perf_gui_warning_gate = PerfGuiWarningGate()
+        # Throttles only the high-frequency, simulation-driven repaint
+        # requests (set_runtime_state()/set_multi_runtime_state()) to at
+        # most DEFAULT_RENDER_THROTTLE_FPS repaints/second -- see
+        # RenderThrottler's docstring. Does not affect any other
+        # self.update() call in this class.
+        self._render_throttler = RenderThrottler()
         self.latest_perf_status: dict | None = None
         # Gates GUI-console perf warnings only (see
         # _maybe_emit_perf_gui_warning/draw_grid_overlay's degraded notice)
@@ -447,7 +491,8 @@ class SimulationCanvas(QWidget):
             self.simulation_time = float(simulation_time)
         if simulation_speed is not None:
             self.simulation_speed = float(simulation_speed)
-        self.update()
+        if self._render_throttler.should_render():
+            self.update()
 
     def set_multi_runtime_state(
         self,
@@ -474,7 +519,8 @@ class SimulationCanvas(QWidget):
             self.simulation_time = float(simulation_time)
         if simulation_speed is not None:
             self.simulation_speed = float(simulation_speed)
-        self.update()
+        if self._render_throttler.should_render():
+            self.update()
 
     def set_simulation_metrics(self, simulation_time: float, simulation_speed: float):
         self.simulation_time = float(simulation_time)

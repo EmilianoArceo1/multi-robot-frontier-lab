@@ -164,7 +164,10 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         QTimer.singleShot(0, self.center_on_screen)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.simulation_step)
+        # on_simulation_tick() times simulation_step() (see
+        # PerfMonitor/SIM_PERF_LOG) and then calls it -- simulation_step()
+        # itself is completely unchanged by this indirection.
+        self.timer.timeout.connect(self.on_simulation_tick)
         self.timer.start(TARGET_FRAME_MS)
 
     # ========================================================

@@ -191,7 +191,12 @@ def test_exploration_hold_reason_when_no_targets_remain():
     )
     assert decision.reason != "no target available in current exploration mode"
     assert "no path found" not in decision.reason
-    assert len(fake_services.calls) == 1
+    # 2 calls, not 1: the configured planner attempt, plus one map-wide
+    # ("Nearest frontier") fallback attempt tried before giving up -- see
+    # ExplorationBehavior._pick_map_wide_fallback_target(). This fake
+    # returns no candidates regardless of planner_name, so both fail here,
+    # exactly like the single-attempt case used to.
+    assert len(fake_services.calls) == 2
 
     # The failed re-selection attempt must reset the retry-cooldown clock,
     # so the very next tick does not immediately try again (no busy-loop).
@@ -202,7 +207,7 @@ def test_exploration_hold_reason_when_no_targets_remain():
     decision = behavior.update(agent, observation, fake_services)
 
     assert decision.kind == "HOLD"
-    assert len(fake_services.calls) == 1, (
+    assert len(fake_services.calls) == 2, (
         "an unsuccessful re-selection attempt must reset the cooldown clock, "
         "otherwise the agent re-runs frontier detection every single tick"
     )

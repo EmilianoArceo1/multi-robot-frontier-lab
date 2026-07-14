@@ -274,11 +274,18 @@ class ExplorationBehavior:
             agent.exploration_target_xy = None
             next_target = self._pick_next_target(agent, observation, planner_services)
             if next_target is None:
+                # The configured (possibly FoV/directional-biased) planner
+                # found nothing this cycle -- before holding, try the
+                # map-wide fallback planner in case unexplored, reachable
+                # map remains outside its local candidate window.
+                next_target = self._pick_map_wide_fallback_target(agent, observation, planner_services)
+            if next_target is None:
                 agent.stop_count_exploration += 1
                 return hold(reason="frontier reached; no valid next frontier available")
-            # A normal frontier target (from _pick_next_target(), not
-            # RecoveryPolicy) was found here too -- end any recovery
-            # episode from before this frontier was reached, same as step 6.
+            # A normal frontier target (from _pick_next_target() or the
+            # map-wide fallback, not RecoveryPolicy) was found here too --
+            # end any recovery episode from before this frontier was
+            # reached, same as step 6.
             agent.clear_recovery_memory()
             return request_plan(
                 next_target,
@@ -348,16 +355,29 @@ class ExplorationBehavior:
 
         next_target = self._pick_next_target(agent, observation, planner_services)
         if next_target is None:
-            # Normal frontier selection found nothing this cycle -- before
-            # treating that as a failure (and counting towards exhaustion),
-            # try a small, deterministic fallback: a nearby position the
-            # robot itself knows was reachable, because a route was
-            # successfully planned from it before. This is what stops
-            # exploration from giving up prematurely on a single failed
-            # frontier-selection attempt. A recovery target that itself
-            # fails to plan still flows through apply_route_result()'s
-            # normal failure handling (invalidate_failed_exploration_route()
-            # -> register_exploration_failure()), so this cannot dodge
+            # The configured planner found nothing this cycle -- before
+            # falling back to backtracking (RecoveryPolicy, below), try the
+            # map-wide fallback planner. Unlike RecoveryPolicy's candidates
+            # (places the robot has already BEEN), a map-wide frontier
+            # search can find genuinely NEW, still-unexplored area that a
+            # local/directional planner's candidate window simply did not
+            # include this cycle -- exactly the case that was causing
+            # exploration to declare itself exhausted with unexplored map
+            # still reachable.
+            next_target = self._pick_map_wide_fallback_target(agent, observation, planner_services)
+
+        if next_target is None:
+            # Both the configured planner and the map-wide fallback found
+            # nothing this cycle -- before treating that as a failure (and
+            # counting towards exhaustion), try a small, deterministic
+            # fallback: a nearby position the robot itself knows was
+            # reachable, because a route was successfully planned from it
+            # before. This is what stops exploration from giving up
+            # prematurely on a single failed frontier-selection attempt. A
+            # recovery target that itself fails to plan still flows through
+            # apply_route_result()'s normal failure handling
+            # (invalidate_failed_exploration_route() ->
+            # register_exploration_failure()), so this cannot dodge
             # exhaustion forever -- only add one bounded extra attempt.
             #
             # agent.recovery_targets() is scoped to the current RECOVERY
@@ -405,10 +425,11 @@ class ExplorationBehavior:
                 return hold(reason="exploration exhausted: no reachable frontier candidates after recovery")
             return hold(reason="no reachable frontier candidates remain")
 
-        # A normal frontier target was found: exploration is making real
-        # progress again, so the recovery episode (if any) is over. This is
-        # the ONLY place recovery memory is cleared -- deliberately not on
-        # any map_signature change, see recent_recovery_targets above.
+        # A normal frontier target was found (from the configured planner or
+        # the map-wide fallback): exploration is making real progress
+        # again, so the recovery episode (if any) is over. This is the ONLY
+        # place recovery memory is cleared -- deliberately not on any
+        # map_signature change, see recent_recovery_targets above.
         agent.clear_recovery_memory()
         return request_plan(
             next_target,
@@ -417,6 +438,51 @@ class ExplorationBehavior:
         )
 
     # ------------------------------------------------------------------ private
+
+    # Fallback exploration planner tried when the configured planner (e.g.
+    # the default "FoV-aware directional frontier", which restricts
+    # candidates to the robot's current field of view / heading) finds
+    # nothing this cycle. "Nearest frontier" scores frontier candidates
+    # from the belief map directly (see FrontierExplorationPlanner in
+    # exploration_planners.py) with no FoV/heading restriction, so it can
+    # still find a target when local/directional candidates are exhausted
+    # but unexplored, reachable map remains elsewhere. Reuses the exact
+    # same PlannerServices.select_exploration_target() call every other
+    # target-selection path already goes through -- no new planner code,
+    # no A* changes, just an existing, already-registered planner_name.
+    _MAP_WIDE_FALLBACK_PLANNER: str = "Nearest frontier"
+
+    def _excluded_targets(
+        self,
+        agent: "RobotAgent",
+        observation: "RobotObservation",
+    ) -> list[tuple[float, float]]:
+        """Targets no candidate search should propose right now.
+
+        Shared by _pick_next_target() and _pick_map_wide_fallback_target()
+        so both respect the same recently-failed/already-reached exclusions.
+        """
+        # Exclude other robots' claimed targets (observation.excluded_targets)
+        # plus this agent's own recently-failed targets, so a target that
+        # just failed to plan is not immediately re-selected while an
+        # alternative frontier exists.
+        excluded = list(observation.excluded_targets) + agent.recently_failed_exploration_targets(
+            current_time=observation.current_time,
+            cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
+        )
+
+        # Never re-propose something already effectively reached: the
+        # robot's own current position (a candidate "here" is not a
+        # frontier worth driving to), and the route that was just
+        # completed, if any. Without this, frontier detection can
+        # immediately re-select the exact same nearby point right after
+        # "frontier reached", producing a near-zero-length route that gets
+        # "reached" again within a tick or two -- a fast REQUEST_PLAN loop.
+        excluded.append(observation.robot_xy)
+        if agent.active_path_goal_xy is not None:
+            excluded.append(agent.active_path_goal_xy)
+
+        return excluded
 
     def _pick_next_target(
         self,
@@ -435,25 +501,7 @@ class ExplorationBehavior:
             # Should not be called in goal-seeking, but guard defensively.
             return agent.final_goal_xy
 
-        # Exclude other robots' claimed targets (observation.excluded_targets)
-        # plus this agent's own recently-failed targets, so a target that
-        # just failed to plan is not immediately re-selected while an
-        # alternative frontier exists.
-        excluded = list(observation.excluded_targets) + agent.recently_failed_exploration_targets(
-            current_time=observation.current_time,
-            cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
-        )
-
-        # Never re-propose something already effectively reached: the
-        # robot's own current position (a candidate "here" is not a
-        # frontier worth driving to), and the route that was just
-        # completed, if any. Without this, FoV-aware frontier detection can
-        # immediately re-select the exact same nearby point right after
-        # "frontier reached", producing a near-zero-length route that gets
-        # "reached" again within a tick or two -- a fast REQUEST_PLAN loop.
-        excluded.append(observation.robot_xy)
-        if agent.active_path_goal_xy is not None:
-            excluded.append(agent.active_path_goal_xy)
+        excluded = self._excluded_targets(agent, observation)
 
         result = planner_services.select_exploration_target(
             planner_name=agent.planner_mode,
@@ -469,6 +517,12 @@ class ExplorationBehavior:
             excluded_targets=excluded,
         )
 
+        # Diagnostics only (read by engine.py to log [EXHAUSTION_DIAG] at
+        # the moment exploration_exhausted() actually fires) -- never used
+        # for any decision here.
+        agent.last_frontier_selection_reason = str(result.reason)
+        agent.last_frontier_candidate_count = len(result.candidates)
+
         if not result.success or result.target is None:
             return None
 
@@ -479,6 +533,61 @@ class ExplorationBehavior:
         # actually honored the exclusion above -- this is the guarantee
         # that stops the near-zero-length route loop, independent of
         # exploration-planner internals.
+        if math.hypot(
+            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
+        ) <= observation.goal_tolerance:
+            return None
+
+        return candidate
+
+    def _pick_map_wide_fallback_target(
+        self,
+        agent: "RobotAgent",
+        observation: "RobotObservation",
+        planner_services: "PlannerServices",
+    ) -> tuple[float, float] | None:
+        """
+        Last-resort target search tried when the configured exploration
+        planner finds nothing this cycle: retry with _MAP_WIDE_FALLBACK_PLANNER
+        instead, which is not restricted to the robot's current field of
+        view / heading. Prevents exploration from declaring itself
+        exhausted just because a directional/local planner's candidate
+        window is momentarily empty, while genuinely unexplored, reachable
+        map remains elsewhere.
+
+        Returns None when the configured planner already IS the fallback
+        planner (nothing new to try), when goal-seeking, or when the
+        fallback itself finds nothing either.
+        """
+        if is_goal_seeking_planner(agent.planner_mode):
+            return None
+        if agent.planner_mode == self._MAP_WIDE_FALLBACK_PLANNER:
+            return None
+
+        agent.last_map_wide_fallback_attempted = True
+        excluded = self._excluded_targets(agent, observation)
+
+        result = planner_services.select_exploration_target(
+            planner_name=self._MAP_WIDE_FALLBACK_PLANNER,
+            belief_map=observation.belief_map,
+            robot_xy=observation.robot_xy,
+            robot_heading=observation.robot_heading,
+            current_target=agent.exploration_target_xy,
+            final_goal_xy=observation.final_goal_xy,
+            robot_radius=observation.robot_radius,
+            sensor_range=observation.sensor_range,
+            vision_model=observation.vision_model,
+            ipp_distance_penalty=observation.ipp_distance_penalty,
+            excluded_targets=excluded,
+        )
+
+        agent.last_frontier_selection_reason = str(result.reason)
+        agent.last_frontier_candidate_count = len(result.candidates)
+
+        if not result.success or result.target is None:
+            return None
+
+        candidate = (float(result.target[0]), float(result.target[1]))
         if math.hypot(
             candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
         ) <= observation.goal_tolerance:

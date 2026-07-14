@@ -82,7 +82,11 @@ def test_format_perf_summary_line_is_pure_and_stable():
         "[PERF] avg_sim_step_ms=36.8 max_sim_step_ms=52.0 fast_path_avg_ms=0.00 "
         "full_pipeline_avg_ms=0.00 explored_update_ms=1.1 "
         "obstacle_extract_ms=2.2 belief_update_ms=20.4 runtime_state_build_ms=0.5 "
-        "controller_ms=0.3 nav_ms=0.4 apply_ms=0.3 motion_ms=0.1 route_check_ms=0.1 "
+        "controller_ms=0.3 planner_services_refresh_ms=0.0 "
+        "reachability_context_build_ms=0.0 reachability_obstacle_prepare_ms=0.0 "
+        "reachability_grid_build_ms=0.0 reachability_context_builds=0 "
+        "visible_candidate_obstacles_ms=0.0 "
+        "nav_ms=0.4 apply_ms=0.3 motion_ms=0.1 route_check_ms=0.1 "
         "planner_dispatch_ms=1.7 route_result_ms=0.3 pending_path_ms=0.0 snapshot_ms=0.2 "
         "telemetry_ms=0.1 canvas_ms=0.0 render_ms=21.0 console_ms=0.0 misc_ms=0.0 "
         "top_level_sum_ms=0.0 "
@@ -455,3 +459,113 @@ def test_exhausted_idle_counters_still_reported(capsys):
     assert "exhausted_idle_full_updates=1" in captured.out
     assert "exhausted_idle_skipped_canvas_updates=77" in captured.out
     assert "exhausted_idle_skipped_sensor_updates=77" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# J. planner_services_refresh_ms accounting (diagnosis-only round for
+#    unaccounted_ms growth traced to ensure_planner_services()).
+#
+# Real Office.sim evidence: unaccounted_ms grew progressively with
+# mapped_obs while nav_decision itself had separate 15-27ms spikes.
+# ensure_planner_services() sits between the "controller" and
+# "nav_decision" timers with no timer of its own, and its own docstring
+# says it refreshes is_candidate_reachable on every call -- these tests
+# confirm the new top-level timer correctly reduces unaccounted_ms, and
+# that its nested reachability_* sub-timings are never subtracted a
+# second time (the same double-counting bug pattern already fixed once
+# for the exhausted-idle fast path).
+# ---------------------------------------------------------------------------
+
+
+def test_planner_services_refresh_ms_is_top_level_and_reduces_unaccounted(capsys):
+    monitor = PerfMonitor(env={"SIM_PERF_LOG": "1"})
+    monitor.record("sim_step", 0.020)
+    monitor.record("planner_services_refresh", 0.008)
+    # Nested INSIDE planner_services_refresh -- must NOT be subtracted again.
+    monitor.record("reachability_context_build", 0.007)
+    monitor.record("reachability_obstacle_prepare", 0.003)
+    monitor.record("reachability_grid_build", 0.004)
+
+    monitor.maybe_log_summary(now=0.0)
+
+    captured = capsys.readouterr()
+    assert "planner_services_refresh_ms=8.0" in captured.out
+    # measured = 8ms (planner_services_refresh only); sim_step=20ms ->
+    # unaccounted=12.0, NOT reduced again by the nested reachability_*
+    # figures (which would drive it negative: 20 - 8 - 7 - 3 - 4 < 0).
+    assert "unaccounted_ms=12.0" in captured.out
+
+
+def test_reachability_subfields_reported_without_double_counting(capsys):
+    """reachability_context_build/obstacle_prepare/grid_build are NESTED
+    entirely inside planner_services_refresh (the same call) and must not
+    be subtracted from unaccounted_ms a second time.
+    visible_candidate_obstacles, by contrast, is a SEPARATE top-level
+    section (a genuine, non-overlapping gap inside update_sensed_obstacles(),
+    which has no wrapping timer of its own) and DOES reduce unaccounted_ms
+    on top of planner_services_refresh -- see perf_monitor.py's module
+    docstring for why each is classified the way it is."""
+    monitor = PerfMonitor(env={"SIM_PERF_LOG": "1"})
+    monitor.record("sim_step", 0.050)
+    monitor.record("planner_services_refresh", 0.030)
+    monitor.record("reachability_context_build", 0.029)
+    monitor.record("reachability_obstacle_prepare", 0.012)
+    monitor.record("reachability_grid_build", 0.015)
+    monitor.record("visible_candidate_obstacles", 0.001)
+
+    monitor.maybe_log_summary(now=0.0)
+
+    captured = capsys.readouterr()
+    assert "reachability_context_build_ms=29.0" in captured.out
+    assert "reachability_obstacle_prepare_ms=12.0" in captured.out
+    assert "reachability_grid_build_ms=15.0" in captured.out
+    assert "visible_candidate_obstacles_ms=1.0" in captured.out
+    # measured = 30ms (planner_services_refresh) + 1ms
+    # (visible_candidate_obstacles, a SEPARATE top-level section) = 31ms;
+    # sim_step=50ms -> unaccounted=19.0. NOT 20.0 (visible_candidate_obstacles
+    # must still count) and NOT negative (the nested reachability_* figures
+    # must not be subtracted a second time on top of planner_services_refresh).
+    assert "unaccounted_ms=19.0" in captured.out
+
+
+def test_reachability_fields_have_safe_defaults(capsys):
+    monitor = PerfMonitor(env={"SIM_PERF_LOG": "1"})
+    monitor.record("sim_step", 0.010)
+
+    monitor.maybe_log_summary(now=0.0)
+
+    captured = capsys.readouterr()
+    assert "planner_services_refresh_ms=0.0" in captured.out
+    assert "reachability_context_build_ms=0.0" in captured.out
+    assert "reachability_obstacle_prepare_ms=0.0" in captured.out
+    assert "reachability_grid_build_ms=0.0" in captured.out
+    assert "reachability_context_builds=0" in captured.out
+    assert "visible_candidate_obstacles_ms=0.0" in captured.out
+
+
+def test_reachability_fields_silent_when_logging_disabled(capsys):
+    monitor = PerfMonitor(env={})
+    monitor.record("sim_step", 0.010)
+    monitor.record("planner_services_refresh", 0.005)
+
+    emitted = monitor.maybe_log_summary(reachability_context_builds=42, now=0.0)
+
+    assert emitted is False
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
+def test_reachability_context_builds_is_per_window_delta(capsys):
+    monitor = PerfMonitor(env={"SIM_PERF_LOG": "1"})
+    monitor.record("sim_step", 0.010)
+
+    monitor.maybe_log_summary(reachability_context_builds=10, now=0.0)
+    captured = capsys.readouterr()
+    # First window establishes the baseline -- delta is 0 even though the
+    # cumulative total is already 10.
+    assert "reachability_context_builds=0" in captured.out
+
+    monitor.record("sim_step", 0.010)
+    monitor.maybe_log_summary(reachability_context_builds=15, now=3.0)
+    captured = capsys.readouterr()
+    assert "reachability_context_builds=5" in captured.out

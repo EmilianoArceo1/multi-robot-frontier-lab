@@ -2536,6 +2536,7 @@ class SimulationControllerMixin:
             exhausted_idle_full_updates=getattr(self, "exhausted_idle_full_updates", 0),
             exhausted_idle_skipped_canvas_updates=getattr(self, "exhausted_idle_skipped_canvas_updates", 0),
             exhausted_idle_skipped_sensor_updates=getattr(self, "exhausted_idle_skipped_sensor_updates", 0),
+            reachability_context_builds=getattr(self, "reachability_context_builds", 0),
             log=self.log_console_message,
         )
 
@@ -4495,7 +4496,20 @@ class SimulationControllerMixin:
 
         spacing = max(float(self.config.mapping_point_spacing), 0.015)
         quantization = spacing
+        # Diagnosis-only: this call runs before obstacle_extract's own timer
+        # starts, and update_sensed_obstacles() has no wrapping timer of its
+        # own, so this is a genuine TOP-LEVEL gap (not nested inside any
+        # already-measured section) -- previously folded into
+        # unaccounted_ms. Reported under its own top-level section (see
+        # perf_monitor.py's _UNACCOUNTED_SECTIONS) -- gated by
+        # should_run_sensor_update() like the rest of this method, so it is
+        # intermittent (not every tick) unlike planner_services_refresh_ms,
+        # but per_tick_ms() already accounts for that correctly.
+        _visible_candidate_obstacles_start = time.perf_counter()
         candidate_obstacles = self.visible_candidate_obstacles()
+        _record_perf(
+            self, "visible_candidate_obstacles", time.perf_counter() - _visible_candidate_obstacles_start
+        )
 
         _obstacle_extract_perf_start = time.perf_counter()
         for obstacle in candidate_obstacles:
@@ -5494,14 +5508,28 @@ class SimulationControllerMixin:
         Refreshes is_candidate_reachable on every call so exploration target
         selection always checks against the current robot pose and map --
         see make_exploration_reachability_check().
+
+        planner_services_refresh_ms times this ENTIRE method as a single
+        top-level section for the optional [PERF] summary -- diagnosis-only
+        instrumentation, added because this call sits between the
+        "controller" and "nav_decision" timers in simulation_step() without
+        any timer of its own, so its cost was previously silently folded
+        into unaccounted_ms. See make_exploration_reachability_check()'s own
+        docstring for the nested sub-timings (never subtracted from
+        unaccounted_ms a second time -- see perf_monitor.py's
+        _UNACCOUNTED_SECTIONS comment). Reading/recording this timing never
+        changes what is_candidate_reachable does or how often this method
+        is called.
         """
         if PlannerServices is None:
             return None
         if not hasattr(self, "_planner_services") or self._planner_services is None:
             self._planner_services = PlannerServices()
+        _refresh_start = time.perf_counter()
         self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(
             getattr(self, "robot", None)
         )
+        _record_perf(self, "planner_services_refresh", time.perf_counter() - _refresh_start)
         return self._planner_services
 
     def make_exploration_reachability_check(self, robot):
@@ -5514,25 +5542,48 @@ class SimulationControllerMixin:
         without exploration_planners.py depending on engine.py. Returns
         None (no filtering, existing behavior) when there is no live robot
         or the planner package is unavailable.
+
+        Diagnosis-only instrumentation: reachability_context_build_ms times
+        this whole method (nested inside ensure_planner_services()'s own
+        planner_services_refresh_ms -- see perf_monitor.py's
+        _UNACCOUNTED_SECTIONS comment for why nested sections are reported
+        but never subtracted a second time), and
+        reachability_obstacle_prepare_ms/reachability_grid_build_ms further
+        split that into obstacle sanitization vs. planning-grid
+        construction -- the two sub-steps a growing mapped_obstacle_points
+        would make progressively more expensive.
+        reachability_context_builds counts how many times this method
+        actually builds a fresh callback (i.e. does NOT hit the early
+        "no robot" return) per [PERF] window, to show how often this work
+        repeats regardless of whether that tick ends up selecting a new
+        exploration target. None of this changes the callback that is
+        built or returned.
         """
         if robot is None or compute_planned_waypoints is None:
             return None
 
+        _context_build_start = time.perf_counter()
         robot_radius = self.safety_radius_for_robot(robot)
         resolution = float(self.config.grid_resolution)
         start_xy = (float(robot.x), float(robot.y))
 
+        _obstacle_prepare_start = time.perf_counter()
         obstacle_points, _ = self.sanitize_planner_obstacle_points(
             list(self.mapped_obstacle_points),
             start_xy=start_xy,
             robot_radius=robot_radius,
             resolution=resolution,
         )
+        _record_perf(self, "reachability_obstacle_prepare", time.perf_counter() - _obstacle_prepare_start)
+
+        _grid_build_start = time.perf_counter()
         planning_grid = self.build_planning_grid_for_robot(
             robot,
             obstacle_points=obstacle_points,
             robot_radius=robot_radius,
         )
+        _record_perf(self, "reachability_grid_build", time.perf_counter() - _grid_build_start)
+
         planner_type = str(self.config.planner_type)
         bounds = (WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX)
         goal_tolerance = float(self.config.goal_tolerance)
@@ -5549,6 +5600,8 @@ class SimulationControllerMixin:
                 goal_tolerance=goal_tolerance,
             )
 
+        _record_perf(self, "reachability_context_build", time.perf_counter() - _context_build_start)
+        self.reachability_context_builds = getattr(self, "reachability_context_builds", 0) + 1
         return _is_reachable
 
     def build_observation(self, robot, agent, robot_index=None):

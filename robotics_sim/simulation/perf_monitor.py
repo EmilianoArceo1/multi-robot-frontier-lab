@@ -83,24 +83,34 @@ average_ms() -- per-occurrence -- since "how expensive is this phase when
 it runs" remains useful diagnostic information; only the unaccounted_ms
 SUM was the actual bug.
 
-planner_services_refresh_ms accounting (diagnosis-only round): engine.py's
-ensure_planner_services() call sat between the "controller" and
-"nav_decision" timers with no timer of its own, and its own docstring says
-it refreshes is_candidate_reachable on EVERY call (not just when a new
-frontier is actually selected) -- so its cost was silently folded into
+planner_services_refresh_ms accounting: engine.py's ensure_planner_services()
+call sits between the "controller" and "nav_decision" timers with no timer
+of its own -- so its cost was previously silently folded into
 unaccounted_ms, and real Office.sim evidence showed unaccounted_ms growing
-with mapped_obs, which is exactly what sanitize_planner_obstacle_points()/
-build_planning_grid_for_robot() scale with. planner_services_refresh_ms
-is a TOP-LEVEL section (added to _UNACCOUNTED_SECTIONS, so it now reduces
-unaccounted_ms like any other top-level section). Its own internals --
-reachability_context_build_ms, reachability_obstacle_prepare_ms,
-reachability_grid_build_ms -- are NESTED entirely inside it (the same
-call), so they are reported as their own diagnostic fields but
-deliberately excluded from _UNACCOUNTED_SECTIONS, exactly like
-planner_dispatch_ms/route_result_ms/etc. above -- including them too would
-double-subtract time already counted once via planner_services_refresh_ms.
-reachability_context_builds counts how many times a fresh reachability
-callback was actually built this window (diagnostic only).
+with mapped_obs. planner_services_refresh_ms is a TOP-LEVEL section (added
+to _UNACCOUNTED_SECTIONS, so it reduces unaccounted_ms like any other
+top-level section).
+
+reachability_context_build_ms/reachability_obstacle_prepare_ms/
+reachability_grid_build_ms -- the actually expensive obstacle-sanitizing
+and planning-grid-building work -- used to run EAGERLY inside
+ensure_planner_services()'s call (nested inside its own
+planner_services_refresh_ms), but engine.py's
+make_exploration_reachability_check() now builds this LAZILY, only on the
+first real invocation of the is_candidate_reachable(xy) callback it
+returns. That invocation happens from wherever exploration target
+selection actually calls the callback -- in practice inside agent.step(),
+i.e. nested inside "nav_decision", not inside "planner_services_refresh"
+anymore. Either way these three fields are diagnostic-only and deliberately
+excluded from _UNACCOUNTED_SECTIONS, exactly like planner_dispatch_ms/
+route_result_ms/etc. above -- including them too would double-subtract time
+already counted once via whichever top-level section actually triggered
+the build (planner_services_refresh_ms before this round, nav_decision_ms
+now). reachability_context_builds counts how many times the context was
+ACTUALLY built this window (i.e. is_candidate_reachable was genuinely
+invoked at least once that tick) -- diagnostic only, and now typically
+much smaller than the per-tick call count, since most ticks that build a
+fresh callback never end up invoking it.
 
 visible_candidate_obstacles_ms is a SEPARATE top-level section, not nested:
 it times self.visible_candidate_obstacles() inside update_sensed_obstacles(),
@@ -242,13 +252,18 @@ def format_perf_summary_line(
 
     planner_services_refresh_ms is a TOP-LEVEL section (see module
     docstring) -- ensure_planner_services()'s entire call, previously
-    unmeasured time sitting between controller_ms and nav_ms.
+    unmeasured time sitting between controller_ms and nav_ms; now that the
+    expensive reachability work is lazy, this measures only the cheap
+    pose/config snapshot taken when the callback is created.
     reachability_context_build_ms/reachability_obstacle_prepare_ms/
-    reachability_grid_build_ms are NESTED inside it (diagnostic only, never
-    subtracted from unaccounted_ms a second time) and break down where
-    inside that refresh the time actually goes.
-    reachability_context_builds counts how many fresh reachability
-    callbacks were built this window. visible_candidate_obstacles_ms is a
+    reachability_grid_build_ms are diagnostic-only and NESTED wherever the
+    is_candidate_reachable(xy) callback is actually first invoked (in
+    practice inside nav_ms, since exploration target selection runs inside
+    agent.step()) -- never subtracted from unaccounted_ms a second time.
+    reachability_context_builds counts how many times the context was
+    ACTUALLY built this window (the callback was genuinely invoked at least
+    once), not how many callbacks were created. visible_candidate_obstacles_ms
+    is a
     SEPARATE, unrelated TOP-LEVEL section (see module docstring) -- inside
     update_sensed_obstacles(), gated by should_run_sensor_update() rather
     than running every tick, but still its own non-overlapping gap that is

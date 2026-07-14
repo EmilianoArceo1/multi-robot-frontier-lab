@@ -387,6 +387,13 @@ def build_config_panel(window):
         0,
     )
 
+    # "Navigation Debug" is controlled solely by the eye icon drawn directly
+    # on the canvas next to the FPS/metrics eye button (see
+    # SimulationCanvas.navigation_debug_eye_rect() / navigationDebugToggle
+    # Requested), not by a side-panel control -- a single, always-visible
+    # toggle instead of two controls for the same state. The </> history-
+    # step buttons are likewise real child widgets of the canvas itself.
+
     options_grid.setColumnStretch(0, 1)
     options_grid.setColumnStretch(1, 1)
 

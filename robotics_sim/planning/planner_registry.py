@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Iterable, Any
 
+from robotics_sim.diagnostics.capture import PlanDebugCapture
 from robotics_sim.environment.occupancy_grid import (
     FREE,
     OCCUPIED,
@@ -231,6 +232,7 @@ def compute_planned_waypoints(
     planning_grid: OccupancyGrid | None = None,
     unknown_is_traversable: bool = True,
     safety_margin: float = 0.0,
+    debug_capture: PlanDebugCapture | None = None,
 ) -> tuple[bool, str, list[Point]]:
     """
     Compute executable world-coordinate waypoints.
@@ -240,6 +242,12 @@ def compute_planned_waypoints(
 
     Failure returns an empty waypoint list. The controller must not execute a
     route when success is False.
+
+    debug_capture: optional outparam. When provided and planning succeeds,
+    filled in place with the raw/simplified grid path, start/first-waypoint
+    cells, and planner/simplifier names -- values this function already
+    computes locally and would otherwise discard. Every existing caller
+    omits it (default None); nothing below runs when it is None.
     """
     start_xy = _as_point(start_xy)
     goal_xy = _as_point(goal_xy)
@@ -325,5 +333,20 @@ def compute_planned_waypoints(
 
     if start_was_occupied:
         reason_parts.append("start cell cleared because robot is already there")
+
+    if debug_capture is not None:
+        first_waypoint_cell = _cell_from_world_or_none(grid, waypoints[0], clamp=True) if waypoints else None
+        debug_capture.planner_name = planner_name
+        debug_capture.simplifier_name = str(path_simplifier)
+        debug_capture.raw_world_path = tuple(grid.grid_to_world(cell) for cell in result.grid_path)
+        debug_capture.simplified_world_path = tuple(world_path)
+        debug_capture.start_cell = start_cell
+        debug_capture.start_cell_world = grid.grid_to_world(start_cell)
+        debug_capture.first_waypoint_cell = first_waypoint_cell
+        debug_capture.first_waypoint_world = (
+            grid.grid_to_world(first_waypoint_cell) if first_waypoint_cell is not None else None
+        )
+        debug_capture.unknown_is_traversable = bool(unknown_is_traversable)
+        debug_capture.start_cell_cleared = bool(start_was_occupied)
 
     return True, "; ".join(reason_parts), waypoints

@@ -1,9 +1,13 @@
 from math import pi
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from robotics_sim.control.modes import RobotMode
 from robotics_sim.core.geometry import goal_metrics
+
+if TYPE_CHECKING:
+    from robotics_sim.diagnostics.capture import NavigationDebugCapture
 
 
 class TrackingController:
@@ -147,7 +151,14 @@ class TrackingController:
             dtype=float,
         )
 
-    def compute_control(self, state, target, limits, mode: RobotMode) -> np.ndarray:
+    def compute_control(
+        self,
+        state,
+        target,
+        limits,
+        mode: RobotMode,
+        capture: "NavigationDebugCapture | None" = None,
+    ) -> np.ndarray:
         """
         Compute nominal control according to the current mode.
 
@@ -156,6 +167,11 @@ class TrackingController:
             - ROTATE: rotate and brake
             - TRACK: move toward target
             - STOP/BLOCKED/FAILED: brake
+
+        capture: optional diagnostic sink. When provided and a target
+        exists, stashes the heading_error/distance_to_goal this method
+        already computes via goal_metrics() before mode dispatch discards
+        the rest of the dict. None (the default) costs nothing extra.
         """
         metrics = goal_metrics(state, target)
 
@@ -167,6 +183,12 @@ class TrackingController:
 
         distance_to_goal = metrics["distance_to_goal"]
         error_theta = metrics["error_theta"]
+        desired_angle = metrics["desired_angle"]
+
+        if capture is not None:
+            capture.heading_error = float(error_theta)
+            capture.distance_to_goal = float(distance_to_goal)
+            capture.desired_heading = float(desired_angle)
 
         if mode == RobotMode.IDLE:
             control = self.brake_control(state)
@@ -194,4 +216,8 @@ class TrackingController:
         else:
             raise RuntimeError(f"Unknown robot mode: {mode}")
 
-        return self.clip_control(control, limits)
+        applied = self.clip_control(control, limits)
+        if capture is not None:
+            capture.nominal_control = (float(control[0, 0]), float(control[1, 0]))
+            capture.applied_control = (float(applied[0, 0]), float(applied[1, 0]))
+        return applied

@@ -23,7 +23,7 @@ from PySide6.QtGui import (
     QBrush,
     QPixmap,
 )
-from PySide6.QtWidgets import QSizePolicy, QWidget
+from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
 from robotics_sim.simulation.config import *
 from robotics_sim.app.map_editor import (
@@ -121,6 +121,11 @@ class SimulationCanvas(QWidget):
     editor_obstacle_move_started = Signal()
     editor_obstacle_moved = Signal(tuple)
     editor_view_changed = Signal()
+    # Emitted on eye-icon click; the canvas never decides navigation_debug
+    # state itself (same pattern as goalClicked) -- main_window.py's
+    # on_navigation_debug_toggled() is the single place that flips both
+    # engine.navigation_debug_enabled and canvas.navigation_debug_enabled.
+    navigationDebugToggleRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -243,6 +248,52 @@ class SimulationCanvas(QWidget):
         self._grid_overlay_blit_ms = 0.0
         self._grid_overlay_cells_ms = 0.0
         self._grid_overlay_lines_ms = 0.0
+
+        # Navigation debug overlay. Off by default. The canvas never
+        # imports/calls planning, navigation, or collision-checking code --
+        # it only ever holds the single most recent NavigationDebugSnapshot
+        # (an immutable, plain-data value pushed in from engine.py) and
+        # renders whatever is already inside it. Pausing the simulation
+        # simply stops new set_navigation_debug_snapshot() calls; nothing
+        # here ever clears _nav_debug_snapshot on its own, so the last
+        # relevant snapshot survives untouched across repeated repaints.
+        self.navigation_debug_enabled = False
+        self._nav_debug_snapshot = None
+        # The last RELEVANT event (PLAN_ACCEPTED/ROUTE_REJECTED/SAFETY_REPLAN/
+        # PREDICTED_COLLISION/HOLD/EXHAUSTED/...), separate from
+        # _nav_debug_snapshot: the latter updates every tick while running
+        # (for a live HUD), this one only updates when engine.py's bounded
+        # ring buffer actually gains a new entry -- so "what was the last
+        # relevant thing that happened" survives many quiet ticks after it.
+        self._nav_debug_last_event = None
+        # (position, total) while stepping through history (paused), or
+        # (None, total) while showing the live snapshot.
+        self._nav_debug_history_position: tuple[int | None, int] = (None, 0)
+        self._nav_debug_overlay_cache: dict | None = None
+        self._nav_debug_overlay_cache_key: tuple | None = None
+
+        # History step buttons: real Qt widgets (not QPainter-drawn), so
+        # they are always crisp and reliably clickable regardless of the
+        # side panel's scroll position. Fixed in a corner of the canvas
+        # itself (not attached to the moving robot -- a control needs a
+        # predictable place to click, unlike the diagnostic readout, which
+        # should follow the robot). main_window.py connects their
+        # `clicked` signals; this widget only owns their placement/enabled
+        # state.
+        self.navigation_debug_step_back_button = QPushButton("<", self)
+        self.navigation_debug_step_forward_button = QPushButton(">", self)
+        for step_button in (self.navigation_debug_step_back_button, self.navigation_debug_step_forward_button):
+            step_button.setFixedSize(28, 24)
+            step_button.setEnabled(False)
+            step_button.setVisible(True)
+            step_button.raise_()
+            step_button.setStyleSheet(
+                "QPushButton { background-color: rgba(255,255,255,215); border: 1px solid "
+                f"{BORDER}; border-radius: 4px; font-weight: 600; }}"
+                "QPushButton:disabled { color: rgba(120,120,120,150); }"
+                "QPushButton:enabled { color: #17212B; }"
+            )
+        self._position_navigation_debug_step_buttons()
 
         # Render-only FPS/frame-time telemetry. Independent of the engine --
         # this only ever measures how fast paintEvent itself is running.
@@ -369,7 +420,19 @@ class SimulationCanvas(QWidget):
         self.invalidate_explored_area_cache()
         self.invalidate_mapped_points_cache()
         self.invalidate_obstacles_cache()
+        self._position_navigation_debug_step_buttons()
         super().resizeEvent(event)
+
+    def _position_navigation_debug_step_buttons(self) -> None:
+        """Fixed top-right corner of the canvas widget -- a predictable
+        spot to click regardless of where the robot currently is, always
+        within the visible viewport (never inside a scrollable side panel)."""
+        margin = 14
+        gap = 4
+        back = self.navigation_debug_step_back_button
+        forward = self.navigation_debug_step_forward_button
+        forward.move(self.width() - margin - forward.width(), margin)
+        back.move(forward.x() - gap - back.width(), margin)
 
     def invalidate_static_plot_cache(self):
         self._static_plot_cache = None
@@ -843,13 +906,21 @@ class SimulationCanvas(QWidget):
         # can bring the counters back without searching elsewhere.
         return QRectF((self.width() - eye_width) / 2.0, y, eye_width, height)
 
+    def navigation_debug_eye_rect(self) -> QRectF:
+        """Clickable eye button that toggles the Navigation Debug overlay --
+        always visible next to the FPS/metrics eye button, regardless of
+        metrics_visible, so it never depends on another toggle's state."""
+        metrics_eye = self.metrics_eye_rect()
+        gap = 6.0
+        return QRectF(metrics_eye.right() + gap, metrics_eye.top(), metrics_eye.width(), metrics_eye.height())
+
     def metrics_reserved_rect(self) -> QRectF:
         """Area reserved by the metric controls in the header row."""
-        eye = self.metrics_eye_rect()
+        nav_eye = self.navigation_debug_eye_rect()
         if not self.metrics_visible:
-            return eye
+            return QRectF(self.metrics_eye_rect().left(), nav_eye.top(), nav_eye.right() - self.metrics_eye_rect().left(), nav_eye.height())
         metrics = self.metrics_rect()
-        return QRectF(metrics.left(), metrics.top(), eye.right() - metrics.left(), metrics.height())
+        return QRectF(metrics.left(), metrics.top(), nav_eye.right() - metrics.left(), metrics.height())
 
 
     def multi_robot_screen_positions(self) -> list[tuple[int, float, float, RobotStartConfig]]:
@@ -1149,6 +1220,14 @@ class SimulationCanvas(QWidget):
                 self.update()
                 return
 
+            if self.navigation_debug_eye_rect().contains(QPointF(pos.x(), pos.y())):
+                # Emits only -- main_window.py's on_navigation_debug_toggled()
+                # is the single place that flips engine + canvas state
+                # together (same "canvas emits, window decides" pattern as
+                # goalClicked). Never touches simulation/robot/agent state.
+                self.navigationDebugToggleRequested.emit()
+                return
+
             if self.plot_rect().contains(pos.toPoint()):
                 if self.editor_mode and not self.robot and not self.robots:
                     # Pan/Zoom mode is exclusive. It must never select, move,
@@ -1214,6 +1293,13 @@ class SimulationCanvas(QWidget):
                 self.goalClicked.emit(x, y)
 
     def mouseMoveEvent(self, event):
+        pos = event.position()
+        if self.navigation_debug_eye_rect().contains(QPointF(pos.x(), pos.y())):
+            if self.toolTip() != "Show navigation reasoning":
+                self.setToolTip("Show navigation reasoning")
+        elif self.toolTip() == "Show navigation reasoning":
+            self.setToolTip("")
+
         if self.editor_mode and self.editor_pan_active and self.editor_last_pan_pos is not None:
             pos = event.position()
             dx = pos.x() - self.editor_last_pan_pos[0]
@@ -1352,6 +1438,9 @@ class SimulationCanvas(QWidget):
         self.draw_telemetry(painter)
         telemetry_ms = (time.perf_counter() - _telemetry_start) * 1000.0
         self._render_layer_ms["telemetry"] = telemetry_ms
+
+        if self.navigation_debug_enabled:
+            self.draw_navigation_debug_hud(painter)
 
         # Card/title/telemetry chrome is small, one-off UI decoration, not
         # a simulation/map/robot layer -- folded into "overlays" for the
@@ -1506,6 +1595,7 @@ class SimulationCanvas(QWidget):
         if self.metrics_visible:
             self.draw_metrics_badge(painter, self.metrics_rect())
         self.draw_metrics_eye_button(painter, self.metrics_eye_rect())
+        self.draw_navigation_debug_eye_button(painter, self.navigation_debug_eye_rect())
 
         # Right status. Long status messages are elided because the center
         # metrics controls have priority in this header row.
@@ -1585,6 +1675,41 @@ class SimulationCanvas(QWidget):
         painter.drawPath(eye_path)
 
         if self.metrics_visible:
+            painter.setBrush(QBrush(eye_color))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QRectF(cx - 2.3, cy - 2.3, 4.6, 4.6))
+        else:
+            painter.setPen(QPen(eye_color, 1.7, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(cx - 8.0, cy + 7.0), QPointF(cx + 8.0, cy - 7.0))
+
+        painter.restore()
+
+    def draw_navigation_debug_eye_button(self, painter: QPainter, rect: QRectF):
+        """Same open/closed eye glyph as draw_metrics_eye_button(), but for
+        the Navigation Debug layer -- accented (not just dark/muted) when
+        active, so its on/off state reads at a glance without a tooltip."""
+        painter.save()
+
+        active = self.navigation_debug_enabled
+        path = QPainterPath()
+        path.addRoundedRect(rect, 12.5, 12.5)
+        painter.setPen(QPen(QColor(BLUE) if active else QColor(218, 223, 231, 190), 1.3 if active else 1.0))
+        painter.setBrush(QBrush(QColor(BLUE).lighter(185) if active else QColor(255, 255, 255, 230)))
+        painter.drawPath(path)
+
+        cx = rect.center().x()
+        cy = rect.center().y()
+        eye_color = QColor(BLUE) if active else QColor(TEXT_MUTED)
+        painter.setPen(QPen(eye_color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.setBrush(Qt.NoBrush)
+
+        eye_path = QPainterPath()
+        eye_path.moveTo(cx - 8.5, cy)
+        eye_path.cubicTo(cx - 5.5, cy - 5.0, cx + 5.5, cy - 5.0, cx + 8.5, cy)
+        eye_path.cubicTo(cx + 5.5, cy + 5.0, cx - 5.5, cy + 5.0, cx - 8.5, cy)
+        painter.drawPath(eye_path)
+
+        if active:
             painter.setBrush(QBrush(eye_color))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(QRectF(cx - 2.3, cy - 2.3, 4.6, 4.6))
@@ -1852,6 +1977,11 @@ class SimulationCanvas(QWidget):
         self.draw_goal_and_robot(painter)
         self._render_layer_ms["robot_body"] = (time.perf_counter() - _robot_body_start) * 1000.0
 
+        _nav_debug_start = time.perf_counter()
+        if self.navigation_debug_enabled:
+            self.draw_navigation_debug_overlay(painter)
+        self._render_layer_ms["navigation_debug"] = (time.perf_counter() - _nav_debug_start) * 1000.0
+
         _grid_preview_start = time.perf_counter()
         # Drawn last so the temporary red preview is clearly visible over
         # every other layer while the user is comparing grid resolutions.
@@ -2072,6 +2202,51 @@ class SimulationCanvas(QWidget):
 
     def is_grid_overlay_enabled(self) -> bool:
         return bool(self.grid_overlay_enabled)
+
+    # ------------------------------------------------------------------
+    # Navigation debug overlay. _nav_debug_snapshot is an immutable
+    # NavigationDebugSnapshot pushed in from engine.py -- the canvas never
+    # constructs, mutates, or recomputes any part of it.
+    # ------------------------------------------------------------------
+
+    def set_navigation_debug_enabled(self, enabled: bool) -> None:
+        self.navigation_debug_enabled = bool(enabled)
+        self.update()
+
+    def is_navigation_debug_enabled(self) -> bool:
+        return bool(self.navigation_debug_enabled)
+
+    def set_navigation_debug_snapshot(self, snapshot) -> None:
+        """Store the latest NavigationDebugSnapshot for the overlay/HUD to
+        read. Deliberately never called from paintEvent or any idle/hover
+        path -- only from engine.py's per-tick/per-route-result assembly --
+        so pausing the simulation (which just stops those calls) leaves the
+        last relevant snapshot in place across any number of repaints."""
+        self._nav_debug_snapshot = snapshot
+        self.update()
+
+    def navigation_debug_snapshot(self):
+        return self._nav_debug_snapshot
+
+    def set_navigation_debug_last_event(self, event) -> None:
+        """Store the last RELEVANT navigation-debug event (a
+        NavigationDebugEvent), independent of the always-current live
+        snapshot -- see the field comment in __init__. Never called from
+        paintEvent or any idle path."""
+        self._nav_debug_last_event = event
+        self.update()
+
+    def navigation_debug_last_event(self):
+        return self._nav_debug_last_event
+
+    def set_navigation_debug_history_position(self, position: int | None, total: int) -> None:
+        """position is 1-based while stepping through history, or None
+        while showing the live snapshot. Never called from paintEvent."""
+        self._nav_debug_history_position = (position, int(total))
+        self.update()
+
+    def navigation_debug_history_position(self) -> tuple[int | None, int]:
+        return self._nav_debug_history_position
 
     def set_simulation_running_for_perf(self, running: bool) -> None:
         """Tell the canvas whether the simulation is actively running, for
@@ -2998,6 +3173,172 @@ class SimulationCanvas(QWidget):
 
         painter.restore()
 
+    def _navigation_debug_path_from_maybe_points(self, maybe_points) -> QPainterPath | None:
+        """Convert an already-computed Maybe[tuple[Point2D, ...]] into a
+        QPainterPath. The only place raw/simplified/predicted world-space
+        point lists become Qt geometry -- nothing upstream in
+        simulation/planning/navigation ever builds a QPainterPath."""
+        if maybe_points.unavailable or not maybe_points.value or len(maybe_points.value) < 2:
+            return None
+        return self._navigation_debug_path_from_points(maybe_points.value)
+
+    def _navigation_debug_path_from_points(self, points) -> QPainterPath | None:
+        if not points or len(points) < 2:
+            return None
+        path = QPainterPath()
+        sx, sy = self.world_to_screen(*points[0])
+        path.moveTo(sx, sy)
+        for point in points[1:]:
+            sx, sy = self.world_to_screen(*point)
+            path.lineTo(sx, sy)
+        return path
+
+    def _rebuild_navigation_debug_overlay_cache(self, snapshot) -> dict:
+        active_segment_path = None
+        if snapshot.path.active_segment is not None:
+            start, end = snapshot.path.active_segment
+            if end is not None:
+                active_segment_path = self._navigation_debug_path_from_points([start, end])
+
+        return {
+            "raw_path": self._navigation_debug_path_from_maybe_points(snapshot.path.raw_path),
+            "simplified_path": self._navigation_debug_path_from_maybe_points(snapshot.path.simplified_path),
+            "pending_path": self._navigation_debug_path_from_points(snapshot.path.pending_path),
+            "predicted_trajectory": self._navigation_debug_path_from_maybe_points(
+                snapshot.predicted_motion.trajectory
+            ),
+            "active_segment": active_segment_path,
+        }
+
+    def draw_navigation_debug_overlay(self, painter: QPainter):
+        """Render the navigation debug overlay from the last pushed
+        NavigationDebugSnapshot.
+
+        Pure consumer: builds QPainterPaths from already-computed
+        world-space points/values and draws already-computed markers/radii.
+        Never recomputes a plan, a collision check, or a decision -- if a
+        value is not on the snapshot (Maybe.missing()), it is simply not
+        drawn. Cached by (snapshot_id, view transform), mirroring
+        draw_planned_route()'s existing cache pattern -- rebuilt only when
+        either changes, not on every paintEvent.
+        """
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None:
+            return
+
+        cache_key = (snapshot.snapshot_id, self._view_transform_signature())
+        if self._nav_debug_overlay_cache is None or self._nav_debug_overlay_cache_key != cache_key:
+            self._nav_debug_overlay_cache = self._rebuild_navigation_debug_overlay_cache(snapshot)
+            self._nav_debug_overlay_cache_key = cache_key
+        cache = self._nav_debug_overlay_cache
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Color coding (fixed, per-layer): raw=gray dotted, simplified=
+        # yellow, pending=violet, predicted=green when safe/red when
+        # blocked, active segment=green when clear/red when blocked.
+        if cache["raw_path"] is not None:
+            painter.setPen(QPen(QColor(140, 140, 140, 210), 1.2, Qt.DotLine))
+            painter.drawPath(cache["raw_path"])
+
+        if cache["simplified_path"] is not None:
+            painter.setPen(QPen(QColor(YELLOW), 1.8, Qt.DashLine))
+            painter.drawPath(cache["simplified_path"])
+
+        if cache["pending_path"] is not None:
+            painter.setPen(QPen(QColor(160, 90, 200, 220), 1.8, Qt.DashDotLine))
+            painter.drawPath(cache["pending_path"])
+
+        predicted_blocked = (
+            not snapshot.predicted_motion.collision.unavailable
+            and snapshot.predicted_motion.collision.value is not None
+            and snapshot.predicted_motion.collision.value.blocked
+        )
+        if cache["predicted_trajectory"] is not None:
+            predicted_color = QColor(RED) if predicted_blocked else QColor(GREEN)
+            predicted_color.setAlpha(200 if predicted_blocked else 140)
+            painter.setPen(QPen(predicted_color, 1.8, Qt.DotLine))
+            painter.drawPath(cache["predicted_trajectory"])
+
+        active_blocked = (
+            not snapshot.safety.active_segment.unavailable
+            and snapshot.safety.active_segment.value is not None
+            and snapshot.safety.active_segment.value.blocked
+        )
+        if cache["active_segment"] is not None:
+            active_color = QColor(RED) if active_blocked else QColor(GREEN)
+            painter.setPen(QPen(active_color, 3.2, Qt.SolidLine, Qt.RoundCap))
+            painter.drawPath(cache["active_segment"])
+
+        # Footprint / safety-radius circles at the robot's pose -- drawn
+        # here (not only via draw_safety_radius(), which is gated on the
+        # separate "Robot Orders" toggle) so the debug layer is
+        # self-sufficient regardless of that toggle's state.
+        px_per_meter = self.pixels_per_meter()
+        rx, ry = self.world_to_screen(snapshot.robot_pose.x, snapshot.robot_pose.y)
+        body_r = snapshot.safety.robot_radius * px_per_meter
+        safety_r = snapshot.safety.safety_radius * px_per_meter
+        painter.setPen(QPen(QColor(40, 40, 40, 170), 1.4, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QRectF(rx - body_r, ry - body_r, body_r * 2, body_r * 2))
+        painter.setPen(QPen(QColor(230, 140, 20, 170), 1.4, Qt.DotLine))
+        painter.drawEllipse(QRectF(rx - safety_r, ry - safety_r, safety_r * 2, safety_r * 2))
+
+        # Start / first-waypoint planning-grid cell highlights.
+        cell_size_world = max(float(getattr(self.config, "grid_resolution", 0.5)), 1e-3)
+        cell_px = cell_size_world * px_per_meter
+        for maybe_point, color in (
+            (snapshot.planning_grid.start_cell_world, QColor(40, 160, 90, 210)),
+            (snapshot.planning_grid.first_waypoint_world, QColor(230, 160, 30, 210)),
+        ):
+            if maybe_point.unavailable or maybe_point.value is None:
+                continue
+            cx, cy = self.world_to_screen(*maybe_point.value)
+            painter.setPen(QPen(color, 2.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRectF(cx - cell_px / 2.0, cy - cell_px / 2.0, cell_px, cell_px))
+
+        # Blocking-point marker + clearance label: whichever check is
+        # currently blocked wins (first segment on a just-processed route
+        # result, else the live active-segment check, else predicted
+        # motion) -- first match, not a merged/invented composite.
+        blocking_terms = None
+        for maybe_terms in (
+            snapshot.route.first_segment,
+            snapshot.safety.active_segment,
+            snapshot.predicted_motion.collision,
+        ):
+            if not maybe_terms.unavailable and maybe_terms.value is not None and maybe_terms.value.blocked:
+                blocking_terms = maybe_terms.value
+                break
+
+        if blocking_terms is not None and blocking_terms.blocking_point is not None:
+            bx, by = self.world_to_screen(*blocking_terms.blocking_point)
+            painter.setPen(QPen(QColor(220, 30, 30), 2.4))
+            painter.setBrush(QBrush(QColor(220, 30, 30, 90)))
+            marker_r = 7.0
+            painter.drawEllipse(QRectF(bx - marker_r, by - marker_r, marker_r * 2, marker_r * 2))
+            painter.drawLine(QPointF(bx - marker_r, by - marker_r), QPointF(bx + marker_r, by + marker_r))
+            painter.drawLine(QPointF(bx - marker_r, by + marker_r), QPointF(bx + marker_r, by - marker_r))
+
+            distance_text = (
+                "n/a" if blocking_terms.distance.unavailable else f"{blocking_terms.distance.value:.2f}"
+            )
+            # Plain text, no filled background box -- kept small and light
+            # so it marks the blocking point without becoming another
+            # obstructive panel; the robot's own live status has its own
+            # nameplate-style readout drawn below.
+            label = f"d={distance_text}m < r={blocking_terms.required_clearance:.2f}m"
+            painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            painter.setPen(QColor(RED))
+            painter.drawText(QPointF(bx + marker_r + 4, by + 3), label)
+
+        self.draw_navigation_debug_waypoint_line(painter)
+        self.draw_navigation_debug_heading_rays(painter)
+        self.draw_navigation_debug_robot_label(painter)
+        painter.restore()
+
     def draw_mapped_obstacle_points(self, painter: QPainter):
         """
         Draw discovered obstacle samples from a cached pixmap.
@@ -3476,4 +3817,272 @@ class SimulationCanvas(QWidget):
 
         painter.drawText(rect.adjusted(12, 0, -12, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
 
+    def _navigation_debug_pick_live_terms(self, snapshot):
+        """Pick whichever safety check is most relevant to show as the live
+        formula next to the robot: a currently-blocked predicted-motion
+        check is the most urgent, then the always-live active-segment
+        check (computed every tick there is a target), else a clear
+        predicted-motion result, else nothing (idle / no target)."""
+        predicted = snapshot.predicted_motion.collision
+        if not predicted.unavailable and predicted.value is not None and predicted.value.blocked:
+            return "predicted", predicted.value
+        active = snapshot.safety.active_segment
+        if not active.unavailable and active.value is not None:
+            return "active segment", active.value
+        if not predicted.unavailable and predicted.value is not None:
+            return "predicted", predicted.value
+        return None, None
+
+    def draw_navigation_debug_heading_rays(self, painter: QPainter):
+        """World-space rays/arc around the robot answering "why did it
+        turn": current heading (white), desired heading toward the active
+        target (cyan), and the angular error arc between them. Every angle
+        drawn is read straight off the snapshot (robot_pose.theta,
+        controller.desired_heading) -- nothing here is computed."""
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None:
+            return
+
+        px_per_meter = self.pixels_per_meter()
+        rx, ry = self.world_to_screen(snapshot.robot_pose.x, snapshot.robot_pose.y)
+        ray_len = max(28.0, snapshot.safety.safety_radius * px_per_meter * 1.8)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        theta = snapshot.robot_pose.theta
+        hx = rx + ray_len * math.cos(theta)
+        hy = ry - ray_len * math.sin(theta)
+        painter.setPen(QPen(QColor(255, 255, 255), 2.4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(rx, ry), QPointF(hx, hy))
+        painter.setPen(QPen(QColor(40, 40, 40)))
+        painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        painter.drawText(QPointF(hx + 3, hy), f"θ={math.degrees(theta):.0f}°")
+
+        if not snapshot.controller.desired_heading.unavailable:
+            theta_t = snapshot.controller.desired_heading.value
+            dx = rx + ray_len * math.cos(theta_t)
+            dy = ry - ray_len * math.sin(theta_t)
+            painter.setPen(QPen(QColor(0, 188, 212), 2.2, Qt.DashLine, Qt.RoundCap))
+            painter.drawLine(QPointF(rx, ry), QPointF(dx, dy))
+            painter.setPen(QPen(QColor(0, 140, 165)))
+            painter.drawText(QPointF(dx + 3, dy), f"θt={math.degrees(theta_t):.0f}°")
+
+            # Angular-error arc between the two rays.
+            arc_r = ray_len * 0.55
+            start_deg = math.degrees(theta)
+            span_deg = math.degrees(theta_t - theta)
+            span_deg = (span_deg + 180.0) % 360.0 - 180.0
+            painter.setPen(QPen(QColor(230, 140, 20), 1.6, Qt.SolidLine))
+            painter.drawArc(
+                QRectF(rx - arc_r, ry - arc_r, arc_r * 2, arc_r * 2),
+                int(-start_deg * 16),
+                int(-span_deg * 16),
+            )
+
+        painter.restore()
+
+    def draw_navigation_debug_waypoint_line(self, painter: QPainter):
+        """World-space line from the robot to the active waypoint, with the
+        real distance already computed by the controller (goal_metrics())
+        -- not recomputed here."""
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None or snapshot.path.active_segment is None:
+            return
+        start, end = snapshot.path.active_segment
+        if end is None:
+            return
+
+        sx, sy = self.world_to_screen(*start)
+        ex, ey = self.world_to_screen(*end)
+        painter.save()
+        painter.setPen(QPen(QColor(0, 188, 212, 160), 1.4, Qt.DashDotLine))
+        painter.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+        painter.setPen(QPen(QColor(255, 255, 255), 2.0))
+        painter.setBrush(QBrush(QColor(0, 188, 212)))
+        painter.drawEllipse(QRectF(ex - 5, ey - 5, 10, 10))
+        if not snapshot.controller.distance_to_goal.unavailable:
+            painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            painter.setPen(QColor(0, 120, 140))
+            mx, my = (sx + ex) / 2.0, (sy + ey) / 2.0
+            painter.drawText(QPointF(mx + 4, my - 4), f"d={snapshot.controller.distance_to_goal.value:.2f}m")
+        painter.restore()
+
+    def draw_navigation_debug_robot_label(self, painter: QPainter):
+        """Compact floating readout anchored above the robot, following it
+        every frame like a nameplate -- short formulas only (the full
+        breakdown lives in the fixed HUD card, see
+        draw_navigation_debug_hud()). Nothing here is computed: every value
+        is read straight off the snapshot. Background is translucent and
+        the label is offset past the safety-radius ring so it never covers
+        the robot or the map underneath it.
+        """
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None:
+            return
+
+        lines: list[str] = []
+        colors: list[QColor] = []
+        accent = QColor(TEXT_MUTED)
+
+        mode_line = snapshot.tracking_mode or snapshot.navigation_state
+        lines.append(f"{mode_line} · {snapshot.decision_kind}")
+        colors.append(QColor(TEXT_MUTED))
+
+        if not snapshot.controller.heading_error.unavailable and not snapshot.rotate_threshold.unavailable:
+            eth = math.degrees(snapshot.controller.heading_error.value)
+            thr = math.degrees(snapshot.rotate_threshold.value)
+            rotate = abs(eth) > thr
+            accent = QColor(ORANGE) if rotate else QColor(GREEN)
+            lines.append(f"|eθ|={abs(eth):.1f}° {'>' if rotate else '≤'} thr={thr:.1f}°")
+            lines.append(f"ROTATE={rotate}")
+            colors.append(accent)
+            colors.append(accent)
+
+        checker_label, terms = self._navigation_debug_pick_live_terms(snapshot)
+        if terms is not None and terms.blocked:
+            distance_text = "n/a" if terms.distance.unavailable else f"{terms.distance.value:.2f}m"
+            accent = QColor(RED)
+            lines.append(f"{checker_label}: BLOCKED d={distance_text}<r={terms.required_clearance:.2f}m")
+            colors.append(accent)
+
+        position, total = self._nav_debug_history_position
+        if position is not None:
+            view_color = QColor(ORANGE)
+            view_text = f"HISTORY {position}/{total}"
+        else:
+            view_color = QColor(GREEN)
+            view_text = "LIVE"
+        lines.append(view_text)
+        colors.append(view_color)
+
+        px_per_meter = self.pixels_per_meter()
+        rx, ry = self.world_to_screen(snapshot.robot_pose.x, snapshot.robot_pose.y)
+        safety_r_px = snapshot.safety.safety_radius * px_per_meter
+
+        painter.save()
+        painter.setFont(QFont("Segoe UI", 7))
+        metrics = painter.fontMetrics()
+        line_height = metrics.height() + 1
+        width = max(metrics.horizontalAdvance(line) for line in lines) + 14
+        height = line_height * len(lines) + 7
+
+        # Anchored above and to the right of the safety-radius ring -- past
+        # the robot's own footprint, like a nameplate that follows it
+        # without ever covering it.
+        label_x = rx + safety_r_px * 0.35 + 6
+        label_y = ry - safety_r_px - height - 8
+        rect = QRectF(label_x, label_y, width, height)
+
+        path = QPainterPath()
+        path.addRoundedRect(rect, 5, 5)
+        # Deliberately light: translucent fill so the map/route underneath
+        # stays visible through the label, not an opaque card.
+        painter.fillPath(path, QColor(255, 255, 255, 120))
+        painter.setPen(QPen(accent, 1.0))
+        painter.drawPath(path)
+
+        for i, (line, color) in enumerate(zip(lines, colors)):
+            painter.setPen(color)
+            painter.drawText(QPointF(rect.left() + 6, rect.top() + 5 + line_height * (i + 1) - 3), line)
+
+        # Thin leader line from the robot to the label, like a callout.
+        painter.setPen(QPen(accent, 1.0, Qt.DotLine))
+        painter.drawLine(QPointF(rx, ry - safety_r_px * 0.3), QPointF(rect.left(), rect.bottom()))
+        painter.restore()
+
+    def draw_navigation_debug_hud(self, painter: QPainter):
+        """Fixed HUD card -- the full field breakdown (Paso 3). Positioned
+        top-left, deliberately away from where draw_navigation_debug_
+        robot_label already floats (near the robot), so the two never
+        overlap. Every value is read straight off the snapshot; the one-
+        line explanation is built from those same fields by
+        engine._navigation_debug_explanation(), never inferred here."""
+        snapshot = self._nav_debug_snapshot
+        if snapshot is None:
+            painter.save()
+            painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            rect = QRectF(10, 10, 260, 30)
+            path = QPainterPath()
+            path.addRoundedRect(rect, 6, 6)
+            painter.fillPath(path, QColor(255, 255, 255, 220))
+            painter.setPen(QPen(QColor(BORDER), 1))
+            painter.drawPath(path)
+            painter.setPen(QColor(TEXT_MUTED))
+            painter.drawText(rect.adjusted(10, 0, -10, 0), Qt.AlignVCenter | Qt.AlignLeft, "No navigation decisions captured")
+            painter.restore()
+            return
+
+        def _mtext(maybe, fmt="{:.2f}"):
+            return "n/a" if maybe.unavailable else fmt.format(maybe.value)
+
+        position, total = self._nav_debug_history_position
+        view_text = f"HISTORY {position}/{total}" if position is not None else ("LIVE" if total else "no history yet")
+
+        c = snapshot.controller
+        lines = [
+            ("NAVIGATION REASONING", None),
+            (f"Robot: {snapshot.robot_id}   {view_text}", None),
+            (f"Time: {snapshot.simulation_time:.2f}s   snapshot #{snapshot.snapshot_id}", None),
+            (f"State: {snapshot.tracking_mode or '-'}   Decision: {snapshot.decision_kind}", None),
+            (f"Reason: {snapshot.decision_reason or '-'}", None),
+            (f"θ={math.degrees(snapshot.robot_pose.theta):.1f}°  "
+             f"θt={('n/a' if c.desired_heading.unavailable else f'{math.degrees(c.desired_heading.value):.1f}°')}",
+             None),
+            (f"eθ={('n/a' if c.heading_error.unavailable else f'{math.degrees(c.heading_error.value):.1f}°')}"
+             f"  rotate_thr={('n/a' if snapshot.rotate_threshold.unavailable else f'{math.degrees(snapshot.rotate_threshold.value):.1f}°')}",
+             None),
+            (f"waypoint#={snapshot.path.active_waypoint_index if snapshot.path.active_waypoint_index is not None else '-'}"
+             f"  d_goal={_mtext(c.distance_to_goal)}m", None),
+            (f"v={c.v:.2f}  a_nom={('n/a' if c.nominal_control.unavailable else f'{c.nominal_control.value[0]:.2f}')}"
+             f"  ω_nom={('n/a' if c.nominal_control.unavailable else f'{c.nominal_control.value[1]:.2f}')}", None),
+            (f"a_cmd={('n/a' if c.applied_control.unavailable else f'{c.applied_control.value[0]:.2f}')}"
+             f"  ω_cmd={('n/a' if c.applied_control.unavailable else f'{c.applied_control.value[1]:.2f}')}", None),
+            (f"planner={self._navigation_debug_maybe_text(snapshot.path.planner_name)}"
+             f"  simplifier={self._navigation_debug_maybe_text(snapshot.path.simplifier_name)}", None),
+            (f"route validation: {self._navigation_debug_clearance_text(snapshot.route.first_segment)}", None),
+            (f"safety (active segment): {self._navigation_debug_clearance_text(snapshot.safety.active_segment)}", None),
+            (f"predicted collision: {self._navigation_debug_clearance_text(snapshot.predicted_motion.collision)}", None),
+            (f"radius body={snapshot.safety.robot_radius:.2f}m  safety={snapshot.safety.safety_radius:.2f}m", None),
+            (snapshot.explanation or "-", QColor(BLUE)),
+        ]
+
+        painter.save()
+        painter.setFont(QFont("Segoe UI", 8))
+        metrics = painter.fontMetrics()
+        line_height = metrics.height() + 2
+        width = max(metrics.horizontalAdvance(text) for text, _ in lines) + 20
+        height = line_height * len(lines) + 14
+        rect = QRectF(10, 10, min(width, 420), height)
+
+        path = QPainterPath()
+        path.addRoundedRect(rect, 7, 7)
+        painter.fillPath(path, QColor(255, 255, 255, 225))
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.drawPath(path)
+
+        for i, (text, color) in enumerate(lines):
+            if i == 0:
+                painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                painter.setPen(QColor(TEXT_MUTED))
+            else:
+                painter.setFont(QFont("Segoe UI", 8))
+                painter.setPen(color if color is not None else QColor(TEXT))
+            elided = metrics.elidedText(text, Qt.ElideRight, int(rect.width() - 16))
+            painter.drawText(QPointF(rect.left() + 9, rect.top() + 8 + line_height * (i + 1) - 4), elided)
+        painter.restore()
+
+    @staticmethod
+    def _navigation_debug_maybe_text(maybe_value, formatter=str) -> str:
+        if maybe_value.unavailable:
+            return "unavailable"
+        return formatter(maybe_value.value)
+
+    def _navigation_debug_clearance_text(self, maybe_terms) -> str:
+        if maybe_terms.unavailable or maybe_terms.value is None:
+            return "unavailable"
+        terms = maybe_terms.value
+        distance_text = "n/a" if terms.distance.unavailable else f"{terms.distance.value:.2f}"
+        status = "BLOCKED" if terms.blocked else "clear"
+        return f"{status} (d={distance_text}m, req={terms.required_clearance:.2f}m, {terms.checker})"
 

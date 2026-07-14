@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from robotics_sim.simulation.config import *
+from robotics_sim.diagnostics.event_log import NavigationDebugEventLog
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.simulation.engine import PlannerWorker, SimulationControllerMixin
 from robotics_sim.app.widgets import (
@@ -82,6 +83,19 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.robot_agents = self.runtime_robot_registry.agents
         self.running = False
         self.paused = False
+
+        # Navigation debug overlay: off by default, persists across
+        # simulation resets (a user preference, not run state) -- mirrors
+        # canvas.grid_overlay_enabled's lifecycle. The bounded event log
+        # itself IS reset per simulation run (see reset_simulation_state()),
+        # since events from a previous run are no longer meaningful.
+        self.navigation_debug_enabled = False
+        self.navigation_debug_log = NavigationDebugEventLog()
+        self._nav_debug_seq = 0
+        # None = showing the live (always-current) snapshot. An int is an
+        # index into navigation_debug_log's events while the user is
+        # stepping through history with the </> buttons (paused only).
+        self._nav_debug_history_index = None
         self.editor_mode = False
         self.editor_tool = "rectangles"
         self.editor_interaction_mode = "paint"
@@ -239,6 +253,9 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas.editor_obstacle_move_started.connect(self.push_editor_undo_state)
         self.canvas.editor_obstacle_moved.connect(self.on_editor_obstacle_moved)
         self.canvas.editor_view_changed.connect(self.refresh_editor_status_label)
+        self.canvas.navigation_debug_step_back_button.clicked.connect(self.on_navigation_debug_step_back)
+        self.canvas.navigation_debug_step_forward_button.clicked.connect(self.on_navigation_debug_step_forward)
+        self.canvas.navigationDebugToggleRequested.connect(self.on_navigation_debug_eye_clicked)
 
         self.simulation_panel = self.build_config_panel()
         self.editor_panel = self.build_editor_panel()
@@ -544,6 +561,37 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         change while the simulation is running (see grid_overlay_toggle's
         exclusion from locked_during_run_widgets in config_panel.py)."""
         self.canvas.set_grid_overlay_enabled(bool(enabled))
+
+    def on_navigation_debug_eye_clicked(self) -> None:
+        """The canvas eye icon only emits navigationDebugToggleRequested
+        (never decides state itself, same as goalClicked) -- this reads the
+        current state and flips it, so there is exactly one control (the
+        eye icon) and exactly one place that decides the new value."""
+        self.on_navigation_debug_toggled(not self.navigation_debug_enabled)
+
+    def on_navigation_debug_toggled(self, enabled: bool) -> None:
+        """Apply the navigation debug on/off state.
+
+        Gates both snapshot capture (engine.py checks
+        self.navigation_debug_enabled before building a
+        NavigationDebugCapture at all -- zero cost while off) and its
+        rendering (canvas checks its own mirrored flag before drawing).
+        Never touches self.config, robot/agent state, or the simulation
+        itself -- only which values get computed for display -- so it is
+        intentionally allowed to change while paused or running. The
+        canvas eye icon is always visible (unlike a side-panel control),
+        so this can fire at any time, running or paused."""
+        self.navigation_debug_enabled = bool(enabled)
+        self.canvas.set_navigation_debug_enabled(bool(enabled))
+        if not enabled:
+            self.resume_navigation_debug_live_view()
+        self.update_navigation_debug_step_buttons()
+
+    def on_navigation_debug_step_back(self) -> None:
+        self.step_navigation_debug_history(-1)
+
+    def on_navigation_debug_step_forward(self) -> None:
+        self.step_navigation_debug_history(1)
 
     def move_robot_from_canvas(self, index: int, x: float, y: float) -> None:
         if self.running or self.robot is not None or bool(getattr(self, "robots", [])):

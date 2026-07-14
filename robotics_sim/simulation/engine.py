@@ -73,10 +73,12 @@ except ImportError:
 try:
     from robotics_sim.environment.collision_checker import (
         CollisionChecker,
+        CollisionReport,
         RobotSnapshot,
     )
 except ImportError:
     CollisionChecker = None
+    CollisionReport = None
     RobotSnapshot = None
 
 # New POO architecture — imported lazily inside methods to avoid circular deps.
@@ -90,6 +92,28 @@ except ImportError:  # pragma: no cover
     PlannerServices = None  # type: ignore[assignment]
 
 from robotics_sim.navigation.navigation_supervisor import NavigationSupervisor
+from robotics_sim.diagnostics.capture import (
+    NavigationDebugCapture,
+    PlanDebugCapture,
+    clearance_terms_from_report,
+)
+from robotics_sim.diagnostics.event_log import (
+    NavigationDebugEvent,
+    NavigationDebugEventKind,
+    NavigationDebugEventLog,
+)
+from robotics_sim.diagnostics.navigation_snapshot import (
+    ControllerDebug,
+    FrontierDebug,
+    Maybe,
+    NavigationDebugSnapshot,
+    PathDebug,
+    PlanningGridDebug,
+    Pose,
+    PredictedMotionDebug,
+    RouteValidationDebug,
+    SafetyDebug,
+)
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
 # canvas's grid overlay. The belief grid can be large, and copying it more
@@ -137,7 +161,13 @@ class PlannerWorker(QRunnable):
     Qt widgets or the live Robot object.
     """
 
-    def __init__(self, request_id: int, planner_kwargs: dict, path_simplifier: str):
+    def __init__(
+        self,
+        request_id: int,
+        planner_kwargs: dict,
+        path_simplifier: str,
+        debug_capture: "PlanDebugCapture | None" = None,
+    ):
         super().__init__()
         self.setAutoDelete(False)
         self.request_id = int(request_id)
@@ -148,6 +178,11 @@ class PlannerWorker(QRunnable):
         self.perf_reason = str(self.planner_kwargs.pop("__perf_reason__", "route_replan"))
         self.path_simplifier = str(path_simplifier)
         self.signals = PlannerWorkerSignals()
+        # Mutated during run() on the background thread; read back on the
+        # GUI thread from on_async_route_ready() only after route_ready has
+        # fired -- same safe handoff already used for route_plan_ms/
+        # route_plan_perf_line below (see the comment a few lines down).
+        self.debug_capture = debug_capture
 
     def run(self):
         if bool(self.planner_kwargs.get("__hold__", False)):
@@ -188,9 +223,12 @@ class PlannerWorker(QRunnable):
                 success, reason, waypoints = compute_planned_waypoints(
                     **self.planner_kwargs,
                     path_simplifier=self.path_simplifier,
+                    debug_capture=self.debug_capture,
                 )
             else:
-                success, reason, waypoints = compute_planned_waypoints(**self.planner_kwargs)
+                success, reason, waypoints = compute_planned_waypoints(
+                    **self.planner_kwargs, debug_capture=self.debug_capture
+                )
         except Exception as exc:  # noqa: BLE001 - report planner failures to GUI safely.
             success = False
             reason = f"planner worker failed: {exc}"
@@ -240,6 +278,31 @@ def current_route_repair_goal(agent) -> tuple[float, float] | None:
     return agent.active_path_goal_xy or agent.exploration_target_xy
 
 
+def _evaluate_route_first_segment(
+    collision_checker,
+    start_xy: tuple[float, float],
+    target_xy: tuple[float, float] | None,
+    obstacle_points: list[tuple[float, float]],
+    robot_radius: float,
+):
+    """Run the same CollisionChecker.check_segment_points() rule
+    build_observation() uses to compute active_segment_blocked, and return
+    the full CollisionReport (never reduced to a bool) so callers can
+    surface the real blocking point/reason for diagnostics instead of only
+    the accept/reject decision. Returns None when there is nothing to check
+    (no collision_checker or no target), matching route_first_segment_blocked's
+    prior "not blocked" default for that case.
+    """
+    if collision_checker is None or target_xy is None:
+        return None
+    return collision_checker.check_segment_points(
+        start=start_xy,
+        end=target_xy,
+        obstacle_points=list(obstacle_points),
+        robot_radius=float(robot_radius),
+    )
+
+
 def route_first_segment_blocked(
     collision_checker,
     start_xy: tuple[float, float],
@@ -258,17 +321,14 @@ def route_first_segment_blocked(
 
     A module-level function (not a method) so it can be unit-tested with a
     plain CollisionChecker instance, without instantiating the Qt-based
-    simulation engine.
+    simulation engine. Thin wrapper around _evaluate_route_first_segment()
+    -- identical computation/behavior, kept so every existing caller/test
+    using this exact name and bool return type is unaffected.
     """
-    if collision_checker is None or target_xy is None:
-        return False
-    report = collision_checker.check_segment_points(
-        start=start_xy,
-        end=target_xy,
-        obstacle_points=list(obstacle_points),
-        robot_radius=float(robot_radius),
+    report = _evaluate_route_first_segment(
+        collision_checker, start_xy, target_xy, obstacle_points, robot_radius
     )
-    return bool(report.collision)
+    return False if report is None else bool(report.collision)
 
 
 def route_reaches_goal(
@@ -286,6 +346,74 @@ def route_reaches_goal(
     unchanged.
     """
     return NavigationSupervisor.validate_route_endpoint(waypoints, goal, tolerance)
+
+
+def _navigation_debug_explanation(
+    *,
+    tracking_mode: str,
+    decision_kind: str,
+    decision_reason: str,
+    controller: "ControllerDebug",
+    rotate_threshold: "Maybe",
+    safety: "SafetyDebug",
+    predicted_motion: "PredictedMotionDebug",
+    route: "RouteValidationDebug",
+) -> str:
+    """One-line human explanation of what the robot is doing right now,
+    built only from fields already present on this same snapshot -- never a
+    separate inference over engine/agent state. A module-level pure
+    function so it is directly unit-testable without a real engine/robot.
+    """
+    if tracking_mode == "ROTATE" and not controller.heading_error.unavailable and not rotate_threshold.unavailable:
+        return (
+            f"ROTATE: heading error {math.degrees(abs(controller.heading_error.value)):.1f}° "
+            f"exceeds {math.degrees(rotate_threshold.value):.1f}°."
+        )
+
+    if (
+        not predicted_motion.collision.unavailable
+        and predicted_motion.collision.value is not None
+        and predicted_motion.collision.value.blocked
+    ):
+        terms = predicted_motion.collision.value
+        d = "n/a" if terms.distance.unavailable else f"{terms.distance.value:.2f}"
+        return f"STOP: predicted clearance {d} m is at/under required {terms.required_clearance:.2f} m."
+
+    if (
+        not safety.active_segment.unavailable
+        and safety.active_segment.value is not None
+        and safety.active_segment.value.blocked
+    ):
+        terms = safety.active_segment.value
+        d = "n/a" if terms.distance.unavailable else f"{terms.distance.value:.2f}"
+        return f"STOP: active segment blocked (clearance {d} m < required {terms.required_clearance:.2f} m)."
+
+    if decision_kind == "REPLAN_FOR_SAFETY":
+        return f"REPLAN: {decision_reason or 'a safety condition triggered a replan'}."
+
+    if (
+        not route.first_segment.unavailable
+        and route.first_segment.value is not None
+        and route.first_segment.value.blocked
+    ):
+        return "HOLD: planner rejected the first segment of the route."
+
+    if decision_kind == "ACCEPT_PENDING_PATH":
+        return "TARGET CHANGED: accepting the prefetched path for the next target."
+
+    if tracking_mode == "TRACK":
+        return "TRACK: heading aligned; moving toward the active waypoint."
+
+    if decision_kind == "HOLD":
+        return f"HOLD: {decision_reason}." if decision_reason else "HOLD: no active route to follow."
+
+    if tracking_mode == "STOP":
+        return "STOP: waypoint reached within goal tolerance."
+
+    if tracking_mode == "IDLE":
+        return "IDLE: no active target."
+
+    return f"{decision_kind}: {decision_reason}." if decision_reason else f"{decision_kind}."
 
 
 def _emit_robot_trace(engine, method: str, **kwargs) -> None:
@@ -1002,16 +1130,24 @@ class SimulationControllerMixin:
         planner_kwargs: dict,
         *,
         path_simplifier: str | None = None,
+        debug_capture: PlanDebugCapture | None = None,
     ) -> tuple[bool, str, list[tuple[float, float]]]:
-        """Call the planner without spamming TypeError fallback messages."""
+        """Call the planner without spamming TypeError fallback messages.
+
+        debug_capture: optional outparam forwarded straight through to
+        compute_planned_waypoints(); None (the default, used by every
+        caller that does not care) costs nothing extra.
+        """
         if bool(planner_kwargs.get("__hold__", False)):
             return False, str(planner_kwargs.get("__hold_reason__", "holding position")), []
 
         if compute_planned_waypoints is None:
             return False, "planner package is not available", []
         if path_simplifier is not None and self.planner_accepts_path_simplifier():
-            return compute_planned_waypoints(**planner_kwargs, path_simplifier=path_simplifier)
-        return compute_planned_waypoints(**planner_kwargs)
+            return compute_planned_waypoints(
+                **planner_kwargs, path_simplifier=path_simplifier, debug_capture=debug_capture
+            )
+        return compute_planned_waypoints(**planner_kwargs, debug_capture=debug_capture)
 
 
     def build_planner_kwargs(self, start_xy: tuple[float, float]) -> dict:
@@ -1906,20 +2042,32 @@ class SimulationControllerMixin:
         """
         planner_kwargs = self.build_planner_kwargs(start_xy)
         if bool(planner_kwargs.get("__hold__", False)):
+            self._nav_debug_last_plan_capture = None
             return False, str(planner_kwargs.get("__hold_reason__", "holding position")), []
         goal_xy = tuple(planner_kwargs["goal_xy"])
 
         if self.config.planner_type == "Direct":
+            self._nav_debug_last_plan_capture = None
             return True, f"direct route; {self.last_goal_selection_reason}", [goal_xy]
 
         if compute_planned_waypoints is None:
+            self._nav_debug_last_plan_capture = None
             return False, "planner package is not available", []
 
-
-        return self.call_compute_planned_waypoints(
+        # Stashed on self (not returned/passed as a parameter) so this
+        # method's call signature never changes -- several existing tests
+        # replace compute_route()/apply_route_result() with fixed-arity
+        # lambdas; apply_route_result() reads this back via getattr(). See
+        # _finalize_navigation_debug_snapshot() docstring for the same
+        # defensive getattr pattern.
+        debug_capture = PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None
+        result = self.call_compute_planned_waypoints(
             planner_kwargs,
             path_simplifier=self.config.path_simplifier,
+            debug_capture=debug_capture,
         )
+        self._nav_debug_last_plan_capture = debug_capture
+        return result
 
     def planner_label(self) -> str:
         exploration = self.config.exploration_planner
@@ -2033,6 +2181,13 @@ class SimulationControllerMixin:
         if self.robot is None:
             return
 
+        # Consumed unconditionally (not just on the success path below) so a
+        # capture from one call never leaks into a later, unrelated
+        # apply_route_result() call (e.g. a hold/failure result that never
+        # reaches the success branch that would otherwise clear it).
+        pending_plan_capture = getattr(self, "_nav_debug_last_plan_capture", None)
+        self._nav_debug_last_plan_capture = None
+
         self.route_result_count += 1
 
         if success and waypoints:
@@ -2050,13 +2205,22 @@ class SimulationControllerMixin:
             # immediately trip REPLAN_FOR_SAFETY again for the route we just
             # assigned, producing a safety-replan loop instead of a working
             # route. Falls through to the shared failure-handling code below.
+            #
+            # Computed via _evaluate_route_first_segment() (not the bool-only
+            # route_first_segment_blocked() wrapper) so the full CollisionReport
+            # -- blocking point, distance, reason -- survives for the
+            # navigation debug snapshot below instead of being reduced to a
+            # bare bool. Same single computation either way.
             start_xy = (float(self.robot.x), float(self.robot.y))
-            blocked_on_arrival = bool(clean_waypoints) and route_first_segment_blocked(
+            first_segment_report = _evaluate_route_first_segment(
                 self.collision_checker,
                 start_xy,
-                clean_waypoints[0],
+                clean_waypoints[0] if clean_waypoints else None,
                 list(self.mapped_obstacle_points),
                 self.safety_radius(),
+            )
+            blocked_on_arrival = bool(clean_waypoints) and bool(
+                first_segment_report is not None and first_segment_report.collision
             )
 
             # Reject a route that claims success but whose final waypoint
@@ -2069,12 +2233,41 @@ class SimulationControllerMixin:
             # "frontier reached" never fires and STATE keeps showing a
             # stale target/path_goal forever.
             misses_intended_goal = False
+            endpoint_reaches_goal_debug = None
             if not blocked_on_arrival and self.is_exploration_mode() and clean_waypoints:
                 intended_goal = self.current_exploration_target
-                if intended_goal is not None and not route_reaches_goal(
-                    clean_waypoints, intended_goal, float(self.config.goal_tolerance)
-                ):
-                    misses_intended_goal = True
+                if intended_goal is not None:
+                    misses_intended_goal = not route_reaches_goal(
+                        clean_waypoints, intended_goal, float(self.config.goal_tolerance)
+                    )
+                    endpoint_reaches_goal_debug = not misses_intended_goal
+
+            # Navigation debug diagnostics only -- observational, never
+            # affects blocked_on_arrival/misses_intended_goal or any
+            # acceptance decision below. Off by default (see
+            # navigation_debug_enabled), and getattr-guarded so lightweight
+            # duck-typed engine fakes used elsewhere in the test suite (which
+            # do not set this attribute at all) are unaffected.
+            if getattr(self, "navigation_debug_enabled", False):
+                nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
+                if first_segment_report is not None:
+                    nav_capture.first_segment = clearance_terms_from_report(
+                        first_segment_report,
+                        checker="check_segment_points",
+                        required_clearance=self.safety_radius(),
+                    )
+                nav_capture.endpoint_reaches_goal = endpoint_reaches_goal_debug
+                self._finalize_navigation_debug_snapshot(
+                    agent=self.runtime_agent(None),
+                    decision_kind="ROUTE_RESULT",
+                    decision_reason=reason,
+                    event_kind=(
+                        NavigationDebugEventKind.ROUTE_REJECTED
+                        if (blocked_on_arrival or misses_intended_goal)
+                        else NavigationDebugEventKind.PLAN_ACCEPTED
+                    ),
+                    capture=nav_capture,
+                )
 
             if blocked_on_arrival:
                 reason = f"{reason}; rejected: first segment blocked on arrival"
@@ -2222,6 +2415,283 @@ class SimulationControllerMixin:
             f"Planner failed: {reason}. Falling back to direct goal."
         )
 
+    def _navigation_debug_event_kind_for_decision(
+        self, decision, predicted_report
+    ) -> NavigationDebugEventKind:
+        """Map a per-tick NavigationDecision (+ this tick's predicted-collision
+        report, if any) to the navigation-debug event vocabulary.
+
+        Reuses the exact "exploration exhausted" substring check
+        apply_navigation_decision() already uses for its own EXHAUSTION_DIAG
+        logging (see the `kind == "HOLD" and "exploration exhausted" in
+        str(decision.reason)` condition further down in this file) rather
+        than inventing a second detection rule for the same condition.
+        """
+        if predicted_report is not None and getattr(predicted_report, "collision", False):
+            return NavigationDebugEventKind.PREDICTED_COLLISION
+        kind = str(getattr(decision, "kind", ""))
+        reason = str(getattr(decision, "reason", ""))
+        if kind == "REPLAN_FOR_SAFETY":
+            return NavigationDebugEventKind.SAFETY_REPLAN
+        if kind == "HOLD":
+            if "exploration exhausted" in reason:
+                return NavigationDebugEventKind.EXHAUSTED
+            return NavigationDebugEventKind.HOLD
+        return NavigationDebugEventKind.TICK
+
+    def _finalize_navigation_debug_snapshot(
+        self,
+        *,
+        agent,
+        decision_kind: str,
+        decision_reason: str,
+        event_kind: NavigationDebugEventKind,
+        capture: NavigationDebugCapture | None = None,
+    ) -> None:
+        """Freeze `capture` into a NavigationDebugSnapshot using values
+        already known on self/agent at call time -- never recomputed here --
+        then push it to the bounded event log and (if present) the canvas.
+
+        Callers gate on self.navigation_debug_enabled themselves before
+        constructing a capture at all; this method re-checks defensively
+        (getattr-guarded so lightweight duck-typed engine fakes used
+        throughout the test suite, which do not set this attribute, are
+        unaffected) so it is always safe to call.
+        """
+        if not getattr(self, "navigation_debug_enabled", False) or self.robot is None:
+            return
+
+        capture = capture or NavigationDebugCapture()
+        robot = self.robot
+        robot_xy = (float(robot.x), float(robot.y))
+        robot_radius = self.body_radius_for_robot(robot)
+        safety_radius = self.safety_radius_for_robot(robot)
+
+        active_target = agent.active_target() if agent is not None else None
+        active_target_xy = None
+        if active_target is not None:
+            active_target_arr = np.asarray(active_target, dtype=float).reshape(-1)
+            active_target_xy = (float(active_target_arr[0]), float(active_target_arr[1]))
+
+        waypoints_mgr = getattr(agent, "waypoints", None) if agent is not None else None
+        active_path: tuple[tuple[float, float], ...] = ()
+        active_waypoint_index = None
+        if waypoints_mgr is not None and getattr(waypoints_mgr, "waypoints", None):
+            active_path = tuple(
+                (float(p[0]), float(p[1])) for p in waypoints_mgr.waypoints
+            )
+            active_waypoint_index = int(getattr(waypoints_mgr, "current_index", 0))
+
+        pending_path_raw = getattr(agent, "pending_path", None) if agent is not None else None
+        pending_path = tuple((float(p[0]), float(p[1])) for p in pending_path_raw) if pending_path_raw else ()
+
+        plan = capture.plan
+        path = PathDebug(
+            raw_path=Maybe.of(plan.raw_world_path) if plan and plan.raw_world_path is not None else Maybe.missing(),
+            simplified_path=(
+                Maybe.of(plan.simplified_world_path)
+                if plan and plan.simplified_world_path is not None
+                else Maybe.missing()
+            ),
+            active_path=active_path,
+            pending_path=pending_path,
+            active_segment=(robot_xy, active_target_xy) if active_target_xy is not None else None,
+            active_waypoint_index=active_waypoint_index,
+            planner_name=Maybe.of(plan.planner_name) if plan and plan.planner_name else Maybe.missing(),
+            simplifier_name=Maybe.of(plan.simplifier_name) if plan and plan.simplifier_name else Maybe.missing(),
+        )
+
+        route = RouteValidationDebug(
+            first_segment=Maybe.of(capture.first_segment) if capture.first_segment is not None else Maybe.missing(),
+            endpoint_reaches_goal=capture.endpoint_reaches_goal,
+        )
+
+        predicted_motion = PredictedMotionDebug(
+            trajectory=(
+                Maybe.of(capture.predicted_trajectory) if capture.predicted_trajectory is not None else Maybe.missing()
+            ),
+            collision=Maybe.of(capture.predicted_collision) if capture.predicted_collision is not None else Maybe.missing(),
+        )
+
+        safety = SafetyDebug(
+            robot_radius=float(robot_radius),
+            safety_radius=float(safety_radius),
+            active_segment=Maybe.of(capture.active_segment) if capture.active_segment is not None else Maybe.missing(),
+        )
+
+        planning_grid = PlanningGridDebug(
+            start_cell=Maybe.of(plan.start_cell) if plan and plan.start_cell is not None else Maybe.missing(),
+            start_cell_world=Maybe.of(plan.start_cell_world) if plan and plan.start_cell_world is not None else Maybe.missing(),
+            first_waypoint_cell=(
+                Maybe.of(plan.first_waypoint_cell) if plan and plan.first_waypoint_cell is not None else Maybe.missing()
+            ),
+            first_waypoint_world=(
+                Maybe.of(plan.first_waypoint_world) if plan and plan.first_waypoint_world is not None else Maybe.missing()
+            ),
+            unknown_is_traversable=(
+                Maybe.of(plan.unknown_is_traversable) if plan and plan.unknown_is_traversable is not None else Maybe.missing()
+            ),
+            start_cell_cleared=(
+                Maybe.of(plan.start_cell_cleared) if plan and plan.start_cell_cleared is not None else Maybe.missing()
+            ),
+        )
+
+        last_control = np.asarray(getattr(self, "last_control", None), dtype=float).reshape(-1) if getattr(
+            self, "last_control", None
+        ) is not None else None
+        controller = ControllerDebug(
+            v=float(robot.v),
+            omega=float(last_control[1]) if last_control is not None and last_control.size >= 2 else 0.0,
+            acceleration=float(last_control[0]) if last_control is not None and last_control.size >= 1 else 0.0,
+            heading_error=Maybe.of(capture.heading_error) if capture.heading_error is not None else Maybe.missing(),
+            distance_to_goal=Maybe.of(capture.distance_to_goal) if capture.distance_to_goal is not None else Maybe.missing(),
+            desired_heading=Maybe.of(capture.desired_heading) if capture.desired_heading is not None else Maybe.missing(),
+            nominal_control=Maybe.of(capture.nominal_control) if capture.nominal_control is not None else Maybe.missing(),
+            applied_control=Maybe.of(capture.applied_control) if capture.applied_control is not None else Maybe.missing(),
+        )
+
+        frontier = FrontierDebug(
+            candidate_count=Maybe.missing(),
+            selected_target=Maybe.missing(),
+            selected_score=Maybe.missing(),
+            reason=Maybe.missing(),
+        )
+
+        # tracking_mode/rotate_threshold: read directly off the robot's
+        # already-updated TrackingStateMachine (Robot.update_state_machine()
+        # runs earlier this tick, before nominal_control_safe() is called) --
+        # not recomputed. Which threshold is "active" depends on hysteresis:
+        # ROTATE watches the lower rotate_to_track_threshold to exit; TRACK
+        # (and the initial IDLE evaluation) watches track_to_rotate_threshold
+        # (IDLE actually uses rotate_to_track_threshold too -- see
+        # TrackingStateMachine.update()); STOP/BLOCKED/FAILED have no active
+        # rotate/track threshold.
+        state_machine = getattr(robot, "state_machine", None)
+        tracking_mode = ""
+        rotate_threshold = Maybe.missing()
+        if state_machine is not None:
+            mode_obj = getattr(state_machine, "mode", None)
+            tracking_mode = str(getattr(mode_obj, "value", mode_obj) or "")
+            if tracking_mode == "ROTATE" or tracking_mode == "IDLE":
+                rotate_threshold = Maybe.of(float(state_machine.rotate_to_track_threshold))
+            elif tracking_mode == "TRACK":
+                rotate_threshold = Maybe.of(float(state_machine.track_to_rotate_threshold))
+
+        explanation = _navigation_debug_explanation(
+            tracking_mode=tracking_mode,
+            decision_kind=str(decision_kind),
+            decision_reason=str(decision_reason),
+            controller=controller,
+            rotate_threshold=rotate_threshold,
+            safety=safety,
+            predicted_motion=predicted_motion,
+            route=route,
+        )
+
+        self._nav_debug_seq = getattr(self, "_nav_debug_seq", 0) + 1
+        snapshot = NavigationDebugSnapshot(
+            snapshot_id=self._nav_debug_seq,
+            simulation_time=float(getattr(self, "simulation_time", 0.0)),
+            robot_id="R1",
+            navigation_state=str(getattr(agent, "status", "idle")),
+            decision_kind=str(decision_kind),
+            decision_reason=str(decision_reason),
+            robot_pose=Pose(x=robot_xy[0], y=robot_xy[1], theta=float(robot.theta), v=float(robot.v)),
+            path=path,
+            route=route,
+            predicted_motion=predicted_motion,
+            safety=safety,
+            planning_grid=planning_grid,
+            controller=controller,
+            frontier=frontier,
+            tracking_mode=tracking_mode,
+            rotate_threshold=rotate_threshold,
+            explanation=explanation,
+        )
+
+        # The ring buffer only ever receives relevant events (see the brief:
+        # "No guardar cada render frame ... Guardar cambios de decisión y
+        # eventos relevantes") -- a routine FOLLOW_PATH/BRAKE/REQUEST_PLAN
+        # tick maps to NavigationDebugEventKind.TICK and is deliberately
+        # never pushed here, or 800 routine ticks would evict every
+        # actually-interesting historical event within a couple of seconds.
+        # The canvas still gets every snapshot below so the live overlay/HUD
+        # stays current while running; pausing just stops these calls, which
+        # is what leaves the last relevant *event* (not just the last live
+        # snapshot) intact for inspection.
+        canvas = getattr(self, "canvas", None)
+
+        if event_kind is not NavigationDebugEventKind.TICK:
+            log = getattr(self, "navigation_debug_log", None)
+            if log is not None:
+                log.record(event_kind, snapshot)
+            # Pushed separately from the always-current "live" snapshot
+            # below so the HUD can show "last relevant event" even on a
+            # tick where nothing relevant just happened (e.g. the robot is
+            # calmly following a path two seconds after a ROUTE_REJECTED).
+            if canvas is not None and hasattr(canvas, "set_navigation_debug_last_event"):
+                canvas.set_navigation_debug_last_event(NavigationDebugEvent(event_kind, snapshot))
+
+        if canvas is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
+            canvas.set_navigation_debug_snapshot(snapshot)
+
+    def navigation_debug_history_length(self) -> int:
+        log = getattr(self, "navigation_debug_log", None)
+        return len(log) if log is not None else 0
+
+    def _push_navigation_debug_history_view(self, index: int) -> None:
+        """Push the snapshot/event at `index` in the bounded event log to
+        the canvas as the displayed view -- used only while paused and
+        stepping. Never recomputes anything: `index` selects an already-
+        frozen NavigationDebugSnapshot the log already holds."""
+        log = getattr(self, "navigation_debug_log", None)
+        if log is None:
+            return
+        event = log.event_at(index)
+        if event is None:
+            return
+
+        self._nav_debug_history_index = index
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        if hasattr(canvas, "set_navigation_debug_snapshot"):
+            canvas.set_navigation_debug_snapshot(event.snapshot)
+        if hasattr(canvas, "set_navigation_debug_last_event"):
+            canvas.set_navigation_debug_last_event(event)
+        if hasattr(canvas, "set_navigation_debug_history_position"):
+            canvas.set_navigation_debug_history_position(index + 1, len(log))
+
+    def step_navigation_debug_history(self, delta: int) -> None:
+        """Step backward (delta<0) / forward (delta>0) through the bounded
+        relevant-event ring buffer. No-op unless both navigation_debug_enabled
+        and paused -- while running, the per-tick live push in
+        _finalize_navigation_debug_snapshot() would immediately overwrite
+        whatever this selects, so stepping only makes sense at rest."""
+        if not getattr(self, "navigation_debug_enabled", False) or not getattr(self, "paused", False):
+            return
+        length = self.navigation_debug_history_length()
+        if length == 0:
+            return
+
+        current = getattr(self, "_nav_debug_history_index", None)
+        if current is None:
+            # First step away from "live" starts at the latest relevant
+            # event, then moves from there.
+            current = length - 1
+        new_index = max(0, min(length - 1, current + int(delta)))
+        self._push_navigation_debug_history_view(new_index)
+
+    def resume_navigation_debug_live_view(self) -> None:
+        """Return to the live (always-current) snapshot view. Called when
+        the simulation resumes from pause so a stale historical snapshot
+        never lingers once new ticks start pushing again, and so the next
+        pause starts stepping from "latest" rather than a stale index."""
+        self._nav_debug_history_index = None
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None and hasattr(canvas, "set_navigation_debug_history_position"):
+            canvas.set_navigation_debug_history_position(None, self.navigation_debug_history_length())
+
     def assign_route_to_robot(self) -> None:
         if self.robot is None:
             return
@@ -2303,6 +2773,7 @@ class SimulationControllerMixin:
             request_id=request_id,
             planner_kwargs=planner_kwargs,
             path_simplifier=self.config.path_simplifier,
+            debug_capture=PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None,
         )
         worker.signals.route_ready.connect(self.on_async_route_ready)
         self.active_planner_workers[request_id] = worker
@@ -3133,6 +3604,21 @@ class SimulationControllerMixin:
             self.start_button.setText("Pause Simulation")
             self.start_button.setIcon(make_icon("pause", "white"))
 
+    def update_navigation_debug_step_buttons(self) -> None:
+        """Enable the </> history-step buttons only while both the debug
+        layer is on and the simulation is paused -- stepping while running
+        would fight the live per-tick snapshot push (see
+        step_navigation_debug_history()'s own no-op guard, mirrored here
+        purely for the widgets' enabled state)."""
+        can_step = bool(getattr(self, "navigation_debug_enabled", False)) and bool(getattr(self, "paused", False))
+        canvas = getattr(self, "canvas", None)
+        back_button = getattr(canvas, "navigation_debug_step_back_button", None)
+        forward_button = getattr(canvas, "navigation_debug_step_forward_button", None)
+        if back_button is not None:
+            back_button.setEnabled(can_step)
+        if forward_button is not None:
+            forward_button.setEnabled(can_step)
+
     def handle_start_pause_button(self) -> None:
         has_runtime_robot = self.robot is not None or bool(getattr(self, "robots", []))
         if not self.running or not has_runtime_robot:
@@ -3780,6 +4266,9 @@ class SimulationControllerMixin:
         self.last_goal_selection_reason = "multi-robot baseline using shared final goal"
         self.route_request_count = 0
         self.route_result_count = 0
+        self.navigation_debug_log = NavigationDebugEventLog()
+        self._nav_debug_seq = 0
+        self._nav_debug_history_index = None
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -3933,6 +4422,9 @@ class SimulationControllerMixin:
         self.last_goal_selection_reason = "using final mission goal"
         self.route_request_count = 0
         self.route_result_count = 0
+        self.navigation_debug_log = NavigationDebugEventLog()
+        self._nav_debug_seq = 0
+        self._nav_debug_history_index = None
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -4005,6 +4497,9 @@ class SimulationControllerMixin:
         self.last_goal_selection_reason = "using final mission goal"
         self.route_request_count = 0
         self.route_result_count = 0
+        self.navigation_debug_log = NavigationDebugEventLog()
+        self._nav_debug_seq = 0
+        self._nav_debug_history_index = None
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -4060,8 +4555,10 @@ class SimulationControllerMixin:
             self.last_time = time.perf_counter()
             self.canvas.set_status("Simulation running.")
             self.top_bar.set_status("running")
+            self.resume_navigation_debug_live_view()
 
         self.update_start_pause_button()
+        self.update_navigation_debug_step_buttons()
 
     def set_goal_from_canvas(self, gx: float, gy: float):
         self.goal_x_input.setValue(gx)
@@ -4218,10 +4715,20 @@ class SimulationControllerMixin:
         self.top_bar.set_status("paused")
         self.update_start_pause_button()
 
-    def nominal_control_safe(self, blocked: bool = False) -> np.ndarray:
+    def nominal_control_safe(self, blocked: bool = False, capture=None) -> np.ndarray:
         """
         Call the robot nominal controller while supporting old and new APIs.
+
+        capture: optional NavigationDebugCapture, forwarded down to
+        TrackingController.compute_control() so it can stash heading_error/
+        distance_to_goal when navigation_debug_enabled. Falls back to the
+        capture-less/blocked-less call shapes for older Robot
+        implementations that do not accept these kwargs yet.
         """
+        try:
+            return self.robot.nominal_control(blocked=blocked, capture=capture)
+        except TypeError:
+            pass
         try:
             return self.robot.nominal_control(blocked=blocked)
         except TypeError:
@@ -4746,6 +5253,7 @@ class SimulationControllerMixin:
         robot_radius: float,
         known_obstacle_points: list[tuple[float, float]] | None = None,
         use_ground_truth: bool = True,
+        capture=None,
     ):
         """Check short-horizon motion before applying a control.
 
@@ -4754,6 +5262,14 @@ class SimulationControllerMixin:
         are also checked as a simulator integrity guard: the simulator should
         stop before a collision, not after the robot has already entered an
         obstacle safety region.
+
+        capture: optional NavigationDebugCapture. When provided, stashes the
+        predicted trajectory (predict_unicycle_points() already computes
+        this internally per check call below, but never returns it -- an
+        extra cheap 10-step kinematic rollout when capture is requested is
+        the simplest way to surface it without changing the checker's
+        public return type) and the ClearanceTerms for whichever check
+        found a collision, if any. None (the default) costs nothing extra.
         """
         if self.collision_checker is None:
             return None
@@ -4764,6 +5280,11 @@ class SimulationControllerMixin:
         safe_dt = max(float(dt), 1e-3)
         steps = 10
 
+        if capture is not None and hasattr(self.collision_checker, "predict_unicycle_points"):
+            capture.predicted_trajectory = tuple(
+                self.collision_checker.predict_unicycle_points(snapshot, control, safe_dt, steps)
+            )
+
         if known_obstacle_points and hasattr(self.collision_checker, "check_predicted_motion_points"):
             report = self.collision_checker.check_predicted_motion_points(
                 snapshot=snapshot,
@@ -4773,6 +5294,15 @@ class SimulationControllerMixin:
                 obstacle_points=known_obstacle_points,
                 robot_radius=robot_radius,
             )
+            # Captured on BOTH outcomes (not only collision=True) -- a clear
+            # result is real, informative data ("checked, nothing found"),
+            # not the same as "this check never ran". Whichever check runs
+            # last below overwrites this with its own outcome, matching
+            # which check actually gated the return value.
+            if capture is not None:
+                capture.predicted_collision = clearance_terms_from_report(
+                    report, checker="check_predicted_motion_points", required_clearance=robot_radius
+                )
             if getattr(report, "collision", False):
                 return report
 
@@ -4785,6 +5315,10 @@ class SimulationControllerMixin:
                 obstacles=self.config.obstacles,
                 robot_radius=robot_radius,
             )
+            if capture is not None:
+                capture.predicted_collision = clearance_terms_from_report(
+                    report, checker="check_predicted_motion", required_clearance=robot_radius
+                )
             if getattr(report, "collision", False):
                 return report
 
@@ -5332,15 +5866,22 @@ class SimulationControllerMixin:
         if agent is not None and RobotObservation is not None:
             # ── New OOP flow ──────────────────────────────────────────────
             # build_observation pre-computes active_segment_blocked.
+            #
+            # nav_debug_capture is None (the default, zero extra cost) unless
+            # navigation_debug_enabled -- see _finalize_navigation_debug_snapshot()
+            # for how it is frozen into a NavigationDebugSnapshot below.
+            nav_debug_capture = (
+                NavigationDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None
+            )
             _runtime_state_build_perf_start = time.perf_counter()
-            obs = self.build_observation(self.robot, agent, None)
+            obs = self.build_observation(self.robot, agent, None, capture=nav_debug_capture)
             _record_perf(self, "runtime_state_build", time.perf_counter() - _runtime_state_build_perf_start)
 
             # Compute nominal control first so predicted_motion_report() can
             # use it; pass the blocked flag so the controller can slow down.
             _controller_perf_start = time.perf_counter()
             self.last_control = self.nominal_control_safe(
-                blocked=obs.active_segment_blocked
+                blocked=obs.active_segment_blocked, capture=nav_debug_capture
             )
 
             predicted_report = self.predicted_motion_report(
@@ -5349,6 +5890,7 @@ class SimulationControllerMixin:
                 robot_radius=robot_radius,
                 known_obstacle_points=list(self.mapped_obstacle_points),
                 use_ground_truth=True,
+                capture=nav_debug_capture,
             )
             _record_perf(self, "controller", time.perf_counter() - _controller_perf_start)
             if predicted_report is not None and getattr(predicted_report, "collision", False):
@@ -5362,6 +5904,15 @@ class SimulationControllerMixin:
             _apply_decision_perf_start = time.perf_counter()
             should_brake = self.apply_navigation_decision(self.robot, agent, decision)
             _record_perf(self, "apply_decision", time.perf_counter() - _apply_decision_perf_start)
+
+            if nav_debug_capture is not None:
+                self._finalize_navigation_debug_snapshot(
+                    agent=agent,
+                    decision_kind=str(decision.kind),
+                    decision_reason=str(decision.reason),
+                    event_kind=self._navigation_debug_event_kind_for_decision(decision, predicted_report),
+                    capture=nav_debug_capture,
+                )
 
             if should_brake:
                 self.last_control = self.brake_control_for_collision()
@@ -5630,7 +6181,7 @@ class SimulationControllerMixin:
             )
         return _is_reachable
 
-    def build_observation(self, robot, agent, robot_index=None):
+    def build_observation(self, robot, agent, robot_index=None, capture=None):
         """
         Build a RobotObservation snapshot for one robot.
 
@@ -5645,6 +6196,12 @@ class SimulationControllerMixin:
             The RobotAgent for this robot.
         robot_index:
             Index in self.robots (None for single-robot mode).
+        capture:
+            Optional NavigationDebugCapture. When provided, stashes the
+            CollisionReport already computed below (checker, blocking point,
+            distance) instead of discarding it down to
+            active_segment_blocked's bare bool. None (the default) costs
+            nothing extra.
         """
         if RobotObservation is None:
             return None
@@ -5670,6 +6227,10 @@ class SimulationControllerMixin:
                     robot_radius=robot_radius,
                 )
                 active_segment_blocked = bool(report.collision)
+                if capture is not None:
+                    capture.active_segment = clearance_terms_from_report(
+                        report, checker="check_segment_points", required_clearance=robot_radius
+                    )
 
         # Dynamic obstacles: other robots as (cx, cy, radius) disks.
         dynamic_obstacles: list[tuple[float, float, float]] = []
@@ -6131,6 +6692,7 @@ class SimulationControllerMixin:
             request_id=request_id,
             planner_kwargs=planner_kwargs,
             path_simplifier=self.config.path_simplifier,
+            debug_capture=PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None,
         )
         # Capture idx in the closure so stale callbacks go to the right robot.
         captured_idx = idx
@@ -6174,7 +6736,8 @@ class SimulationControllerMixin:
 
         if not hasattr(self, "prefetch_workers"):
             return
-        self.prefetch_workers.pop(idx, None)
+        prefetch_worker = self.prefetch_workers.pop(idx, None)
+        pending_plan_capture = getattr(prefetch_worker, "debug_capture", None)
 
         # Stale result: a newer prefetch was started for this robot slot.
         stored_id = getattr(self, "prefetch_request_ids", {}).get(idx)
@@ -6217,6 +6780,14 @@ class SimulationControllerMixin:
                 self.log_console_message(
                     f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
                 )
+                if getattr(self, "navigation_debug_enabled", False):
+                    self._finalize_navigation_debug_snapshot(
+                        agent=agent,
+                        decision_kind="ROUTE_RESULT",
+                        decision_reason=f"{reason}; rejected: final waypoint does not reach path goal",
+                        event_kind=NavigationDebugEventKind.ROUTE_REJECTED,
+                        capture=NavigationDebugCapture(plan=pending_plan_capture, endpoint_reaches_goal=False),
+                    )
                 return
 
             # Reject a prefetch whose first segment (FROM THE ROBOT'S
@@ -6226,14 +6797,24 @@ class SimulationControllerMixin:
             # path. Without this, a prefetch computed before new obstacle
             # samples appeared near the route could still be promoted via
             # ACCEPT_PENDING_PATH straight into a now-unsafe segment.
+            #
+            # Uses _evaluate_route_first_segment() (not the bool-only
+            # route_first_segment_blocked() wrapper) so the full
+            # CollisionReport survives for the navigation debug snapshot --
+            # same single computation either way.
             robot_xy_now = (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None
-            if robot_xy_now is not None and route_first_segment_blocked(
-                self.collision_checker,
-                robot_xy_now,
-                clean_waypoints[0],
-                list(self.mapped_obstacle_points),
-                self.safety_radius(),
-            ):
+            first_segment_report = (
+                _evaluate_route_first_segment(
+                    self.collision_checker,
+                    robot_xy_now,
+                    clean_waypoints[0],
+                    list(self.mapped_obstacle_points),
+                    self.safety_radius(),
+                )
+                if robot_xy_now is not None
+                else None
+            )
+            if first_segment_report is not None and first_segment_report.collision:
                 rejected_target = agent.pending_target_xy
                 agent.first_segment_blocked_count += 1
                 agent.reject_pending_path(f"{reason}; first segment blocked on arrival")
@@ -6244,6 +6825,20 @@ class SimulationControllerMixin:
                 self.log_console_message(
                     f"[PREFETCH] rejected: first segment blocked on arrival; {reason}"
                 )
+                if getattr(self, "navigation_debug_enabled", False):
+                    nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
+                    nav_capture.first_segment = clearance_terms_from_report(
+                        first_segment_report,
+                        checker="check_segment_points",
+                        required_clearance=self.safety_radius(),
+                    )
+                    self._finalize_navigation_debug_snapshot(
+                        agent=agent,
+                        decision_kind="ROUTE_RESULT",
+                        decision_reason=f"{reason}; rejected: first segment blocked on arrival",
+                        event_kind=NavigationDebugEventKind.ROUTE_REJECTED,
+                        capture=nav_capture,
+                    )
                 return
 
             agent.pending_path = clean_waypoints

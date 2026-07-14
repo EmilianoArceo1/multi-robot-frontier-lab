@@ -33,7 +33,10 @@ long ticks can hide inside an otherwise-low average).
 
 unaccounted_ms = avg_sim_step_ms minus the sum of the TOP-LEVEL, mutually
 non-overlapping sections measured INSIDE simulation_step() (see
-_UNACCOUNTED_SECTIONS below). Deliberately excludes:
+_UNACCOUNTED_SECTIONS below) -- see per_tick_ms()'s docstring for why that
+sum MUST be normalized by the same denominator as avg_sim_step_ms (total
+sim_step ticks in the window), not by each phase's own occurrence count.
+Deliberately excludes:
     - render_ms: paintEvent runs on a separate Qt callback, not nested
       inside simulation_step() at all, and is not reset per-window the
       same way (it is RenderPerfMonitor's own short rolling average) --
@@ -53,6 +56,32 @@ _UNACCOUNTED_SECTIONS below). Deliberately excludes:
       part of this tick's sim_step_ms in the first place. They are still
       reported on the [PERF] line as their own fields for visibility into
       which one dominates -- just not folded into unaccounted_ms.
+
+Exhausted-idle fast path accounting (see engine.py's
+_exhausted_idle_fast_path_ready()): a fast-path-skip tick records a
+"sim_step" sample but none of the _UNACCOUNTED_SECTIONS phase samples (it
+returns before reaching any of them), while a full-pipeline tick records
+both. In a window with many skip ticks and few full ticks, average_ms(phase)
+-- phase_sum / phase's OWN occurrence count -- reports "cost when this
+phase actually runs", a much larger number than its true per-tick
+contribution. Summing several such per-occurrence averages and subtracting
+from avg_sim_step_ms (which IS diluted across every tick, skips included)
+mixed two different denominators and could go negative even though nothing
+was actually double-counted -- exactly the bug real Office.sim evidence
+caught (avg_sim_step_ms=0.6, obstacle_extract_ms=4.3, controller_ms=2.3,
+unaccounted_ms=-6.9). per_tick_ms() fixes this by dividing every phase's
+window sum by the SAME denominator as avg_sim_step_ms (total sim_step
+occurrences, fast-path-skips included) -- see its own docstring.
+fast_path_avg_ms/full_pipeline_avg_ms separately report the average
+sim_step cost of each tick category (engine.py records the same "sim_step"
+sample a second time under "sim_step_fast_path" or "sim_step_full_pipeline"
+depending on which branch simulation_step() took), so a reader can see "a
+skip tick costs ~0.05ms, a full tick costs ~5ms" without those two very
+different numbers being blended into one misleading average. The named
+per-phase fields (obstacle_extract_ms, controller_ms, etc.) are left as
+average_ms() -- per-occurrence -- since "how expensive is this phase when
+it runs" remains useful diagnostic information; only the unaccounted_ms
+SUM was the actual bug.
 """
 from __future__ import annotations
 
@@ -66,6 +95,14 @@ DEFAULT_LOG_INTERVAL_S = 2.0
 # compute unaccounted_ms -- see module docstring for why the others
 # (planner_dispatch, route_result_handling, pending_path_acceptance,
 # telemetry, console_log) are excluded.
+#
+# "misc" is the catch-all for remaining top-level glue that previously had
+# no dedicated timer at all (collision checks, path_points bookkeeping,
+# the grid-overlay snapshot push) -- it used to show up only as an opaque
+# part of unaccounted_ms. It is timed in non-overlapping engine.py
+# call-sites specifically so it never double-counts time already inside
+# another _UNACCOUNTED_SECTIONS entry (e.g. it is measured OUTSIDE
+# canvas_state_update's own timer, never wrapped around it).
 _UNACCOUNTED_SECTIONS: tuple[str, ...] = (
     "explored_update",
     "obstacle_extract",
@@ -78,6 +115,7 @@ _UNACCOUNTED_SECTIONS: tuple[str, ...] = (
     "motion_update",
     "canvas_state_update",
     "belief_snapshot",
+    "misc",
 )
 
 # Cumulative counters the caller reports each window; PerfMonitor diffs
@@ -89,6 +127,10 @@ _WINDOW_COUNTER_NAMES: tuple[str, ...] = (
     "safety_replans",
     "route_failures",
     "repeated_safety_replans",
+    "exhausted_idle_fast_path_hits",
+    "exhausted_idle_full_updates",
+    "exhausted_idle_skipped_canvas_updates",
+    "exhausted_idle_skipped_sensor_updates",
 )
 
 
@@ -100,6 +142,8 @@ def format_perf_summary_line(
     *,
     avg_sim_step_ms: float,
     max_sim_step_ms: float = 0.0,
+    fast_path_avg_ms: float = 0.0,
+    full_pipeline_avg_ms: float = 0.0,
     explored_update_ms: float = 0.0,
     obstacle_extract_ms: float = 0.0,
     belief_update_ms: float = 0.0,
@@ -117,7 +161,10 @@ def format_perf_summary_line(
     canvas_ms: float = 0.0,
     render_ms: float = 0.0,
     console_ms: float = 0.0,
+    misc_ms: float = 0.0,
+    top_level_sum_ms: float = 0.0,
     unaccounted_ms: float = 0.0,
+    phase_coverage_pct: float = 0.0,
     mapped_obs: int = 0,
     explored_percent: float | None = None,
     nav_state: str | None = None,
@@ -129,6 +176,10 @@ def format_perf_summary_line(
     safety_replans: int = 0,
     route_failures: int = 0,
     repeated_safety_replans: int = 0,
+    exhausted_idle_fast_path_hits: int = 0,
+    exhausted_idle_full_updates: int = 0,
+    exhausted_idle_skipped_canvas_updates: int = 0,
+    exhausted_idle_skipped_sensor_updates: int = 0,
 ) -> str:
     """Pure formatter, kept separate from PerfMonitor's timing/throttle
     state so the exact line format can be tested without driving a real
@@ -137,11 +188,23 @@ def format_perf_summary_line(
     explored_percent/nav_state are the only genuinely optional fields
     (omitted entirely, not shown as a placeholder, when not given/cheap);
     everything else always appears.
+
+    fast_path_avg_ms/full_pipeline_avg_ms report the average sim_step cost
+    of each tick CATEGORY separately (a fast-path-skip tick vs. a tick that
+    ran the full pipeline, including exhausted-idle heartbeat ticks) --
+    see PerfMonitor.per_tick_ms()'s docstring for why blending them into
+    one avg_sim_step_ms figure previously hid a denominator mismatch in
+    unaccounted_ms. top_level_sum_ms is the (correctly tick-normalized) sum
+    subtracted from avg_sim_step_ms to get unaccounted_ms; phase_coverage_pct
+    is top_level_sum_ms as a percentage of avg_sim_step_ms, for a quick
+    sanity check that the named phases account for most of a tick.
     """
     parts = [
         "[PERF]",
         f"avg_sim_step_ms={float(avg_sim_step_ms):.1f}",
         f"max_sim_step_ms={float(max_sim_step_ms):.1f}",
+        f"fast_path_avg_ms={float(fast_path_avg_ms):.2f}",
+        f"full_pipeline_avg_ms={float(full_pipeline_avg_ms):.2f}",
         f"explored_update_ms={float(explored_update_ms):.1f}",
         f"obstacle_extract_ms={float(obstacle_extract_ms):.1f}",
         f"belief_update_ms={float(belief_update_ms):.1f}",
@@ -159,7 +222,10 @@ def format_perf_summary_line(
         f"canvas_ms={float(canvas_ms):.1f}",
         f"render_ms={float(render_ms):.1f}",
         f"console_ms={float(console_ms):.1f}",
+        f"misc_ms={float(misc_ms):.1f}",
+        f"top_level_sum_ms={float(top_level_sum_ms):.1f}",
         f"unaccounted_ms={float(unaccounted_ms):.1f}",
+        f"phase_coverage_pct={float(phase_coverage_pct):.1f}",
         f"mapped_obs={int(mapped_obs)}",
     ]
     if explored_percent is not None:
@@ -175,6 +241,10 @@ def format_perf_summary_line(
         f"safety_replans={int(safety_replans)}",
         f"route_failures={int(route_failures)}",
         f"repeated_safety_replans={int(repeated_safety_replans)}",
+        f"exhausted_idle_fast_path_hits={int(exhausted_idle_fast_path_hits)}",
+        f"exhausted_idle_full_updates={int(exhausted_idle_full_updates)}",
+        f"exhausted_idle_skipped_canvas_updates={int(exhausted_idle_skipped_canvas_updates)}",
+        f"exhausted_idle_skipped_sensor_updates={int(exhausted_idle_skipped_sensor_updates)}",
     ])
     return " ".join(parts)
 
@@ -245,6 +315,25 @@ class PerfMonitor:
             return 0.0
         return 1000.0 * self._section_sum.get(phase, 0.0) / count
 
+    def per_tick_ms(self, phase: str) -> float:
+        """*phase*'s total time this window divided by the total number of
+        "sim_step" occurrences this window -- NOT by phase's own occurrence
+        count (that's what average_ms() does). Directly comparable to/
+        subtractable from avg_sim_step_ms, which is also normalized by the
+        total sim_step count.
+
+        This distinction only matters for a phase that does not run on
+        every tick (e.g. a section only reached on full-pipeline ticks,
+        skipped entirely by the exhausted-idle fast path): average_ms()
+        would report "cost when it happens to run", inflating its apparent
+        share of an average tick. per_tick_ms() reports "this phase's true
+        average contribution PER TICK", which is what unaccounted_ms's
+        subtraction requires to stay meaningful (see module docstring)."""
+        total_ticks = self._section_count.get("sim_step", 0)
+        if total_ticks == 0:
+            return 0.0
+        return 1000.0 * self._section_sum.get(phase, 0.0) / total_ticks
+
     def max_ms(self, phase: str) -> float:
         return 1000.0 * self._section_max.get(phase, 0.0)
 
@@ -278,6 +367,10 @@ class PerfMonitor:
         safety_replans: int = 0,
         route_failures: int = 0,
         repeated_safety_replans: int = 0,
+        exhausted_idle_fast_path_hits: int = 0,
+        exhausted_idle_full_updates: int = 0,
+        exhausted_idle_skipped_canvas_updates: int = 0,
+        exhausted_idle_skipped_sensor_updates: int = 0,
         log: Callable[[str], None] | None = None,
         now: float | None = None,
     ) -> bool:
@@ -289,10 +382,20 @@ class PerfMonitor:
         Every *_ms section in the emitted line (other than render_ms) is
         pulled from this instance's own PER-WINDOW accumulators
         (record()/time_phase()), which are reset immediately after a
-        successful emit -- see the module docstring. The five job/replan/
-        failure counters are diffed against their own per-window baseline
-        (_window_delta()) so they too read 0 in a window where nothing
-        new happened, never a stale carried-forward figure.
+        successful emit -- see the module docstring. The nine job/replan/
+        failure/exhausted-idle counters are diffed against their own
+        per-window baseline (_window_delta()) so they too read 0 in a
+        window where nothing new happened, never a stale carried-forward
+        figure.
+
+        top_level_sum_ms/unaccounted_ms use per_tick_ms() (normalized by
+        total sim_step ticks), NOT average_ms() (normalized by each
+        phase's own occurrence count) -- see per_tick_ms()'s and the
+        module docstring for why mixing those two denominators could
+        drive unaccounted_ms negative once the exhausted-idle fast path
+        made most ticks skip every phase. unaccounted_ms is still clamped
+        to 0.0 as a display-only floor for residual timing jitter; it
+        should not need to trigger given the fixed denominator.
         """
         if not self.logging_enabled:
             return False
@@ -305,12 +408,17 @@ class PerfMonitor:
 
         avg_sim_step_ms = self.average_ms("sim_step")
         max_sim_step_ms = self.max_ms("sim_step")
-        measured_inside_sim_step = sum(self.average_ms(phase) for phase in _UNACCOUNTED_SECTIONS)
-        unaccounted_ms = avg_sim_step_ms - measured_inside_sim_step
+        top_level_sum_ms = sum(self.per_tick_ms(phase) for phase in _UNACCOUNTED_SECTIONS)
+        unaccounted_ms = max(0.0, avg_sim_step_ms - top_level_sum_ms)
+        phase_coverage_pct = (
+            min(100.0, 100.0 * top_level_sum_ms / avg_sim_step_ms) if avg_sim_step_ms > 0 else 0.0
+        )
 
         line = format_perf_summary_line(
             avg_sim_step_ms=avg_sim_step_ms,
             max_sim_step_ms=max_sim_step_ms,
+            fast_path_avg_ms=self.average_ms("sim_step_fast_path"),
+            full_pipeline_avg_ms=self.average_ms("sim_step_full_pipeline"),
             explored_update_ms=self.average_ms("explored_update"),
             obstacle_extract_ms=self.average_ms("obstacle_extract"),
             belief_update_ms=self.average_ms("belief_update"),
@@ -328,7 +436,10 @@ class PerfMonitor:
             canvas_ms=self.average_ms("canvas_state_update"),
             render_ms=render_ms,
             console_ms=self.average_ms("console_log"),
+            misc_ms=self.average_ms("misc"),
+            top_level_sum_ms=top_level_sum_ms,
             unaccounted_ms=unaccounted_ms,
+            phase_coverage_pct=phase_coverage_pct,
             mapped_obs=mapped_obstacle_count,
             explored_percent=explored_percent,
             nav_state=nav_state,
@@ -340,6 +451,18 @@ class PerfMonitor:
             safety_replans=self._window_delta("safety_replans", safety_replans),
             route_failures=self._window_delta("route_failures", route_failures),
             repeated_safety_replans=self._window_delta("repeated_safety_replans", repeated_safety_replans),
+            exhausted_idle_fast_path_hits=self._window_delta(
+                "exhausted_idle_fast_path_hits", exhausted_idle_fast_path_hits
+            ),
+            exhausted_idle_full_updates=self._window_delta(
+                "exhausted_idle_full_updates", exhausted_idle_full_updates
+            ),
+            exhausted_idle_skipped_canvas_updates=self._window_delta(
+                "exhausted_idle_skipped_canvas_updates", exhausted_idle_skipped_canvas_updates
+            ),
+            exhausted_idle_skipped_sensor_updates=self._window_delta(
+                "exhausted_idle_skipped_sensor_updates", exhausted_idle_skipped_sensor_updates
+            ),
         )
         (log or print)(line)
         self._reset_window()

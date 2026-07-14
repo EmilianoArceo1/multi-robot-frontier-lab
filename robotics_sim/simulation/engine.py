@@ -2488,9 +2488,24 @@ class SimulationControllerMixin:
         behavior.
         """
         monitor = self.ensure_perf_monitor()
+        hits_before = getattr(self, "exhausted_idle_fast_path_hits", 0)
         start = time.perf_counter()
         self.simulation_step()
-        monitor.record("sim_step", time.perf_counter() - start)
+        duration_s = time.perf_counter() - start
+        monitor.record("sim_step", duration_s)
+        # Also record the SAME duration under a category-specific phase so
+        # PerfMonitor can report fast_path_avg_ms/full_pipeline_avg_ms
+        # separately -- a fast-path-skip tick and a full-pipeline tick have
+        # wildly different costs, and blending them into one "sim_step"
+        # average hid that a tick's phase timings (recorded only on
+        # full-pipeline ticks) were being averaged over a different,
+        # smaller denominator than avg_sim_step_ms itself (see
+        # PerfMonitor.per_tick_ms()'s docstring for the accounting bug this
+        # fixes).
+        if getattr(self, "exhausted_idle_fast_path_hits", 0) > hits_before:
+            monitor.record("sim_step_fast_path", duration_s)
+        else:
+            monitor.record("sim_step_full_pipeline", duration_s)
         monitor.note_tick()
 
         canvas = getattr(self, "canvas", None)
@@ -2517,6 +2532,10 @@ class SimulationControllerMixin:
             safety_replans=getattr(self, "safety_replan_count", 0),
             route_failures=getattr(self, "route_failure_count", 0),
             repeated_safety_replans=getattr(self, "repeated_safety_replan_count", 0),
+            exhausted_idle_fast_path_hits=getattr(self, "exhausted_idle_fast_path_hits", 0),
+            exhausted_idle_full_updates=getattr(self, "exhausted_idle_full_updates", 0),
+            exhausted_idle_skipped_canvas_updates=getattr(self, "exhausted_idle_skipped_canvas_updates", 0),
+            exhausted_idle_skipped_sensor_updates=getattr(self, "exhausted_idle_skipped_sensor_updates", 0),
             log=self.log_console_message,
         )
 
@@ -2574,6 +2593,69 @@ class SimulationControllerMixin:
             return True
         self._last_exhausted_low_rate_time = float(self.simulation_time)
         return False
+
+    def _exhausted_idle_fast_path_ready(self, agent) -> bool:
+        """True when the ENTIRE per-tick pipeline (sensor update, agent
+        decision, motion integration, telemetry) can be skipped this tick
+        without changing simulation state -- a stronger condition than
+        _should_skip_for_exhausted_hold()'s own narrower gate (which only
+        throttles route_affected/canvas/belief-snapshot work).
+
+        Read-only with respect to navigation state -- never calls
+        exploration_exhausted()/agent.step()/any decision method, only
+        reads existing flags, mirroring _should_skip_for_exhausted_hold().
+        ALL of the following must hold, or the caller must fall through
+        to the unmodified normal path:
+            - _compute_nav_state() reports "exhausted": the agent has
+              latched exploration_exhausted_map_signature AND has no
+              active_path_goal_xy -- genuinely nothing left to route to,
+              not just momentarily between replans (see
+              _should_skip_for_exhausted_hold()'s docstring for why both
+              are required)
+            - no planner job is in flight (planning_in_progress)
+            - no pending path/target is awaiting acceptance
+              (RobotAgent.pending_path/pending_target_xy) -- a planner
+              result could arrive and change things at any tick
+            - the robot's own speed is at/below its stop tolerance
+              (robot.v vs. robot.stop_speed_tolerance) -- if it is still
+              moving, its pose (and therefore what its sensor would see)
+              is still changing
+            - the ground-truth obstacle count (config.obstacles, NOT the
+              robot's own mapped_obstacle_points) has not changed since
+              the last full-pipeline tick -- new obstacles are exactly
+              the kind of change that could make an "exhausted" agent's
+              situation different
+
+        With the robot provably stationary and nothing pending, a fresh
+        sensor scan from the same pose against the same ground-truth
+        obstacles is guaranteed to reproduce the same result as the last
+        one, and the agent/motion pipeline is guaranteed to again decide
+        "stay put" -- so skipping them changes no simulation state, only
+        how often it is recomputed. Scoped to single-robot
+        simulation_step(); simulation_step_multi() is untouched.
+        """
+        if agent is None or self.robot is None:
+            return False
+        if self._compute_nav_state(agent) != "exhausted":
+            return False
+        if self.planning_in_progress:
+            return False
+        if getattr(agent, "pending_path", None) is not None:
+            return False
+        if getattr(agent, "pending_target_xy", None) is not None:
+            return False
+        if abs(float(self.robot.v)) > float(self.robot.stop_speed_tolerance):
+            return False
+
+        obstacle_count = len(self.config.obstacles)
+        baseline = getattr(self, "_exhausted_idle_obstacle_count", None)
+        if baseline is None:
+            self._exhausted_idle_obstacle_count = obstacle_count
+            return True
+        if obstacle_count != baseline:
+            self._exhausted_idle_obstacle_count = obstacle_count
+            return False
+        return True
 
     def _timed_route_affected_check(self, newly_discovered) -> bool:
         """Thin timing wrapper around new_information_affects_current_route()
@@ -3706,6 +3788,7 @@ class SimulationControllerMixin:
         self.multi_last_explored_poses = {}
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
+        self._exhausted_idle_obstacle_count = None
 
         self.multi_path_points = [[(float(robot.x), float(robot.y))] for robot in self.robots]
         self.multi_robot_commands_by_id = {}
@@ -3876,6 +3959,7 @@ class SimulationControllerMixin:
         self.last_time = time.perf_counter()
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
+        self._exhausted_idle_obstacle_count = None
 
         self.update_start_pause_button()
         self.speed_button.setText(f"Speed {self.simulation_speed:.2f}x")
@@ -3928,6 +4012,7 @@ class SimulationControllerMixin:
         self.last_explored_pose: tuple[float, float, float] | None = None
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
+        self._exhausted_idle_obstacle_count = None
         self.last_motion_log_time = -1.0e9
         self.multi_last_motion_log_times = {}
         self.planning_in_progress = False
@@ -4960,6 +5045,34 @@ class SimulationControllerMixin:
         # see _should_skip_for_exhausted_hold()'s docstring.
         skip_for_exhausted_hold = self._should_skip_for_exhausted_hold()
 
+        # Exhausted-idle fast path: while the agent is latched exhausted
+        # with nothing left to route to, the robot is stopped, and no
+        # planner/path work is in flight, the ENTIRE per-tick pipeline
+        # below (sensor update, agent decision, motion integration,
+        # telemetry) is a guaranteed no-op -- the robot's pose cannot
+        # change without a control update, and its pose not changing
+        # means a fresh sensor scan against the same (unchanged)
+        # ground-truth obstacles cannot discover anything new either. See
+        # _exhausted_idle_fast_path_ready()'s docstring for the exact
+        # conditions and why each is necessary. Reuses the same
+        # skip_for_exhausted_hold flag/throttle as the gates below so the
+        # low-rate ~1Hz heartbeat and this fast path agree on the same
+        # "due" tick.
+        if self._exhausted_idle_fast_path_ready(self.runtime_agent(None)):
+            if skip_for_exhausted_hold:
+                self.exhausted_idle_fast_path_hits = getattr(self, "exhausted_idle_fast_path_hits", 0) + 1
+                self.exhausted_idle_skipped_canvas_updates = (
+                    getattr(self, "exhausted_idle_skipped_canvas_updates", 0) + 1
+                )
+                self.exhausted_idle_skipped_sensor_updates = (
+                    getattr(self, "exhausted_idle_skipped_sensor_updates", 0) + 1
+                )
+                return
+            # Heartbeat due -- fall through to the normal pipeline this
+            # tick to refresh canvas/telemetry/sensor state, then resume
+            # fast-pathing on the next tick.
+            self.exhausted_idle_full_updates = getattr(self, "exhausted_idle_full_updates", 0) + 1
+
         run_sensor_update = self.should_run_sensor_update(now)
         if run_sensor_update:
             self.sensor_update_count += 1
@@ -5142,6 +5255,7 @@ class SimulationControllerMixin:
                     self.replan_after_new_information("New obstacle affects current route.")
                     return
 
+        _misc_perf_start = time.perf_counter()
         robot_position = (float(self.robot.x), float(self.robot.y))
         robot_radius = self.safety_radius()
         target = self.active_target_xy()
@@ -5151,6 +5265,7 @@ class SimulationControllerMixin:
             obstacles=self.config.obstacles,
             robot_radius=robot_radius,
         )
+        _record_perf(self, "misc", time.perf_counter() - _misc_perf_start)
 
         if current_collision.collision:
             self.last_collision_report = current_collision
@@ -5288,6 +5403,7 @@ class SimulationControllerMixin:
                         return
 
         # ── Shared post-step checks ───────────────────────────────────────
+        _misc_post_perf_start = time.perf_counter()
         new_mode = mode_name(self.robot)
         if old_mode != new_mode:
             self.canvas.set_status(f"State transition: {old_mode} → {new_mode}")
@@ -5298,6 +5414,7 @@ class SimulationControllerMixin:
             obstacles=self.config.obstacles,
             robot_radius=robot_radius,
         )
+        _record_perf(self, "misc", time.perf_counter() - _misc_post_perf_start)
 
         if post_collision.collision:
             self.last_collision_report = post_collision
@@ -5306,6 +5423,7 @@ class SimulationControllerMixin:
             )
             return
 
+        _misc_path_perf_start = time.perf_counter()
         new_path_point = (float(self.robot.x), float(self.robot.y))
         if self.path_points:
             self.total_distance_traveled += math.hypot(
@@ -5316,6 +5434,7 @@ class SimulationControllerMixin:
 
         if len(self.path_points) > 1200:
             self.path_points = self.path_points[-1200:]
+        _record_perf(self, "misc", time.perf_counter() - _misc_path_perf_start)
 
         # Skip the forced per-tick canvas repaint while latched in an
         # exploration-exhausted HOLD and not yet due for the ~1Hz trickle
@@ -5333,7 +5452,9 @@ class SimulationControllerMixin:
             )
             _record_perf(self, "canvas_state_update", time.perf_counter() - _canvas_update_perf_start)
 
+        _misc_tail_perf_start = time.perf_counter()
         self.push_grid_overlay_snapshot_if_due()
+        _record_perf(self, "misc", time.perf_counter() - _misc_tail_perf_start)
 
     # ========================================================
     # NEW POO INTERFACE — gradual migration helpers

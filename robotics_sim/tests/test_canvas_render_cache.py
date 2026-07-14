@@ -19,6 +19,7 @@ only cache/state is asserted on, never pixel output.
 """
 from __future__ import annotations
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
@@ -33,6 +34,16 @@ def _make_canvas(width: int = 400, height: int = 300) -> SimulationCanvas:
     canvas = SimulationCanvas()
     canvas.resize(width, height)
     return canvas
+
+
+def _full_paint_once(canvas: SimulationCanvas) -> None:
+    """Drive a real paintEvent() end-to-end (card/title/draw_plot/
+    telemetry), without needing the widget to be .show()'n -- QPainter(self)
+    works directly on an unshown widget. Used only to exercise the
+    aggregate map_layer_ms/overlays_ms/robot_fov_ms sum relationships and
+    cache-reuse across a full frame; individual layer functions are still
+    tested in isolation elsewhere in this file via a throwaway QPixmap."""
+    canvas.paintEvent(None)
 
 
 def _draw_planned_route_once(canvas: SimulationCanvas) -> None:
@@ -389,3 +400,102 @@ def test_executed_trail_cache_stays_hot_across_engine_style_sliding_window_trims
     # ticks -- NOT one rebuild per tick (which would be 4*margin rebuilds,
     # exactly reproducing the reported cache_hit=False-every-frame bug).
     assert 2 <= rebuild_count <= 6
+
+
+# ---------------------------------------------------------------------------
+# Fine-grained map_layer_ms/overlays_ms/robot_fov_ms instrumentation
+# (diagnosis-only round -- no visual/behavior changes).
+#
+# map_layer_ms was measured as one combined figure across draw_grid_overlay()/
+# draw_explored_area_trace()/draw_ground_truth_obstacles()/
+# draw_mapped_obstacle_points(); overlays_ms mixed editor preview/selection/
+# camera-frame, the grid-resolution preview, the plot border, and the
+# card/title/telemetry chrome; robot_fov_ms measured draw_sensor_range() with
+# no visibility into cache hit/miss, polygon compute, or paint. These tests
+# confirm the new sub-fields sum back to their parent aggregate (design
+# constraint: "map_layer_ms/overlays_ms/robot_fov_ms must equal the sum of
+# their sub-layers, differences only from measurement overhead") and that
+# adding this instrumentation did not disturb any existing render cache.
+# ---------------------------------------------------------------------------
+
+
+def test_map_layer_ms_equals_sum_of_its_sublayers():
+    canvas = _make_canvas()
+    canvas.set_mapped_obstacle_points([(1.0, 1.0), (2.0, 2.0)])
+
+    _full_paint_once(canvas)
+
+    sublayers = (
+        canvas._render_layer_ms["grid_overlay"]
+        + canvas._render_layer_ms["explored_area"]
+        + canvas._render_layer_ms["ground_truth_obstacles"]
+        + canvas._render_layer_ms["mapped_obstacle_points"]
+    )
+    assert canvas._render_layer_ms["map_layer"] == pytest.approx(sublayers, abs=2.0)
+
+
+def test_overlays_ms_equals_sum_of_its_sublayers():
+    canvas = _make_canvas()
+
+    _full_paint_once(canvas)
+
+    sublayers = (
+        canvas._render_layer_ms["editor_overlays"]
+        + canvas._render_layer_ms["grid_preview"]
+        + canvas._render_layer_ms["plot_border"]
+        + canvas._render_layer_ms["card"]
+        + canvas._render_layer_ms["title"]
+        + canvas._render_layer_ms["telemetry"]
+    )
+    assert canvas._render_layer_ms["overlays"] == pytest.approx(sublayers, abs=2.0)
+
+
+def test_robot_fov_ms_equals_compute_plus_paint():
+    canvas = _make_canvas()
+    canvas.config.show_vision = True
+
+    _full_paint_once(canvas)
+
+    fov_sum = canvas._fov_detail["robot_fov_compute_ms"] + canvas._fov_detail["robot_fov_paint_ms"]
+    assert canvas._render_layer_ms["robot_fov"] == pytest.approx(fov_sum, abs=2.0)
+
+
+def test_instrumentation_does_not_disturb_existing_render_caches():
+    """Adding fine-grained timers around existing draw calls must not
+    change which branch any cache takes -- a second, unchanged frame must
+    still reuse every existing cache object, exactly as before this
+    round's instrumentation."""
+    canvas = _make_canvas()
+    canvas.config.show_robot_orders = True
+    canvas.set_mapped_obstacle_points([(1.0, 1.0), (2.0, 2.0)])
+    canvas.set_planned_path([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
+    canvas.set_path([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
+
+    _full_paint_once(canvas)
+
+    static_plot_cache = canvas._static_plot_cache
+    mapped_points_cache = canvas._mapped_points_cache
+    planned_route_cache = canvas._planned_route_cache
+    executed_trail_pixmap = canvas._executed_trail_pixmap
+    fov_cache_snapshot = dict(canvas._sensor_polygon_caches_by_robot)
+
+    assert static_plot_cache is not None
+    assert mapped_points_cache is not None
+    assert planned_route_cache is not None
+    assert executed_trail_pixmap is not None
+    assert fov_cache_snapshot
+
+    _full_paint_once(canvas)
+
+    assert canvas._static_plot_cache is static_plot_cache
+    assert canvas._mapped_points_cache is mapped_points_cache
+    assert canvas._planned_route_cache is planned_route_cache
+    assert canvas._executed_trail_pixmap is executed_trail_pixmap
+    for cache_key, (pose, signature, polygon) in canvas._sensor_polygon_caches_by_robot.items():
+        assert polygon is fov_cache_snapshot[cache_key][2], (
+            "the FOV cache must still return the identical cached polygon object "
+            "when pose/vision/obstacles are unchanged"
+        )
+    assert canvas._fov_detail["robot_fov_cache_hit"] is True, (
+        "an unchanged second frame must report robot_fov_cache_hit=True"
+    )

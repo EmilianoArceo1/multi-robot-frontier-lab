@@ -10,7 +10,7 @@ timestamps, no QApplication/paintEvent needed.
 """
 from __future__ import annotations
 
-from robotics_sim.app.render_perf import RenderDetailLogger
+from robotics_sim.app.render_perf import RenderDetailLogger, format_render_detail_line
 from robotics_sim.app.simulation_canvas import DEFAULT_RENDER_THROTTLE_FPS, RenderThrottler
 
 
@@ -111,12 +111,18 @@ def test_render_detail_log_enabled_reports_line(capsys):
     assert emitted is True
     captured = capsys.readouterr()
     assert captured.out.strip() == (
-        "[RENDER] total_ms=42.1 background_ms=2.0 map_layer_ms=24.0 robot_body_ms=1.0 "
-        "robot_fov_ms=0.5 route_path_ms=1.2 planned_route_build_ms=0.0 "
+        "[RENDER] total_ms=42.1 background_ms=2.0 map_layer_ms=24.0 "
+        "grid_overlay_ms=0.0 grid_overlay_cache_status=n/a grid_overlay_visible_cells=0 "
+        "grid_overlay_rebuild_ms=0.0 grid_overlay_blit_ms=0.0 grid_overlay_cells_ms=0.0 "
+        "grid_overlay_lines_ms=0.0 explored_area_ms=0.0 ground_truth_obstacles_ms=0.0 "
+        "mapped_obstacle_points_ms=0.0 robot_body_ms=1.0 "
+        "robot_fov_ms=0.5 robot_fov_cache_hit=True robot_fov_compute_ms=0.0 "
+        "robot_fov_paint_ms=0.0 route_path_ms=1.2 planned_route_build_ms=0.0 "
         "planned_route_paint_ms=0.0 executed_trail_build_ms=0.0 executed_trail_paint_ms=0.0 "
         "executed_trail_points=0 executed_trail_segments_painted=0 "
         "executed_trail_cache_hit=False sensor_debug_overlay_ms=0.4 "
-        "overlays_ms=5.0 cache_hit=True"
+        "overlays_ms=5.0 editor_overlays_ms=0.0 grid_preview_ms=0.0 plot_border_ms=0.0 "
+        "card_ms=0.0 title_ms=0.0 telemetry_ms=0.0 cache_hit=True"
     )
 
     # Throttled: at most once every 2 seconds, even while enabled.
@@ -181,3 +187,112 @@ def test_route_detail_reports_executed_trail_paint_metrics(capsys):
     assert "executed_trail_points=3400" in captured.out
     assert "executed_trail_segments_painted=3" in captured.out
     assert "executed_trail_cache_hit=True" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Fine-grained map_layer_ms/overlays_ms/robot_fov_ms instrumentation.
+#
+# Diagnosis-only round: map_layer_ms was measured as the combined total of
+# draw_grid_overlay()/draw_explored_area_trace()/draw_ground_truth_obstacles()/
+# draw_mapped_obstacle_points(), overlays_ms mixed editor preview/selection/
+# camera-frame, the grid-resolution preview, the plot border, and the
+# card/title/telemetry chrome, and robot_fov_ms measured draw_sensor_range()
+# as one figure with no visibility into cache hit/miss, polygon compute, or
+# paint. These tests confirm the new sub-fields appear on the [RENDER] line
+# and that the aggregate fields still equal their sum (see
+# test_canvas_render_cache.py for the actual sum-matches-real-draw-plot()
+# regression, driven through a real paintEvent-style pixmap).
+# ---------------------------------------------------------------------------
+
+
+def test_render_detail_line_includes_all_new_instrumentation_fields():
+    line = format_render_detail_line(total_ms=1.0, background_ms=0.0, map_layer_ms=0.0)
+    for field in (
+        "grid_overlay_ms", "grid_overlay_cache_status", "grid_overlay_visible_cells",
+        "grid_overlay_rebuild_ms", "grid_overlay_blit_ms", "grid_overlay_cells_ms",
+        "grid_overlay_lines_ms", "explored_area_ms", "ground_truth_obstacles_ms",
+        "mapped_obstacle_points_ms", "robot_fov_cache_hit", "robot_fov_compute_ms",
+        "robot_fov_paint_ms", "editor_overlays_ms", "grid_preview_ms", "plot_border_ms",
+        "card_ms", "title_ms", "telemetry_ms",
+    ):
+        assert f"{field}=" in line, f"[RENDER] line is missing the {field} field"
+
+
+def test_render_detail_map_layer_subfields_reported(capsys):
+    logger = RenderDetailLogger(env={"SIM_RENDER_DETAIL_LOG": "1"})
+
+    emitted = logger.maybe_log(
+        total_ms=20.0, background_ms=1.0, map_layer_ms=9.0,
+        grid_overlay_ms=5.0, grid_overlay_cache_status="rebuild",
+        grid_overlay_visible_cells=1200, grid_overlay_rebuild_ms=4.7,
+        grid_overlay_blit_ms=0.2, grid_overlay_cells_ms=4.0, grid_overlay_lines_ms=0.5,
+        explored_area_ms=1.5, ground_truth_obstacles_ms=1.0, mapped_obstacle_points_ms=1.5,
+        now=0.0,
+    )
+
+    assert emitted is True
+    captured = capsys.readouterr()
+    assert "grid_overlay_ms=5.0" in captured.out
+    assert "grid_overlay_cache_status=rebuild" in captured.out
+    assert "grid_overlay_visible_cells=1200" in captured.out
+    assert "grid_overlay_rebuild_ms=4.7" in captured.out
+    assert "grid_overlay_blit_ms=0.2" in captured.out
+    assert "grid_overlay_cells_ms=4.0" in captured.out
+    assert "grid_overlay_lines_ms=0.5" in captured.out
+    assert "explored_area_ms=1.5" in captured.out
+    assert "ground_truth_obstacles_ms=1.0" in captured.out
+    assert "mapped_obstacle_points_ms=1.5" in captured.out
+
+
+def test_render_detail_overlays_subfields_reported(capsys):
+    logger = RenderDetailLogger(env={"SIM_RENDER_DETAIL_LOG": "1"})
+
+    emitted = logger.maybe_log(
+        total_ms=10.0, background_ms=0.5, map_layer_ms=0.5,
+        overlays_ms=6.0, editor_overlays_ms=0.2, grid_preview_ms=0.1,
+        plot_border_ms=0.1, card_ms=2.0, title_ms=0.6, telemetry_ms=3.0,
+        now=0.0,
+    )
+
+    assert emitted is True
+    captured = capsys.readouterr()
+    assert "editor_overlays_ms=0.2" in captured.out
+    assert "grid_preview_ms=0.1" in captured.out
+    assert "plot_border_ms=0.1" in captured.out
+    assert "card_ms=2.0" in captured.out
+    assert "title_ms=0.6" in captured.out
+    assert "telemetry_ms=3.0" in captured.out
+
+
+def test_render_detail_fov_compute_paint_cache_hit_reported(capsys):
+    logger = RenderDetailLogger(env={"SIM_RENDER_DETAIL_LOG": "1"})
+
+    emitted = logger.maybe_log(
+        total_ms=5.0, background_ms=0.5, map_layer_ms=0.5,
+        robot_fov_ms=1.4, robot_fov_cache_hit=False,
+        robot_fov_compute_ms=1.1, robot_fov_paint_ms=0.3,
+        now=0.0,
+    )
+
+    assert emitted is True
+    captured = capsys.readouterr()
+    assert "robot_fov_cache_hit=False" in captured.out
+    assert "robot_fov_compute_ms=1.1" in captured.out
+    assert "robot_fov_paint_ms=0.3" in captured.out
+
+
+def test_render_detail_disabled_by_default_ignores_new_fields_too(capsys):
+    """The new fields must not change RenderDetailLogger's disabled-by-
+    default behavior: still silent, still no print, regardless of what
+    values are passed for them."""
+    logger = RenderDetailLogger(env={})
+
+    emitted = logger.maybe_log(
+        total_ms=1.0, background_ms=0.0, map_layer_ms=0.0,
+        grid_overlay_cache_status="rebuild", grid_overlay_visible_cells=99999,
+        robot_fov_cache_hit=False, robot_fov_compute_ms=999.0,
+    )
+
+    assert emitted is False
+    captured = capsys.readouterr()
+    assert captured.out == ""

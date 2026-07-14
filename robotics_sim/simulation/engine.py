@@ -14,6 +14,7 @@ references in one step.
 from __future__ import annotations
 
 import inspect
+import functools
 import json
 import logging
 import math
@@ -302,6 +303,44 @@ def _emit_robot_trace(engine, method: str, **kwargs) -> None:
     if trace is None:
         return
     getattr(trace, method)(**kwargs)
+
+
+def _record_perf(engine, phase: str, duration_s: float) -> None:
+    """Record a PerfMonitor timing sample for *phase* if the engine
+    actually has ensure_perf_monitor() -- mirrors _emit_robot_trace()'s
+    defensive pattern: lightweight duck-typed engine fakes used by many
+    existing tests do not have it, and must not be required to grow one
+    just to exercise unrelated behavior. Never raises.
+    """
+    monitor_getter = getattr(engine, "ensure_perf_monitor", None)
+    if monitor_getter is None:
+        return
+    monitor_getter().record(phase, duration_s)
+
+
+def _timed_method(phase: str):
+    """Decorator: records a PerfMonitor timing sample for *phase* around
+    the wrapped method's call (see _record_perf() for the defensive,
+    fake-engine-safe recording).
+
+    Deliberately a decorator rather than a rename-and-wrap: it preserves
+    the wrapped method's exact name (functools.wraps), so existing tests
+    that bind e.g. SimulationControllerMixin.apply_route_result.__get__(fake)
+    directly onto a lightweight SimpleNamespace fake keep working
+    unchanged -- no second, differently-named method needs to also be
+    bound onto those fakes. Zero effect on the wrapped method's own
+    behavior/return value/control flow.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                _record_perf(self, phase, time.perf_counter() - start)
+        return wrapper
+    return decorator
 
 
 def format_narrow_passage_diagnostic(
@@ -1980,12 +2019,17 @@ class SimulationControllerMixin:
 
         return simplified
 
+    @_timed_method("route_result_handling")
     def apply_route_result(
         self,
         success: bool,
         reason: str,
         waypoints: list[tuple[float, float]],
     ) -> None:
+        """Times route-result handling (see _timed_method()) regardless of
+        whether this is called synchronously within simulation_step() or
+        later, from a queued Qt-signal callback delivered on a separate
+        event-loop turn (the common case for async planner results)."""
         if self.robot is None:
             return
 
@@ -2133,6 +2177,7 @@ class SimulationControllerMixin:
             self.canvas.set_status(
                 f"Planner failed in exploration mode: {reason}. Holding current position; not falling back to G."
             )
+            self.route_failure_count = getattr(self, "route_failure_count", 0) + 1
             self.telemetry.report_route_failure(
                 robot_label="R1",
                 start_xy=hold_xy,
@@ -2185,6 +2230,7 @@ class SimulationControllerMixin:
         success, reason, waypoints = self.compute_route((self.robot.x, self.robot.y))
         self.apply_route_result(success, reason, waypoints)
 
+    @_timed_method("planner_dispatch")
     def request_route_async(
         self,
         reason: str,
@@ -2193,6 +2239,11 @@ class SimulationControllerMixin:
     ) -> bool:
         """
         Start a background replan and keep the GUI responsive.
+
+        Times the synchronous "kick off a planner request" portion (see
+        _timed_method()) -- the actual A*/planner computation, if async,
+        runs on a background PlannerWorker thread and is measured
+        separately, in route_result_handling, once its result arrives.
 
         target_override: when given (and planner_type != "Direct"),
         skips select_navigation_goal()'s own independent target re-derivation
@@ -2260,6 +2311,7 @@ class SimulationControllerMixin:
         self.last_control = self.brake_control_for_collision()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status(f"{reason} Planning in background...")
+        self.planner_jobs_started = getattr(self, "planner_jobs_started", 0) + 1
         self.thread_pool.start(worker)
         return True
 
@@ -2276,6 +2328,7 @@ class SimulationControllerMixin:
             return
 
         self.planning_in_progress = False
+        self.planner_jobs_completed = getattr(self, "planner_jobs_completed", 0) + 1
         clean_waypoints = [tuple(point) for point in waypoints]
         self.apply_route_result(success, reason, clean_waypoints)
 
@@ -2390,6 +2443,38 @@ class SimulationControllerMixin:
             self._perf_monitor = PerfMonitor()
         return self._perf_monitor
 
+    def _compute_nav_state(self, agent) -> str:
+        """Best-effort, diagnostics-only navigation-state label for the
+        [PERF] summary line: running | recovering | exhausted |
+        safety_replan_loop | idle.
+
+        Read-only: only reads existing RobotAgent fields, never calls
+        exploration_exhausted() or any other navigation/decision method,
+        and never affects behavior -- purely a label for humans reading
+        the [PERF] line. Distinguishes "exhausted" (latched exhaustion
+        flag AND no active route -- genuinely nothing left to do) from
+        "safety_replan_loop"/"recovering" (actively retrying/replanning,
+        which can itself be the expensive phase -- see
+        _should_skip_for_exhausted_hold()'s docstring for why conflating
+        these caused route_check_ms to incorrectly read 0.0).
+        """
+        if agent is None:
+            return "idle"
+        has_active_route = getattr(agent, "active_path_goal_xy", None) is not None
+        exhausted_latched = getattr(agent, "exploration_exhausted_map_signature", None) is not None
+        failures = int(getattr(agent, "consecutive_exploration_failures", 0))
+        repairing = getattr(agent, "route_repair_in_progress_for_goal", None) is not None
+
+        if exhausted_latched and not has_active_route:
+            return "exhausted"
+        if repairing:
+            return "safety_replan_loop"
+        if failures > 0:
+            return "recovering"
+        if has_active_route:
+            return "running"
+        return "idle"
+
     def on_simulation_tick(self) -> None:
         """QTimer callback: times the whole simulation_step() call, then
         (at most once every couple of seconds, and only when SIM_PERF_LOG
@@ -2417,12 +2502,94 @@ class SimulationControllerMixin:
         trace_queue_size = writer.queue_size if writer is not None else 0
         dropped_trace_events = writer.dropped_total if writer is not None else 0
 
+        agent = self.runtime_agent(None)
+        nav_state = self._compute_nav_state(agent)
+
         monitor.maybe_log_summary(
             render_ms=render_ms,
             trace_queue_size=trace_queue_size,
             dropped_trace_events=dropped_trace_events,
+            mapped_obstacle_count=len(getattr(self, "mapped_obstacle_points", [])),
+            explored_percent=self.estimated_explored_percent() if self.robot is not None else None,
+            nav_state=nav_state,
+            planner_jobs_started=getattr(self, "planner_jobs_started", 0),
+            planner_jobs_completed=getattr(self, "planner_jobs_completed", 0),
+            safety_replans=getattr(self, "safety_replan_count", 0),
+            route_failures=getattr(self, "route_failure_count", 0),
+            repeated_safety_replans=getattr(self, "repeated_safety_replan_count", 0),
             log=self.log_console_message,
         )
+
+    def _should_skip_for_exhausted_hold(self, *, min_interval_s: float = 1.0) -> bool:
+        """True when expensive per-tick work (route_affected check, forced
+        canvas repaint, belief snapshot) should be SKIPPED this tick.
+
+        Read-only with respect to navigation state: only reads
+        RobotAgent.exploration_exhausted_map_signature and
+        active_path_goal_xy, both persistent flags set/cleared entirely by
+        ExplorationBehavior/RobotAgent's own existing logic elsewhere --
+        never calls exploration_exhausted() itself (which has its own
+        reset side effect) or any other navigation/decision method.
+
+        BOTH exploration_exhausted_map_signature is not None AND
+        active_path_goal_xy is None are required before this is
+        considered "exhausted" for throttling purposes -- not just the
+        flag alone. Root-cause fix: exploration_exhausted_map_signature
+        can go stale. It is set once consecutive_exploration_failures
+        reaches its budget, and is only ever CLEARED by
+        exploration_exhausted() itself, which only runs from
+        ExplorationBehavior's "no active path" branch. Once the agent
+        gets a new active route again (e.g. after a route_affected repair
+        or a safety replan succeeds), that branch is never reached again
+        while the route stays active -- so the stale signature can keep
+        reading "not None" for the ENTIRE remaining safety-replan-loop/
+        recovering episode, even though the agent is now busy, not idle.
+        Without the active_path_goal_xy check, that stale flag silently
+        suppressed route_affected_check/belief_snapshot/canvas updates
+        throughout exactly the period they were most needed (confirmed by
+        route_check_ms staying 0.0 despite route_affected=yes events in
+        the app log). Requiring "no active route" as well means this only
+        ever throttles genuine idle-exhaustion, never an active
+        replan/recovery episode.
+
+        When exhausted, throttles to at most once every min_interval_s
+        simulated seconds ("keep occasional low-rate updates ~1Hz so the
+        UI never looks frozen") -- the FIRST call after the interval
+        elapses returns False (this tick is the "due" one -- do not skip)
+        and stamps the timestamp; every call in between returns True
+        (skip). Call this AT MOST ONCE per tick and reuse the result for
+        every gate that tick, so all the gated work (or none of it) goes
+        together on the same "due" tick.
+        """
+        agent = self.runtime_agent(None)
+        exhausted = (
+            agent is not None
+            and getattr(agent, "exploration_exhausted_map_signature", None) is not None
+            and getattr(agent, "active_path_goal_xy", None) is None
+        )
+        if not exhausted:
+            return False
+        last = getattr(self, "_last_exhausted_low_rate_time", None)
+        if last is not None and (float(self.simulation_time) - last) < min_interval_s:
+            return True
+        self._last_exhausted_low_rate_time = float(self.simulation_time)
+        return False
+
+    def _timed_route_affected_check(self, newly_discovered) -> bool:
+        """Thin timing wrapper around new_information_affects_current_route()
+        -- the exact computation behind the app log's "route_affected=yes"
+        line (see telemetry.report_map_update()'s call site right after
+        this). Extracted into its own method (rather than an inline
+        time.perf_counter() pair) specifically so this timing can be unit
+        tested directly, driving the real route_affected=yes code path,
+        without needing the full simulation_step()/sensor/collision-
+        checker stack. Zero effect on the check's own result/behavior.
+        """
+        start = time.perf_counter()
+        try:
+            return self.new_information_affects_current_route(newly_discovered)
+        finally:
+            _record_perf(self, "route_affected_check", time.perf_counter() - start)
 
     def _build_belief_trace_snapshot(self) -> dict | None:
         """Best-effort belief_final.json (+ belief_grid_final.npz) payload
@@ -2470,8 +2637,10 @@ class SimulationControllerMixin:
             snapshot["_grid"] = grid.copy()
         return snapshot
 
+    @_timed_method("console_log")
     def log_console_message(self, message: str, *, visible_status: bool = False) -> None:
         """Write a readable debugging message to the simulation console.
+        Timed under PerfMonitor's "console_log" phase (see _timed_method()).
 
         visible_status=True also replaces the short status shown at the top of
         the canvas. Most detailed traces should keep visible_status=False so the
@@ -4243,6 +4412,7 @@ class SimulationControllerMixin:
         quantization = spacing
         candidate_obstacles = self.visible_candidate_obstacles()
 
+        _obstacle_extract_perf_start = time.perf_counter()
         for obstacle in candidate_obstacles:
             for point in self.sample_obstacle_boundary_points(tuple(obstacle), spacing):
                 if not self.point_visible_from_robot(point, candidate_obstacles):
@@ -4259,8 +4429,10 @@ class SimulationControllerMixin:
                 self.mapped_obstacle_point_keys.add(key)
                 self.mapped_obstacle_points.append(mapped_point)
                 newly_mapped.append(mapped_point)
+        _record_perf(self, "obstacle_extract", time.perf_counter() - _obstacle_extract_perf_start)
 
         if newly_mapped:
+            _belief_update_perf_start = time.perf_counter()
             changed_cells = belief.mark_occupied_points(
                 newly_mapped,
                 time_s=float(getattr(self, "simulation_time", 0.0)),
@@ -4270,6 +4442,7 @@ class SimulationControllerMixin:
             # the exact start cell in the logical grid.
             self.force_all_robot_poses_free_in_belief()
             self.sync_legacy_map_views_from_belief()
+            _record_perf(self, "belief_update", time.perf_counter() - _belief_update_perf_start)
             self.canvas.append_mapped_obstacle_points(newly_mapped)
             if force_status:
                 self.canvas.set_status(
@@ -4779,15 +4952,25 @@ class SimulationControllerMixin:
             )
             return
 
+        # Exploration-exhausted HOLD: gates route_affected checks, forced
+        # canvas repaints, and belief snapshots below to an occasional
+        # ~1Hz trickle instead of every tick, while the agent has nothing
+        # left to route to anyway. Computed once and reused for every gate
+        # below so they all skip (or all run) together on the same tick --
+        # see _should_skip_for_exhausted_hold()'s docstring.
+        skip_for_exhausted_hold = self._should_skip_for_exhausted_hold()
+
         run_sensor_update = self.should_run_sensor_update(now)
         if run_sensor_update:
             self.sensor_update_count += 1
-            _sensor_update_perf_start = time.perf_counter()
+            _explored_update_perf_start = time.perf_counter()
             self.record_explored_area(force=False)
+            _record_perf(self, "explored_update", time.perf_counter() - _explored_update_perf_start)
+            # update_sensed_obstacles() times its own obstacle_extract/
+            # belief_update sub-sections internally (see its body) --
+            # finer-grained than the old combined "sensor_update" figure,
+            # which this replaces.
             newly_discovered = self.update_sensed_obstacles(force_status=False)
-            self.ensure_perf_monitor().record(
-                "sensor_update", time.perf_counter() - _sensor_update_perf_start
-            )
             if newly_discovered:
                 self.mapping_update_count += 1
 
@@ -4817,20 +5000,23 @@ class SimulationControllerMixin:
                 # belief_trace_writer.py): a no-op unless ROBOT_TRACE's file
                 # sink is active, and the (grid-scanning) snapshot dict is
                 # only ever built lazily, on the tick a write is actually
-                # due -- never on every sensor update.
-                _emit_robot_trace(
-                    self,
-                    "maybe_snapshot_belief",
-                    sim_time=float(self.simulation_time),
-                    provider=self._build_belief_trace_snapshot,
-                )
+                # due -- never on every sensor update. Also skipped
+                # entirely while exploration-exhausted-HOLD's own ~1Hz
+                # throttle isn't due yet -- a stationary, exhausted robot
+                # has nothing new for the snapshot to capture anyway.
+                if not skip_for_exhausted_hold:
+                    _belief_snapshot_perf_start = time.perf_counter()
+                    _emit_robot_trace(
+                        self,
+                        "maybe_snapshot_belief",
+                        sim_time=float(self.simulation_time),
+                        provider=self._build_belief_trace_snapshot,
+                    )
+                    _record_perf(self, "belief_snapshot", time.perf_counter() - _belief_snapshot_perf_start)
 
-            if newly_discovered and self.config.planner_type != "Direct":
-                _route_affected_check_perf_start = time.perf_counter()
-                route_affected = self.new_information_affects_current_route(newly_discovered)
-                self.ensure_perf_monitor().record(
-                    "route_affected_check", time.perf_counter() - _route_affected_check_perf_start
-                )
+            if newly_discovered and self.config.planner_type != "Direct" and not skip_for_exhausted_hold:
+                route_affected = self._timed_route_affected_check(newly_discovered)
+                _telemetry_map_update_perf_start = time.perf_counter()
                 self.telemetry.report_map_update(
                     sim_time=float(self.simulation_time),
                     new_points=newly_discovered,
@@ -4838,6 +5024,7 @@ class SimulationControllerMixin:
                     route_affected=route_affected,
                     explored_percent=self.estimated_explored_percent(),
                 )
+                _record_perf(self, "telemetry", time.perf_counter() - _telemetry_map_update_perf_start)
                 if route_affected:
                     route_affected_agent = self.runtime_agent(None)
                     robot_xy_now = (float(self.robot.x), float(self.robot.y))
@@ -4984,10 +5171,13 @@ class SimulationControllerMixin:
         if agent is not None and RobotObservation is not None:
             # ── New OOP flow ──────────────────────────────────────────────
             # build_observation pre-computes active_segment_blocked.
+            _runtime_state_build_perf_start = time.perf_counter()
             obs = self.build_observation(self.robot, agent, None)
+            _record_perf(self, "runtime_state_build", time.perf_counter() - _runtime_state_build_perf_start)
 
             # Compute nominal control first so predicted_motion_report() can
             # use it; pass the blocked flag so the controller can slow down.
+            _controller_perf_start = time.perf_counter()
             self.last_control = self.nominal_control_safe(
                 blocked=obs.active_segment_blocked
             )
@@ -4999,13 +5189,18 @@ class SimulationControllerMixin:
                 known_obstacle_points=list(self.mapped_obstacle_points),
                 use_ground_truth=True,
             )
+            _record_perf(self, "controller", time.perf_counter() - _controller_perf_start)
             if predicted_report is not None and getattr(predicted_report, "collision", False):
                 self.last_collision_report = predicted_report
                 obs.predicted_collision = True
 
             planner_services = self.ensure_planner_services()
+            _nav_decision_perf_start = time.perf_counter()
             decision = agent.step(obs, planner_services, dt)
+            _record_perf(self, "nav_decision", time.perf_counter() - _nav_decision_perf_start)
+            _apply_decision_perf_start = time.perf_counter()
             should_brake = self.apply_navigation_decision(self.robot, agent, decision)
+            _record_perf(self, "apply_decision", time.perf_counter() - _apply_decision_perf_start)
 
             if should_brake:
                 self.last_control = self.brake_control_for_collision()
@@ -5019,13 +5214,17 @@ class SimulationControllerMixin:
                 return
 
             target = self.active_target_xy()
+            _motion_update_perf_start = time.perf_counter()
             self.robot.update(self.last_control, dt)
+            _record_perf(self, "motion_update", time.perf_counter() - _motion_update_perf_start)
+            _telemetry_perf_start = time.perf_counter()
             self.log_robot_motion(
                 self.robot,
                 robot_index=None,
                 control=self.last_control,
                 target=target,
             )
+            _record_perf(self, "telemetry", time.perf_counter() - _telemetry_perf_start)
 
         else:
             # ── Legacy fallback (agent layer unavailable) ─────────────────
@@ -5118,13 +5317,21 @@ class SimulationControllerMixin:
         if len(self.path_points) > 1200:
             self.path_points = self.path_points[-1200:]
 
-        self.canvas.set_runtime_state(
-            robot=self.robot,
-            path_points=self.path_points,
-            last_control=self.last_control,
-            simulation_time=self.simulation_time,
-            simulation_speed=self.simulation_speed,
-        )
+        # Skip the forced per-tick canvas repaint while latched in an
+        # exploration-exhausted HOLD and not yet due for the ~1Hz trickle
+        # update (see skip_for_exhausted_hold above) -- the robot isn't
+        # moving and has nothing left to route to, so nothing visually
+        # meaningful changes between ticks anyway.
+        if not skip_for_exhausted_hold:
+            _canvas_update_perf_start = time.perf_counter()
+            self.canvas.set_runtime_state(
+                robot=self.robot,
+                path_points=self.path_points,
+                last_control=self.last_control,
+                simulation_time=self.simulation_time,
+                simulation_speed=self.simulation_speed,
+            )
+            _record_perf(self, "canvas_state_update", time.perf_counter() - _canvas_update_perf_start)
 
         self.push_grid_overlay_snapshot_if_due()
 
@@ -5375,6 +5582,7 @@ class SimulationControllerMixin:
                 self.canvas.set_exploration_target(None)
 
         if kind != "FOLLOW_PATH":
+            _telemetry_nav_decision_perf_start = time.perf_counter()
             self.telemetry.report_nav_decision(
                 sim_time=float(self.simulation_time),
                 robot_label="R1",
@@ -5384,6 +5592,7 @@ class SimulationControllerMixin:
                 path_goal=getattr(agent, "active_path_goal_xy", None),
                 pending_target=getattr(agent, "pending_target_xy", None),
             )
+            _record_perf(self, "telemetry", time.perf_counter() - _telemetry_nav_decision_perf_start)
 
             # Opt-in terminal trace only (ROBOT_TRACE=decision); never
             # printed/GUI-consoled unless explicitly enabled.
@@ -5465,7 +5674,9 @@ class SimulationControllerMixin:
             return False
 
         if kind == "ACCEPT_PENDING_PATH":
+            _pending_accept_perf_start = time.perf_counter()
             waypoints = agent.accept_pending_path()
+            _record_perf(self, "pending_path_acceptance", time.perf_counter() - _pending_accept_perf_start)
             if waypoints:
                 start_xy = (float(robot.x), float(robot.y))
                 self.set_robot_goal_or_waypoints(robot, waypoints)
@@ -5608,6 +5819,8 @@ class SimulationControllerMixin:
                         f"Holding: repeated safety replan for the same target ({decision.reason}); "
                         "marking target as failed and re-selecting."
                     )
+                    self.route_failure_count = getattr(self, "route_failure_count", 0) + 1
+                    self.repeated_safety_replan_count = getattr(self, "repeated_safety_replan_count", 0) + 1
                     self.telemetry.report_route_failure(
                         robot_label="R1",
                         start_xy=hold_xy,
@@ -5713,6 +5926,7 @@ class SimulationControllerMixin:
         # staleness check).
         agent.mark_pending_path_requested(target)
 
+        self.planner_jobs_started = getattr(self, "planner_jobs_started", 0) + 1
         self.thread_pool.start(worker)
         self.log_console_message(f"[PREFETCH] requested target={target}")
         return True
@@ -5742,6 +5956,8 @@ class SimulationControllerMixin:
         stored_id = getattr(self, "prefetch_request_ids", {}).get(idx)
         if stored_id != int(request_id):
             return
+
+        self.planner_jobs_completed = getattr(self, "planner_jobs_completed", 0) + 1
 
         agent = self.runtime_agent(None if robot_index == 0 else robot_index)
         if agent is None:

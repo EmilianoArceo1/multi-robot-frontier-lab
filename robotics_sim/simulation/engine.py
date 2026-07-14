@@ -48,6 +48,8 @@ from robotics_sim.simulation.robot_trace import (
     slug_route_failure_reason,
 )
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
+from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
+from robotics_sim.simulation.hazard_service import RuntimeHazardService
 from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
@@ -641,12 +643,26 @@ class SimulationControllerMixin:
     # BELIEF MAP
     # ========================================================
 
-    def reset_belief_map(self, robot_count: int = 1) -> None:
+    def reset_belief_map(
+        self,
+        robot_count: int = 1,
+        *,
+        preserve_hazards: bool = False,
+    ) -> None:
         """Create a fresh logical occupancy/belief map.
 
         This is the source of truth for exploration logic. The canvas pixmaps are
         rendering caches only.
         """
+        preserved_fire_specs = []
+        if preserve_hazards:
+            previous_service = getattr(self, "hazard_service", None)
+            if previous_service is not None:
+                preserved_fire_specs = [
+                    (source.position, source.intensity, source.radius)
+                    for source in previous_service.sources()
+                ]
+
         self.belief_map = BeliefMap(
             bounds=(WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX),
             resolution=max(float(self.config.grid_resolution), 0.10),
@@ -660,12 +676,58 @@ class SimulationControllerMixin:
         self.mapped_obstacle_points = []
         self.mapped_obstacle_point_keys: set[tuple[float, float]] = set()
 
+        # Dynamic hazards are a parallel layer aligned with the belief map.
+        # Recreating the service here gives start/reset the required ephemeral
+        # lifecycle without ever writing temporary fire cells into occupancy.
+        self.hazard_service = RuntimeHazardService(
+            bounds=self.belief_map.bounds,
+            resolution=self.belief_map.resolution,
+            default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
+            default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
+            selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
+            block_threshold=float(getattr(self.config, "hazard_block_threshold", 0.55)),
+        )
+        for position, intensity, radius in preserved_fire_specs:
+            if self.hazard_service.field.in_bounds_world(position):
+                self.hazard_service.field.add_fire(
+                    position, intensity=intensity, radius=radius
+                )
+
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
+            canvas.set_hazard_snapshot(self.hazard_service.snapshot())
+
     def ensure_belief_map(self) -> BeliefMap:
         """Return the active belief map, creating it if needed."""
         if not hasattr(self, "belief_map") or self.belief_map is None:
             count = len(getattr(self, "robots", [])) if getattr(self, "robots", None) else 1
             self.reset_belief_map(robot_count=max(1, count))
         return self.belief_map
+
+    def ensure_hazard_service(self) -> RuntimeHazardService:
+        """Return the runtime hazard service aligned with the active belief."""
+        belief = self.ensure_belief_map()
+        service = getattr(self, "hazard_service", None)
+        if (
+            service is None
+            or service.field.shape != belief.grid.shape
+            or abs(service.field.resolution - belief.resolution) > 1e-9
+            or service.field.bounds != belief.bounds
+        ):
+            self.hazard_service = RuntimeHazardService(
+                bounds=belief.bounds,
+                resolution=belief.resolution,
+                default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
+                default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
+                selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
+                block_threshold=float(getattr(self.config, "hazard_block_threshold", 0.55)),
+            )
+        return self.hazard_service
+
+    def push_hazard_snapshot(self) -> None:
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
+            canvas.set_hazard_snapshot(self.ensure_hazard_service().snapshot())
 
     def occupancy_grid_snapshot(self) -> dict | None:
         """Read-only snapshot of the current belief/occupancy grid, for the
@@ -768,7 +830,6 @@ class SimulationControllerMixin:
             show_vision=True,
             show_explored_area=self.explored_area_switch.isChecked(),
             show_obstacles=self.obstacles_switch.isChecked(),
-            show_robot_orders=self.orders_switch.isChecked(),
             mapping_point_spacing=self.config.mapping_point_spacing,
             robot_count=max(1, min(8, int(round(float(self.robot_count_input.value()))))) if hasattr(self, "robot_count_input") else self.config.robot_count,
             selected_robot_index=int(getattr(self, "selected_robot_index", 0)),
@@ -822,7 +883,6 @@ class SimulationControllerMixin:
         self.goal_tol_input.setValue(config.goal_tolerance)
         self.accel_gain_input.setValue(config.acceleration_gain)
         self.preview_switch.setChecked(config.show_goal_preview)
-        self.orders_switch.setChecked(config.show_robot_orders)
         self.obstacles_switch.setChecked(config.show_obstacles)
         self.explored_area_switch.setChecked(config.show_explored_area)
         self.planner_combo.setCurrentText(config.planner_type)
@@ -1114,6 +1174,16 @@ class SimulationControllerMixin:
         )
         if obstacle_points:
             planning_grid.add_obstacle_points(obstacle_points, padding=max(0.0, radius))
+
+        # Project the independent continuous hazard layer into this derived
+        # binary planning grid. BeliefMap.grid is never modified.
+        hazard_service = self.ensure_hazard_service()
+        apply_hazard_to_planning_grid(
+            planning_grid,
+            hazard_service.field,
+            block_threshold=hazard_service.block_threshold,
+            inflate_radius=max(0.0, radius),
+        )
         return planning_grid
 
     def planner_accepts_path_simplifier(self) -> bool:
@@ -2268,6 +2338,15 @@ class SimulationControllerMixin:
                     ),
                     capture=nav_capture,
                 )
+                # Persisted so subsequent ticks' snapshots (which do not
+                # recompute a plan) can still show which planner/simplifier
+                # produced the route currently being executed, instead of
+                # reporting "unavailable" on every tick except the one the
+                # route was actually accepted on. Cleared on the next
+                # accepted/rejected plan, and by the same reset_simulation_
+                # state() points that clear navigation_debug_log.
+                if pending_plan_capture is not None and not (blocked_on_arrival or misses_intended_goal):
+                    self._nav_debug_last_accepted_plan = pending_plan_capture
 
             if blocked_on_arrival:
                 reason = f"{reason}; rejected: first segment blocked on arrival"
@@ -2467,13 +2546,23 @@ class SimulationControllerMixin:
         robot_radius = self.body_radius_for_robot(robot)
         safety_radius = self.safety_radius_for_robot(robot)
 
-        active_target = agent.active_target() if agent is not None else None
-        active_target_xy = None
-        if active_target is not None:
-            active_target_arr = np.asarray(active_target, dtype=float).reshape(-1)
-            active_target_xy = (float(active_target_arr[0]), float(active_target_arr[1]))
+        # Sourced from self.active_target_xy() / robot.waypoints (the
+        # physics Robot's own WaypointManager), NOT agent.active_target()/
+        # agent.waypoints -- the RobotAgent's route bookkeeping and the
+        # physics robot's own waypoint tracker are two separate
+        # WaypointManager instances (RobotAgent decides the route; Robot.
+        # update() -> advance_waypoint_if_needed() is what actually
+        # advances current_index during motion). Using the agent's copy
+        # here could show a segment pointing at a waypoint the robot's own
+        # tracker already advanced past. self.active_target_xy() is the
+        # same accessor build_observation()/simulation_step() already use
+        # for the real active_segment_blocked check, so this now agrees
+        # with what the controller is actually tracking this tick.
+        active_target_xy = self.active_target_xy()
 
-        waypoints_mgr = getattr(agent, "waypoints", None) if agent is not None else None
+        waypoints_mgr = getattr(robot, "waypoints", None)
+        if waypoints_mgr is None or not hasattr(waypoints_mgr, "waypoints"):
+            waypoints_mgr = getattr(agent, "waypoints", None) if agent is not None else None
         active_path: tuple[tuple[float, float], ...] = ()
         active_waypoint_index = None
         if waypoints_mgr is not None and getattr(waypoints_mgr, "waypoints", None):
@@ -2485,7 +2574,13 @@ class SimulationControllerMixin:
         pending_path_raw = getattr(agent, "pending_path", None) if agent is not None else None
         pending_path = tuple((float(p[0]), float(p[1])) for p in pending_path_raw) if pending_path_raw else ()
 
-        plan = capture.plan
+        # Falls back to the last ACCEPTED plan when this tick did not just
+        # compute a fresh one (the overwhelmingly common case -- most ticks
+        # are routine FOLLOW_PATH ticks, not route-result ticks) so
+        # planner/simplifier/raw/simplified-path keep describing the route
+        # currently being executed instead of reading "unavailable" on
+        # every tick except the exact one a route was accepted on.
+        plan = capture.plan or getattr(self, "_nav_debug_last_accepted_plan", None)
         path = PathDebug(
             raw_path=Maybe.of(plan.raw_world_path) if plan and plan.raw_world_path is not None else Maybe.missing(),
             simplified_path=(
@@ -2609,26 +2704,28 @@ class SimulationControllerMixin:
             explanation=explanation,
         )
 
-        # The ring buffer only ever receives relevant events (see the brief:
-        # "No guardar cada render frame ... Guardar cambios de decisión y
-        # eventos relevantes") -- a routine FOLLOW_PATH/BRAKE/REQUEST_PLAN
-        # tick maps to NavigationDebugEventKind.TICK and is deliberately
-        # never pushed here, or 800 routine ticks would evict every
-        # actually-interesting historical event within a couple of seconds.
-        # The canvas still gets every snapshot below so the live overlay/HUD
-        # stays current while running; pausing just stops these calls, which
-        # is what leaves the last relevant *event* (not just the last live
-        # snapshot) intact for inspection.
+        # The ring buffer records every tick (a full in-memory history for
+        # the </> step buttons to scrub through) -- bounded (see
+        # NavigationDebugEventLog's max_size) and cleared whenever a
+        # simulation starts/resets (the 3 reset_simulation_state() call
+        # sites), so it never persists across a restart and never grows
+        # without bound. The canvas also gets every snapshot below so the
+        # live overlay/HUD stays current while running; pausing just stops
+        # these calls, which is what leaves the last snapshot intact for
+        # inspection.
         canvas = getattr(self, "canvas", None)
+        self._nav_debug_live_snapshot = snapshot
+
+        log = getattr(self, "navigation_debug_log", None)
+        if log is not None:
+            log.record(event_kind, snapshot)
 
         if event_kind is not NavigationDebugEventKind.TICK:
-            log = getattr(self, "navigation_debug_log", None)
-            if log is not None:
-                log.record(event_kind, snapshot)
             # Pushed separately from the always-current "live" snapshot
-            # below so the HUD can show "last relevant event" even on a
-            # tick where nothing relevant just happened (e.g. the robot is
-            # calmly following a path two seconds after a ROUTE_REJECTED).
+            # below so the HUD's "last relevant event" line stays a sparse,
+            # meaningful signal (PLAN_ACCEPTED/ROUTE_REJECTED/SAFETY_REPLAN/
+            # ...) even while routine ticks keep recording into the full
+            # history above.
             if canvas is not None and hasattr(canvas, "set_navigation_debug_last_event"):
                 canvas.set_navigation_debug_last_event(NavigationDebugEvent(event_kind, snapshot))
 
@@ -2663,34 +2760,46 @@ class SimulationControllerMixin:
             canvas.set_navigation_debug_history_position(index + 1, len(log))
 
     def step_navigation_debug_history(self, delta: int) -> None:
-        """Step backward (delta<0) / forward (delta>0) through the bounded
-        relevant-event ring buffer. No-op unless both navigation_debug_enabled
-        and paused -- while running, the per-tick live push in
-        _finalize_navigation_debug_snapshot() would immediately overwrite
-        whatever this selects, so stepping only makes sense at rest."""
+        """Navigate LIVE <-> latest <-> older frozen snapshots while paused."""
         if not getattr(self, "navigation_debug_enabled", False) or not getattr(self, "paused", False):
             return
         length = self.navigation_debug_history_length()
-        if length == 0:
+        if length == 0 or int(delta) == 0:
             return
 
         current = getattr(self, "_nav_debug_history_index", None)
-        if current is None:
-            # First step away from "live" starts at the latest relevant
-            # event, then moves from there.
-            current = length - 1
-        new_index = max(0, min(length - 1, current + int(delta)))
-        self._push_navigation_debug_history_view(new_index)
+        if int(delta) < 0:
+            new_index = length - 1 if current is None else max(0, current - 1)
+            self._push_navigation_debug_history_view(new_index)
+        else:
+            if current is None:
+                return
+            if current >= length - 1:
+                self.resume_navigation_debug_live_view()
+            else:
+                self._push_navigation_debug_history_view(current + 1)
+        updater = getattr(self, "update_navigation_debug_step_buttons", None)
+        if callable(updater):
+            updater()
 
     def resume_navigation_debug_live_view(self) -> None:
-        """Return to the live (always-current) snapshot view. Called when
-        the simulation resumes from pause so a stale historical snapshot
-        never lingers once new ticks start pushing again, and so the next
-        pause starts stepping from "latest" rather than a stale index."""
+        """Restore the last real live snapshot after history inspection."""
         self._nav_debug_history_index = None
         canvas = getattr(self, "canvas", None)
-        if canvas is not None and hasattr(canvas, "set_navigation_debug_history_position"):
+        if canvas is None:
+            return
+        live_snapshot = getattr(self, "_nav_debug_live_snapshot", None)
+        if live_snapshot is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
+            canvas.set_navigation_debug_snapshot(live_snapshot)
+        log = getattr(self, "navigation_debug_log", None)
+        latest = log.latest() if log is not None else None
+        if hasattr(canvas, "set_navigation_debug_last_event"):
+            canvas.set_navigation_debug_last_event(latest)
+        if hasattr(canvas, "set_navigation_debug_history_position"):
             canvas.set_navigation_debug_history_position(None, self.navigation_debug_history_length())
+        updater = getattr(self, "update_navigation_debug_step_buttons", None)
+        if callable(updater):
+            updater()
 
     def assign_route_to_robot(self) -> None:
         if self.robot is None:
@@ -2793,13 +2902,23 @@ class SimulationControllerMixin:
         reason: str,
         waypoints: list,
     ) -> None:
-        self.active_planner_workers.pop(int(request_id), None)
+        worker = self.active_planner_workers.pop(int(request_id), None)
 
         if request_id != self.route_request_id:
             return
 
         self.planning_in_progress = False
         self.planner_jobs_completed = getattr(self, "planner_jobs_completed", 0) + 1
+        # PlannerWorker filled worker.debug_capture (if any) on the
+        # background thread during run(); safe to read now, only after the
+        # route_ready signal has fired -- same handoff pattern already used
+        # for route_plan_ms/route_plan_perf_line. Almost every route after
+        # the first goes through this async path (replanning during motion
+        # always does, for a non-Direct planner), not compute_route()'s
+        # synchronous path -- without this, apply_route_result() below
+        # would never see a plan to persist, and planner/simplifier would
+        # read "unavailable" for the rest of the run after the first route.
+        self._nav_debug_last_plan_capture = getattr(worker, "debug_capture", None)
         clean_waypoints = [tuple(point) for point in waypoints]
         self.apply_route_result(success, reason, clean_waypoints)
 
@@ -3605,19 +3724,25 @@ class SimulationControllerMixin:
             self.start_button.setIcon(make_icon("pause", "white"))
 
     def update_navigation_debug_step_buttons(self) -> None:
-        """Enable the </> history-step buttons only while both the debug
-        layer is on and the simulation is paused -- stepping while running
-        would fight the live per-tick snapshot push (see
-        step_navigation_debug_history()'s own no-op guard, mirrored here
-        purely for the widgets' enabled state)."""
-        can_step = bool(getattr(self, "navigation_debug_enabled", False)) and bool(getattr(self, "paused", False))
+        """Reflect history boundaries and hide controls when unusable."""
         canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        length = self.navigation_debug_history_length()
+        active = (
+            bool(getattr(self, "navigation_debug_enabled", False))
+            and bool(getattr(self, "paused", False))
+            and length > 0
+        )
+        current = getattr(self, "_nav_debug_history_index", None)
         back_button = getattr(canvas, "navigation_debug_step_back_button", None)
         forward_button = getattr(canvas, "navigation_debug_step_forward_button", None)
         if back_button is not None:
-            back_button.setEnabled(can_step)
+            back_button.setVisible(active)
+            back_button.setEnabled(active and (current is None or current > 0))
         if forward_button is not None:
-            forward_button.setEnabled(can_step)
+            forward_button.setVisible(active)
+            forward_button.setEnabled(active and current is not None)
 
     def handle_start_pause_button(self) -> None:
         has_runtime_robot = self.robot is not None or bool(getattr(self, "robots", []))
@@ -4257,7 +4382,7 @@ class SimulationControllerMixin:
         # planner or used stale information from a previous run.
         self.known_obstacles = []
         self.explored_area_polygons = []
-        self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1)
+        self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1, preserve_hazards=True)
         self.current_exploration_target = None
         self.multi_exploration_targets = []
         self.multi_invalidated_exploration_targets = []
@@ -4269,6 +4394,9 @@ class SimulationControllerMixin:
         self.navigation_debug_log = NavigationDebugEventLog()
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
+        self._nav_debug_last_accepted_plan = None
+        self._nav_debug_live_snapshot = None
+        self._nav_debug_pending_plan_capture_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -4299,6 +4427,7 @@ class SimulationControllerMixin:
         self.log_console_message(self.simulation_start_summary(multi=True))
 
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
+        self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_planned_path([])
@@ -4413,7 +4542,7 @@ class SimulationControllerMixin:
 
         self.known_obstacles = []
         self.explored_area_polygons = []
-        self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1)
+        self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1, preserve_hazards=True)
         self.current_exploration_target = None
         self.multi_exploration_targets = []
         self.multi_invalidated_exploration_targets = []
@@ -4425,6 +4554,9 @@ class SimulationControllerMixin:
         self.navigation_debug_log = NavigationDebugEventLog()
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
+        self._nav_debug_last_accepted_plan = None
+        self._nav_debug_live_snapshot = None
+        self._nav_debug_pending_plan_capture_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -4435,6 +4567,7 @@ class SimulationControllerMixin:
         self.multi_last_motion_log_times = {}
         self.log_console_message(self.simulation_start_summary(multi=False))
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
+        self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.record_explored_area(force=True)
         self.update_sensed_obstacles(force_status=False)
@@ -4500,6 +4633,9 @@ class SimulationControllerMixin:
         self.navigation_debug_log = NavigationDebugEventLog()
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
+        self._nav_debug_last_accepted_plan = None
+        self._nav_debug_live_snapshot = None
+        self._nav_debug_pending_plan_capture_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -4536,6 +4672,7 @@ class SimulationControllerMixin:
         self.canvas.set_exploration_target(None)
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
+        self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
@@ -4593,6 +4730,150 @@ class SimulationControllerMixin:
                 agent.invalidate_route(reason="manual goal changed in Goal seeking")
             self.assign_route_to_robot()
             self.canvas.set_status("Goal updated by canvas click and route reassigned.")
+
+    def _route_intersects_hazard_points(
+        self,
+        route_points: list[tuple[float, float]],
+        hazard_points: tuple[tuple[float, float], ...],
+        *,
+        robot_radius: float,
+    ) -> bool:
+        """Return whether a current route crosses thresholded hazard cells."""
+        if self.collision_checker is None or len(route_points) < 2 or not hazard_points:
+            return False
+        for start, end in zip(route_points[:-1], route_points[1:]):
+            report = self.collision_checker.check_segment_points(
+                start=start,
+                end=end,
+                obstacle_points=list(hazard_points),
+                robot_radius=max(0.0, float(robot_radius)),
+            )
+            if report.collision:
+                return True
+        return False
+
+    def _replan_routes_affected_by_hazard(self) -> None:
+        """Replan only active routes that now cross blocked thermal cells."""
+        if not getattr(self, "running", False):
+            return
+
+        service = self.ensure_hazard_service()
+        hazard_points = service.blocked_world_points()
+        if not hazard_points:
+            return
+
+        robots = list(getattr(self, "robots", []) or [])
+        if robots and "Multiple" in str(getattr(self.config, "agent_mode", "")):
+            old_robot = getattr(self, "robot", None)
+            try:
+                for robot_index, robot in enumerate(robots):
+                    route_points = self.current_route_points_for_robot(robot)
+                    if not self._route_intersects_hazard_points(
+                        route_points,
+                        hazard_points,
+                        robot_radius=self.safety_radius_for_robot(robot),
+                    ):
+                        continue
+                    self.robot = robot
+                    if str(getattr(self.config, "planner_type", "")) == "Direct":
+                        if hasattr(robot, "force_stop"):
+                            robot.force_stop(reason="dynamic fire hazard blocks direct route")
+                        agent = self.runtime_agent(robot_index)
+                        if agent is not None:
+                            agent.invalidate_route(
+                                reason="dynamic fire hazard blocks direct route"
+                            )
+                        continue
+                    self.assign_route_to_multi_robot(
+                        robot_index,
+                        reason="Dynamic fire hazard affects current route",
+                        force_new_exploration_target=False,
+                    )
+            finally:
+                self.robot = old_robot
+            return
+
+        if self.robot is None:
+            return
+        if self._route_intersects_hazard_points(
+            self.current_route_points(),
+            hazard_points,
+            robot_radius=self.safety_radius_for_robot(self.robot),
+        ):
+            agent = self.runtime_agent(None)
+            if agent is not None:
+                agent.invalidate_pending_path(
+                    reason="dynamic fire hazard affects current route"
+                )
+            if str(getattr(self.config, "planner_type", "")) == "Direct":
+                if hasattr(self.robot, "force_stop"):
+                    self.robot.force_stop(reason="dynamic fire hazard blocks direct route")
+                if agent is not None:
+                    agent.invalidate_route(
+                        reason="dynamic fire hazard blocks direct route"
+                    )
+                self.canvas.set_status(
+                    "Fire blocks the direct route. Select A* or Dijkstra to route around it."
+                )
+                return
+            self.replan_after_new_information(
+                "Dynamic fire hazard affects current route."
+            )
+
+    def add_fire(self, x: float, y: float) -> bool:
+        """Add a temporary globally-known fire without changing occupancy."""
+        service = self.ensure_hazard_service()
+        try:
+            change = service.add_fire((float(x), float(y)))
+        except ValueError as exc:
+            self.canvas.set_status(str(exc))
+            return False
+
+        self.push_hazard_snapshot()
+        source = change.source
+        self.canvas.set_status(
+            f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
+            f"radius={source.radius:.2f}m."
+        )
+        self._replan_routes_affected_by_hazard()
+        return True
+
+    def remove_fire_near(self, x: float, y: float) -> bool:
+        """Remove the nearest fire source without freeing occupancy cells."""
+        service = self.ensure_hazard_service()
+        change = service.remove_fire_near((float(x), float(y)))
+        if not change.changed or change.source is None:
+            return False
+
+        self.push_hazard_snapshot()
+        source = change.source
+        self.canvas.set_status(
+            f"Fire removed at ({source.position[0]:.2f}, {source.position[1]:.2f})."
+        )
+        return True
+
+    def on_fire_toggle_requested(self, x: float, y: float) -> None:
+        """Exploration click: remove a nearby source or create a new one."""
+        service = self.ensure_hazard_service()
+        if not service.field.in_bounds_world((float(x), float(y))):
+            self.canvas.set_status("Fire ignored: click is outside the map bounds.")
+            return
+
+        change = service.toggle_fire_at((float(x), float(y)))
+        self.push_hazard_snapshot()
+        if change.action == "removed" and change.source is not None:
+            source = change.source
+            self.canvas.set_status(
+                f"Fire removed at ({source.position[0]:.2f}, {source.position[1]:.2f})."
+            )
+            return
+        if change.action == "added" and change.source is not None:
+            source = change.source
+            self.canvas.set_status(
+                f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
+                f"radius={source.radius:.2f}m."
+            )
+            self._replan_routes_affected_by_hazard()
 
     def body_radius_for_robot(self, robot=None) -> float:
         """Return physical body radius for a runtime robot or the global config."""
@@ -6463,6 +6744,14 @@ class SimulationControllerMixin:
             waypoints = agent.accept_pending_path()
             _record_perf(self, "pending_path_acceptance", time.perf_counter() - _pending_accept_perf_start)
             if waypoints:
+                robot_index = 0
+                if getattr(self, "robots", None):
+                    robot_index = next((i for i, candidate in enumerate(self.robots) if candidate is robot), 0)
+                pending_captures = getattr(self, "_nav_debug_pending_plan_capture_by_robot", {})
+                promoted_plan_capture = pending_captures.pop(robot_index, None)
+                if promoted_plan_capture is not None:
+                    self._nav_debug_last_accepted_plan = promoted_plan_capture
+
                 start_xy = (float(robot.x), float(robot.y))
                 self.set_robot_goal_or_waypoints(robot, waypoints)
                 self.canvas.set_planned_path([start_xy] + list(waypoints))
@@ -6842,6 +7131,12 @@ class SimulationControllerMixin:
                 return
 
             agent.pending_path = clean_waypoints
+            pending_captures = getattr(self, "_nav_debug_pending_plan_capture_by_robot", None)
+            if pending_captures is None:
+                self._nav_debug_pending_plan_capture_by_robot = {}
+                pending_captures = self._nav_debug_pending_plan_capture_by_robot
+            if pending_plan_capture is not None:
+                pending_captures[idx] = pending_plan_capture
             # pending_target_xy was set when the worker launched; keep it.
             agent.prefetch_success_count += 1
             self.log_console_message(

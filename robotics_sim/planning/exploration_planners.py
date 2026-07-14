@@ -822,8 +822,57 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
         if not candidates:
             return ExplorationPlannerResult(False, None, "no valid frontier candidates found", ())
 
-        chosen = self.choose_candidate(candidates)
-        return ExplorationPlannerResult(True, chosen.target, f"{self.name}: {chosen.reason}", tuple(candidates))
+        candidates_public = tuple(candidates)
+
+        # Optional reachability gate: `frontier_candidates()` above only
+        # consults the belief map, not the dense-obstacle-point-padded grid
+        # the real single-robot navigation A* plans on, so a candidate this
+        # scorer accepts can still come back "no path found" from the actual
+        # planner. When the caller supplies is_candidate_reachable(xy) ->
+        # bool (typically backed by that same real planning grid), reject
+        # candidates it rejects here, before final selection, instead of
+        # sending them to A* and failing downstream.
+        is_candidate_reachable = kwargs.get("is_candidate_reachable")
+        filtered_unreachable = 0
+
+        if callable(is_candidate_reachable):
+            reachable_candidates: list[FrontierCandidate] = []
+            for item in candidates:
+                try:
+                    reachable = bool(is_candidate_reachable(item.target))
+                except Exception:
+                    # A broken reachability callback must not take down
+                    # exploration -- treat it as "unknown, assume reachable".
+                    reachable = True
+                if reachable:
+                    reachable_candidates.append(item)
+                else:
+                    filtered_unreachable += 1
+        else:
+            reachable_candidates = candidates
+
+        if not reachable_candidates:
+            return ExplorationPlannerResult(
+                False,
+                None,
+                (
+                    f"{self.name}: no reachable frontier candidates: all {len(candidates)} "
+                    f"candidate(s) were rejected by the navigation reachability check; "
+                    f"generated={len(candidates)}, filtered_unreachable={filtered_unreachable}"
+                ),
+                candidates_public,
+            )
+
+        chosen = self.choose_candidate(reachable_candidates)
+        return ExplorationPlannerResult(
+            True,
+            chosen.target,
+            (
+                f"{self.name}: {chosen.reason}; generated={len(candidates)}, "
+                f"filtered_unreachable={filtered_unreachable}"
+            ),
+            candidates_public,
+        )
 
 
 class NearestFrontierPlanner(FrontierExplorationPlanner):

@@ -207,8 +207,6 @@ def build_config_panel(window):
     options_grid.setHorizontalSpacing(10)
     options_grid.setVerticalSpacing(9)
 
-    window.state_switch = ToggleSwitch(True)
-
     window.planner_combo = QComboBox()
     window.planner_combo.addItems([
         "Direct",
@@ -229,9 +227,6 @@ def build_config_panel(window):
     window.coordinator_combo.addItems(COORDINATOR_OPTIONS)
     window.coordinator_combo.setCurrentText(DEFAULT_COORDINATOR)
 
-    window.control_combo = QComboBox()
-    window.control_combo.addItems(["Nominal", "Adaptive"])
-
     window.vision_combo = QComboBox()
     window.vision_combo.addItems([
         "LiDAR",
@@ -239,46 +234,36 @@ def build_config_panel(window):
         "Omnidirectional",
     ])
 
-
-    window.orders_switch = ToggleSwitch(False)
     window.obstacles_switch = ToggleSwitch(True)
     window.explored_area_switch = ToggleSwitch(True)
 
     # Visual toggles go first because they are runtime-safe and apply to
     # all robots, independent of whether robots share configuration.
-    options_grid.addWidget(
-        labeled_toggle("Robot Orders", window.orders_switch),
-        0,
-        0,
-    )
+    # "Robot Orders"/"State Machine"/"Motion Control Service" were removed:
+    # the first two are superseded by the Navigation Debug eye icon on the
+    # canvas (see simulation_canvas.py), and Motion Control Service's
+    # Nominal/Adaptive choice was never read anywhere -- confirmed dead,
+    # decorative UI with zero effect on simulation behavior.
     options_grid.addWidget(
         labeled_toggle("Show Obstacles", window.obstacles_switch),
         0,
-        1,
-    )
-    options_grid.addWidget(
-        labeled_toggle("Explored Area", window.explored_area_switch),
-        1,
         0,
     )
     options_grid.addWidget(
-        labeled_toggle("State Machine", window.state_switch),
-        1,
+        labeled_toggle("Explored Area", window.explored_area_switch),
+        0,
         1,
     )
     options_grid.addWidget(
         labeled_combo("Path Planner Service", window.planner_combo),
-        3,
-        0,
-    )
-    options_grid.addWidget(
-        labeled_combo("Motion/Control Service", window.control_combo),
-        3,
         1,
+        0,
+        1,
+        2,
     )
     options_grid.addWidget(
         labeled_combo("Vision Model", window.vision_combo),
-        4,
+        2,
         0,
         1,
         2,
@@ -289,7 +274,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        5,
+        3,
         0,
         1,
         2,
@@ -301,7 +286,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        6,
+        4,
         0,
         1,
         2,
@@ -313,7 +298,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        7,
+        5,
         0,
         1,
         2,
@@ -329,7 +314,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        8,
+        6,
         0,
         1,
         2,
@@ -345,7 +330,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        8,
+        6,
         0,
         1,
         2,
@@ -367,7 +352,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        9,
+        7,
         0,
         1,
         2,
@@ -383,7 +368,7 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        10,
+        8,
         0,
     )
 
@@ -770,7 +755,6 @@ def build_config_panel(window):
         widget.valueChanged.connect(window.update_preview)
 
     window.preview_switch.toggled.connect(window.update_preview)
-    window.state_switch.toggled.connect(window.update_preview)
     # Editor controls are created in build_editor_panel(). Do not create the
     # editor tool combo here; doing so would leave the editor with wrong options.
     window.planner_combo.currentTextChanged.connect(window.update_preview)
@@ -778,7 +762,6 @@ def build_config_panel(window):
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
     window.coordinator_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)
-    window.orders_switch.toggled.connect(window.update_preview)
     window.obstacles_switch.toggled.connect(window.update_preview)
     window.explored_area_switch.toggled.connect(window.update_preview)
     window.body_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
@@ -807,16 +790,14 @@ def build_config_panel(window):
 
     # Controls that define the initial conditions, algorithms, and physical
     # model are locked while a simulation is active. Display-only controls
-    # such as Robot Orders, Show Obstacles, Explored Area, Metrics, and
-    # Speed stay available because they do not invalidate the running state.
+    # such as Show Obstacles, Explored Area, Metrics, and Speed stay
+    # available because they do not invalidate the running state.
     window.locked_during_run_widgets = [
         window.top_bar.mode_selector,
-        window.state_switch,
         window.planner_combo,
         window.path_simplifier_combo,
         window.exploration_planner_combo,
         window.coordinator_combo,
-        window.control_combo,
         window.vision_combo,
         window.robot_count_input,
         window.same_config_switch,

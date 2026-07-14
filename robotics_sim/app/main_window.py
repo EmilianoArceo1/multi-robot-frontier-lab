@@ -43,6 +43,7 @@ from robotics_sim.app.widgets import (
     make_icon,
 )
 from robotics_sim.app.simulation_canvas import SimulationCanvas
+from robotics_sim.app.navigation_reasoning_window import NavigationReasoningWindow
 from robotics_sim.app.config_panel import build_config_panel as build_right_config_panel
 from robotics_sim.app.map_editor import (
     MIN_EDITOR_OBSTACLE_SIZE,
@@ -96,6 +97,22 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         # index into navigation_debug_log's events while the user is
         # stepping through history with the </> buttons (paused only).
         self._nav_debug_history_index = None
+        # Last ACCEPTED plan's planner/simplifier/raw/simplified-path,
+        # persisted so routine ticks (which do not recompute a plan) keep
+        # describing the route currently being executed -- see apply_route_
+        # result()'s diagnostics block and _finalize_navigation_debug_
+        # snapshot()'s fallback.
+        self._nav_debug_last_accepted_plan = None
+        # Last live snapshot is kept separately from the historical view so
+        # stepping backward while paused can always return to the actual live
+        # state instead of leaving a stale history frame on the canvas.
+        self._nav_debug_live_snapshot = None
+        self._nav_debug_pending_plan_capture_by_robot: dict[int, object] = {}
+
+        # RuntimeHazardService is created lazily by reset_belief_map(), using
+        # the same bounds/resolution as the logical occupancy belief. Temporary
+        # fire sources never live inside BeliefMap.grid.
+        self.hazard_service = None
         self.editor_mode = False
         self.editor_tool = "rectangles"
         self.editor_interaction_mode = "paint"
@@ -256,6 +273,14 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas.navigation_debug_step_back_button.clicked.connect(self.on_navigation_debug_step_back)
         self.canvas.navigation_debug_step_forward_button.clicked.connect(self.on_navigation_debug_step_forward)
         self.canvas.navigationDebugToggleRequested.connect(self.on_navigation_debug_eye_clicked)
+        self.canvas.fireToggleRequested.connect(self.on_fire_toggle_requested)
+
+        # Standalone window for the full "Navigation Reasoning" breakdown --
+        # a separate OS window instead of a card drawn on the canvas so it
+        # can never overlap the map/title/FPS. Hidden until the eye icon
+        # turns Navigation Debug on (see on_navigation_debug_toggled()).
+        self.navigation_reasoning_window = NavigationReasoningWindow(self)
+        self.canvas.set_navigation_reasoning_window(self.navigation_reasoning_window)
 
         self.simulation_panel = self.build_config_panel()
         self.editor_panel = self.build_editor_panel()
@@ -587,6 +612,14 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             self.resume_navigation_debug_live_view()
         self.update_navigation_debug_step_buttons()
 
+        window = getattr(self, "navigation_reasoning_window", None)
+        if window is not None:
+            if enabled:
+                window.show()
+                window.raise_()
+            else:
+                window.hide()
+
     def on_navigation_debug_step_back(self) -> None:
         self.step_navigation_debug_history(-1)
 
@@ -717,7 +750,6 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             self.exploration_planner_field.field_label.setText(label_text)
         self.planner_combo.setEnabled(policy.path_planner_enabled and not_locked)
         self.path_simplifier_field.setEnabled(policy.path_simplifier_enabled and not_locked)
-        self.control_combo.setEnabled(policy.control_enabled and not_locked)
 
     def set_configuration_locked(self, locked: bool) -> None:
         """

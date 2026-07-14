@@ -75,6 +75,12 @@ def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamesp
     fake.clean_waypoints_for_current_start = lambda waypoints: [tuple(p) for p in waypoints]
     fake.final_goal_xy = lambda: (0.0, 0.0)
     fake.runtime_agent = lambda robot_index=None: fake.agent
+    # _FakeRobot.waypoints is a plain list (set by set_waypoints()), not a
+    # WaypointManager -- mirrors the real engine.active_target_xy()'s
+    # contract (the real accessor _finalize_navigation_debug_snapshot()
+    # now uses) closely enough for these tests, which don't assert on the
+    # active_segment endpoint itself.
+    fake.active_target_xy = lambda: fake.agent.active_target()
 
     fake.navigation_debug_enabled = navigation_debug_enabled
     fake.navigation_debug_log = NavigationDebugEventLog(max_size=10)

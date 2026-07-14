@@ -234,6 +234,15 @@ class SimulationCanvas(QWidget):
         self._grid_overlay_last_cache_status = "off"
         self._grid_overlay_last_visible_cells = 0
         self._grid_overlay_degraded = False
+        # Fine-grained grid-overlay timings, reported via the optional
+        # [RENDER] detail line only -- see draw_grid_overlay()'s/
+        # _rebuild_grid_overlay_cache()'s own comments for where each is
+        # measured. Purely observational: reading/writing these never
+        # changes which branch draw_grid_overlay() takes.
+        self._grid_overlay_rebuild_ms = 0.0
+        self._grid_overlay_blit_ms = 0.0
+        self._grid_overlay_cells_ms = 0.0
+        self._grid_overlay_lines_ms = 0.0
 
         # Render-only FPS/frame-time telemetry. Independent of the engine --
         # this only ever measures how fast paintEvent itself is running.
@@ -255,6 +264,22 @@ class SimulationCanvas(QWidget):
         self._render_layer_ms: dict[str, float] = {
             "background": 0.0, "map_layer": 0.0, "robot_body": 0.0, "robot_fov": 0.0,
             "route_path": 0.0, "sensor_debug_overlay": 0.0, "overlays": 0.0,
+            # map_layer_ms sub-buckets -- these four must sum back to
+            # map_layer_ms (plus negligible measurement overhead).
+            "grid_overlay": 0.0, "explored_area": 0.0,
+            "ground_truth_obstacles": 0.0, "mapped_obstacle_points": 0.0,
+            # overlays_ms sub-buckets -- these six must sum back to
+            # overlays_ms (plus negligible measurement overhead).
+            "editor_overlays": 0.0, "grid_preview": 0.0, "plot_border": 0.0,
+            "card": 0.0, "title": 0.0, "telemetry": 0.0,
+        }
+        # Fine-grained robot-FOV timings, reported via the optional
+        # [RENDER] detail line -- see draw_sensor_range()'s own comments
+        # for where each is measured. Mirrors _route_detail's pattern.
+        self._fov_detail: dict = {
+            "robot_fov_cache_hit": True,
+            "robot_fov_compute_ms": 0.0,
+            "robot_fov_paint_ms": 0.0,
         }
         # Render caches for robot-related dynamic layers -- see
         # draw_executed_path()/draw_planned_route()'s own docstrings for
@@ -1311,19 +1336,30 @@ class SimulationCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        _chrome_start = time.perf_counter()
+        _card_start = time.perf_counter()
         self.draw_card(painter)
+        card_ms = (time.perf_counter() - _card_start) * 1000.0
+        self._render_layer_ms["card"] = card_ms
+
+        _title_start = time.perf_counter()
         self.draw_title(painter)
-        chrome_ms_before_plot = (time.perf_counter() - _chrome_start) * 1000.0
+        title_ms = (time.perf_counter() - _title_start) * 1000.0
+        self._render_layer_ms["title"] = title_ms
 
         self.draw_plot(painter)
 
-        _chrome_start = time.perf_counter()
+        _telemetry_start = time.perf_counter()
         self.draw_telemetry(painter)
+        telemetry_ms = (time.perf_counter() - _telemetry_start) * 1000.0
+        self._render_layer_ms["telemetry"] = telemetry_ms
+
         # Card/title/telemetry chrome is small, one-off UI decoration, not
         # a simulation/map/robot layer -- folded into "overlays" for the
-        # optional [RENDER] detail line rather than given its own bucket.
-        self._render_layer_ms["overlays"] += chrome_ms_before_plot + (time.perf_counter() - _chrome_start) * 1000.0
+        # optional [RENDER] detail line rather than given its own top-level
+        # bucket. Each is also kept as its own named sub-bucket above so a
+        # telemetry/card/title spike is distinguishable from the editor-
+        # overlay/grid-preview/plot-border sub-layers.
+        self._render_layer_ms["overlays"] += card_ms + title_ms + telemetry_ms
 
         self._report_render_perf(frame_start)
 
@@ -1376,8 +1412,21 @@ class SimulationCanvas(QWidget):
             total_ms=paint_ms,
             background_ms=self._render_layer_ms.get("background", 0.0),
             map_layer_ms=self._render_layer_ms.get("map_layer", 0.0),
+            grid_overlay_ms=self._render_layer_ms.get("grid_overlay", 0.0),
+            grid_overlay_cache_status=self._grid_overlay_last_cache_status,
+            grid_overlay_visible_cells=self._grid_overlay_last_visible_cells,
+            grid_overlay_rebuild_ms=self._grid_overlay_rebuild_ms,
+            grid_overlay_blit_ms=self._grid_overlay_blit_ms,
+            grid_overlay_cells_ms=self._grid_overlay_cells_ms,
+            grid_overlay_lines_ms=self._grid_overlay_lines_ms,
+            explored_area_ms=self._render_layer_ms.get("explored_area", 0.0),
+            ground_truth_obstacles_ms=self._render_layer_ms.get("ground_truth_obstacles", 0.0),
+            mapped_obstacle_points_ms=self._render_layer_ms.get("mapped_obstacle_points", 0.0),
             robot_body_ms=self._render_layer_ms.get("robot_body", 0.0),
             robot_fov_ms=self._render_layer_ms.get("robot_fov", 0.0),
+            robot_fov_cache_hit=self._fov_detail.get("robot_fov_cache_hit", True),
+            robot_fov_compute_ms=self._fov_detail.get("robot_fov_compute_ms", 0.0),
+            robot_fov_paint_ms=self._fov_detail.get("robot_fov_paint_ms", 0.0),
             route_path_ms=self._render_layer_ms.get("route_path", 0.0),
             planned_route_build_ms=self._route_detail.get("planned_route_build_ms", 0.0),
             planned_route_paint_ms=self._route_detail.get("planned_route_paint_ms", 0.0),
@@ -1388,6 +1437,12 @@ class SimulationCanvas(QWidget):
             executed_trail_cache_hit=self._route_detail.get("executed_trail_cache_hit", False),
             sensor_debug_overlay_ms=self._render_layer_ms.get("sensor_debug_overlay", 0.0),
             overlays_ms=self._render_layer_ms.get("overlays", 0.0),
+            editor_overlays_ms=self._render_layer_ms.get("editor_overlays", 0.0),
+            grid_preview_ms=self._render_layer_ms.get("grid_preview", 0.0),
+            plot_border_ms=self._render_layer_ms.get("plot_border", 0.0),
+            card_ms=self._render_layer_ms.get("card", 0.0),
+            title_ms=self._render_layer_ms.get("title", 0.0),
+            telemetry_ms=self._render_layer_ms.get("telemetry", 0.0),
             cache_hit=self._last_background_cache_hit,
         )
 
@@ -1724,21 +1779,37 @@ class SimulationCanvas(QWidget):
         # Persistent "Show Grid" overlay, drawn just above the background so
         # every other layer below (obstacles, mapped points, routes, robot,
         # safety radius, FoV, labels) stays clearly visible on top of it.
+        # Broken into its own sub-bucket (plus draw_grid_overlay()'s own
+        # cache_status/visible_cells/rebuild_ms/blit_ms fields) so a
+        # rebuild spike is distinguishable from the other map_layer_ms
+        # sub-layers below.
+        _grid_overlay_start = time.perf_counter()
         self.draw_grid_overlay(painter, rect)
+        self._render_layer_ms["grid_overlay"] = (time.perf_counter() - _grid_overlay_start) * 1000.0
 
         # Always-visible physical world layers.
         # These are not "robot orders"; they are what the simulation world
         # actually contains or what the robot has already sensed.
+        _explored_area_start = time.perf_counter()
         self.draw_explored_area_trace(painter)
+        self._render_layer_ms["explored_area"] = (time.perf_counter() - _explored_area_start) * 1000.0
 
         # Ground-truth obstacles are a human-facing visual layer. They can be
         # hidden without changing the robot's partial map or planner inputs.
+        _ground_truth_obstacles_start = time.perf_counter()
         if self.config.show_obstacles:
             self.draw_ground_truth_obstacles(painter)
+        self._render_layer_ms["ground_truth_obstacles"] = (
+            (time.perf_counter() - _ground_truth_obstacles_start) * 1000.0
+        )
 
         # Mapped points remain visible because they represent the discovered map.
         # They are drawn above the vision/r layer and below routes/waypoints/robot.
+        _mapped_obstacle_points_start = time.perf_counter()
         self.draw_mapped_obstacle_points(painter)
+        self._render_layer_ms["mapped_obstacle_points"] = (
+            (time.perf_counter() - _mapped_obstacle_points_start) * 1000.0
+        )
         self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 
         # Robot-related layers, broken down into named sub-buckets for the
@@ -1758,7 +1829,9 @@ class SimulationCanvas(QWidget):
         self.draw_editor_preview(painter)
         self.draw_editor_move_selection(painter)
         self.draw_editor_camera_frame(painter)
-        self._render_layer_ms["overlays"] = (time.perf_counter() - _overlays_start) * 1000.0
+        _editor_overlays_ms = (time.perf_counter() - _overlays_start) * 1000.0
+        self._render_layer_ms["editor_overlays"] = _editor_overlays_ms
+        self._render_layer_ms["overlays"] = _editor_overlays_ms
 
         _route_path_start = time.perf_counter()
         self._route_detail["planned_route_build_ms"] = 0.0
@@ -1779,16 +1852,21 @@ class SimulationCanvas(QWidget):
         self.draw_goal_and_robot(painter)
         self._render_layer_ms["robot_body"] = (time.perf_counter() - _robot_body_start) * 1000.0
 
-        _overlays_tail_start = time.perf_counter()
+        _grid_preview_start = time.perf_counter()
         # Drawn last so the temporary red preview is clearly visible over
         # every other layer while the user is comparing grid resolutions.
         self.draw_grid_resolution_preview(painter, rect)
+        _grid_preview_ms = (time.perf_counter() - _grid_preview_start) * 1000.0
+        self._render_layer_ms["grid_preview"] = _grid_preview_ms
 
         painter.restore()
 
+        _plot_border_start = time.perf_counter()
         painter.setPen(QPen(QColor(BORDER), 1))
         painter.drawRect(rect)
-        self._render_layer_ms["overlays"] += (time.perf_counter() - _overlays_tail_start) * 1000.0
+        _plot_border_ms = (time.perf_counter() - _plot_border_start) * 1000.0
+        self._render_layer_ms["plot_border"] = _plot_border_ms
+        self._render_layer_ms["overlays"] += _grid_preview_ms + _plot_border_ms
 
     def draw_topography(self, painter: QPainter, rect):
         painter.save()
@@ -2088,6 +2166,10 @@ class SimulationCanvas(QWidget):
             self._grid_overlay_last_cache_status = "off"
             self._grid_overlay_last_visible_cells = 0
             self._grid_overlay_degraded = False
+            self._grid_overlay_rebuild_ms = 0.0
+            self._grid_overlay_blit_ms = 0.0
+            self._grid_overlay_cells_ms = 0.0
+            self._grid_overlay_lines_ms = 0.0
             return
 
         resolution = self._grid_overlay_resolution
@@ -2127,16 +2209,23 @@ class SimulationCanvas(QWidget):
         )
 
         if self._grid_overlay_cache is not None and self._grid_overlay_cache_key == cache_key:
+            self._grid_overlay_rebuild_ms = 0.0
+            _blit_start = time.perf_counter()
             painter.drawPixmap(0, 0, self._grid_overlay_cache)
+            self._grid_overlay_blit_ms = (time.perf_counter() - _blit_start) * 1000.0
             self._grid_overlay_last_cache_status = "hit"
             return
 
         self._grid_overlay_cache_key = cache_key
+        _rebuild_start = time.perf_counter()
         self._grid_overlay_cache = self._rebuild_grid_overlay_cache(
             rect, resolution, snapshot, cell_bounds
         )
+        self._grid_overlay_rebuild_ms = (time.perf_counter() - _rebuild_start) * 1000.0
         self._grid_overlay_last_cache_status = "degraded" if degraded else "rebuild"
+        _blit_start = time.perf_counter()
         painter.drawPixmap(0, 0, self._grid_overlay_cache)
+        self._grid_overlay_blit_ms = (time.perf_counter() - _blit_start) * 1000.0
 
     def _rebuild_grid_overlay_cache(
         self,
@@ -2152,10 +2241,14 @@ class SimulationCanvas(QWidget):
         cache_painter.save()
         cache_painter.setClipRect(rect)
 
+        _cells_start = time.perf_counter()
         if snapshot is not None and cell_bounds is not None:
             self._draw_grid_overlay_cells(cache_painter, snapshot, cell_bounds)
+        self._grid_overlay_cells_ms = (time.perf_counter() - _cells_start) * 1000.0
 
+        _lines_start = time.perf_counter()
         self._draw_grid_overlay_lines(cache_painter, rect, resolution)
+        self._grid_overlay_lines_ms = (time.perf_counter() - _lines_start) * 1000.0
 
         cache_painter.restore()
         cache_painter.end()
@@ -2400,16 +2493,41 @@ class SimulationCanvas(QWidget):
         In multi-robot mode the LiDAR/FoV of every robot is always drawn with
         the robot's own color. This layer is world/sensing information, not a
         robot-order/debug layer, so it does not depend on Robot Orders.
+
+        Instrumentation only, no behavior change: robot_fov_compute_ms/
+        robot_fov_paint_ms separately time sensor_polygon_for_pose() (the
+        cached raycast lookup/rebuild) vs. draw_sensor_polygon() (the
+        screen-space transform + paint), and robot_fov_cache_hit compares
+        the polygon OBJECT returned by sensor_polygon_for_pose() against
+        whatever was already cached for that cache_key before the call --
+        purely a read of existing cache state, never a new cache or an
+        extra recompute. Does not touch SENSOR_DRAW_RECOMPUTE_DISTANCE/
+        ROTATION or any other existing cache threshold.
         """
+        self._fov_detail["robot_fov_cache_hit"] = True
+        self._fov_detail["robot_fov_compute_ms"] = 0.0
+        self._fov_detail["robot_fov_paint_ms"] = 0.0
         if not self.config.show_vision:
             return
 
         painter.save()
+        cache_hit_this_frame = True
         for cache_key, x, y, theta, vision in self.sensor_display_poses():
             color = QColor(BLUE) if cache_key < 0 else robot_color(cache_key)
+
+            _compute_start = time.perf_counter()
+            previously_cached = self._sensor_polygon_caches_by_robot.get(int(cache_key))
+            prev_polygon = previously_cached[2] if previously_cached is not None else None
             polygon = self.sensor_polygon_for_pose(cache_key, x, y, theta, vision)
+            self._fov_detail["robot_fov_compute_ms"] += (time.perf_counter() - _compute_start) * 1000.0
+            if polygon is not prev_polygon:
+                cache_hit_this_frame = False
+
+            _paint_start = time.perf_counter()
             self.draw_sensor_polygon(painter, polygon, color)
+            self._fov_detail["robot_fov_paint_ms"] += (time.perf_counter() - _paint_start) * 1000.0
         painter.restore()
+        self._fov_detail["robot_fov_cache_hit"] = cache_hit_this_frame
 
     def obstacle_boundary_samples_for_display(
         self,

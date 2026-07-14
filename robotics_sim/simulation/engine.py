@@ -40,7 +40,13 @@ from robotics_sim.simulation.navigation_modes import (
 from robotics_sim.navigation.exploration_behavior import ExplorationBehavior
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.simulation.telemetry import TelemetryLogger
-from robotics_sim.environment.belief_map import UNKNOWN, BeliefMap
+from robotics_sim.simulation.robot_trace import (
+    MAX_OBSTACLE_SECTIONS,
+    RobotTrace,
+    group_obstacle_points_into_sections,
+    slug_route_failure_reason,
+)
+from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
@@ -278,6 +284,51 @@ def route_reaches_goal(
     unchanged.
     """
     return NavigationSupervisor.validate_route_endpoint(waypoints, goal, tolerance)
+
+
+def _emit_robot_trace(engine, method: str, **kwargs) -> None:
+    """Call RobotTrace.<method>(**kwargs) on engine.robot_trace if present.
+
+    Real SimulationControllerMixin instances always have robot_trace (see
+    ensure_robot_trace()); lightweight duck-typed engine fakes used by
+    several tests do not, and must not be required to grow one just to
+    exercise unrelated behavior. Never raises when robot_trace is absent,
+    and RobotTrace's own trace_*() methods already no-op instantly unless
+    their category is enabled -- so this is nearly free in both the
+    "disabled" and "fake engine" cases.
+    """
+    trace = getattr(engine, "robot_trace", None)
+    if trace is None:
+        return
+    getattr(trace, method)(**kwargs)
+
+
+def format_narrow_passage_diagnostic(
+    *,
+    path_goal: tuple[float, float] | None,
+    route_affected_recent: int,
+    first_segment_blocked: int,
+    predicted_collision: int,
+    min_clearance: float | None,
+    action: str,
+) -> str:
+    """Pure formatter for the throttled [NARROW_DIAG] console line.
+
+    Kept separate from the throttling/state logic (RobotAgent.
+    route_affected_replan_allowed(), engine.py's per-tick speed-cap sync)
+    so the exact line format is testable without a real CollisionChecker/
+    BeliefMap. min_clearance is an approximation -- nearest mapped
+    obstacle point distance from the robot's current position, not an
+    exact segment-clearance computation -- deliberately cheap since this
+    is a diagnostic, not a safety check.
+    """
+    goal_text = "None" if path_goal is None else f"({float(path_goal[0]):.2f},{float(path_goal[1]):.2f})"
+    clearance_text = "n/a" if min_clearance is None else f"{float(min_clearance):.2f}"
+    return (
+        f"[NARROW_DIAG] path_goal={goal_text} route_affected_recent={int(route_affected_recent)} "
+        f"first_segment_blocked={int(first_segment_blocked)} predicted_collision={int(predicted_collision)} "
+        f"min_clearance={clearance_text} action={action}"
+    )
 
 
 def effective_planning_clearance(robot_radius: float, safety_radius: float) -> float:
@@ -1982,6 +2033,9 @@ class SimulationControllerMixin:
 
             if blocked_on_arrival:
                 reason = f"{reason}; rejected: first segment blocked on arrival"
+                diag_agent = self.runtime_agent(None)
+                if diag_agent is not None:
+                    diag_agent.first_segment_blocked_count += 1
             elif misses_intended_goal:
                 reason = f"{reason}; rejected: final waypoint does not reach path goal"
             else:
@@ -2085,6 +2139,18 @@ class SimulationControllerMixin:
                 reason=reason,
                 planner_type=str(self.config.planner_type),
                 mapped_obstacle_count=len(self.mapped_obstacle_points),
+            )
+            # Opt-in terminal trace only (ROBOT_TRACE=route).
+            _emit_robot_trace(
+                self,
+                "trace_route",
+                sim_time=float(getattr(self, "simulation_time", 0.0)),
+                robot_label="R1",
+                result="fail",
+                start=hold_xy,
+                goal=attempted_target,
+                reason=slug_route_failure_reason(reason),
+                mapped_obstacle_count=len(getattr(self, "mapped_obstacle_points", [])),
             )
             return
 
@@ -2266,6 +2332,85 @@ class SimulationControllerMixin:
     def telemetry(self) -> TelemetryLogger:
         return self.ensure_telemetry()
 
+    def ensure_robot_trace(self) -> RobotTrace:
+        """Return the shared RobotTrace, creating it if needed.
+
+        Reads the ROBOT_TRACE/ROBOT_TRACE_POINTS/ROBOT_TRACE_STDOUT/
+        ROBOT_TRACE_DIR/BELIEF_TRACE_ARTIFACTS environment variables once,
+        at first use -- completely separate from telemetry.py (the
+        GUI-console channel) and render_perf.py (paint-timing PERF
+        diagnostics). ROBOT_TRACE only ever controls terminal [TRACE ...]
+        printing; belief-trace artifact files are a separate concern (see
+        start_belief_trace_run()) that this constructor does NOT create --
+        only RobotTrace.start_run(), called explicitly when a run actually
+        starts, does that.
+        """
+        if not hasattr(self, "_robot_trace") or self._robot_trace is None:
+            self._robot_trace = RobotTrace()
+        return self._robot_trace
+
+    @property
+    def robot_trace(self) -> RobotTrace:
+        return self.ensure_robot_trace()
+
+    def start_belief_trace_run(self) -> None:
+        """Create a fresh belief-trace artifact directory for this
+        simulation run.
+
+        Called explicitly from start_simulation() and restart_simulation()
+        -- never merely from ensure_robot_trace()/RobotTrace construction,
+        and never from reset_simulation() alone (also used by "load
+        scenario", which must not create a run directory by itself).
+        Enabled by default; BELIEF_TRACE_ARTIFACTS=0 (or false/no/off) is
+        the only thing that can disable it, entirely independent of
+        ROBOT_TRACE (which only controls terminal trace printing).
+
+        Best-effort: prints exactly one compact notification when a
+        directory is actually created, to both the GUI console and the
+        terminal -- never spams, never raises.
+        """
+        trace = self.ensure_robot_trace()
+        run_dir = trace.start_run()
+        if run_dir is not None:
+            message = f"[BELIEF TRACE] writing artifacts to {run_dir}"
+            self.log_console_message(message)
+            trace.print_line(message)
+
+    def _build_belief_trace_snapshot(self) -> dict | None:
+        """Best-effort belief_final.json (+ belief_grid_final.npz) payload
+        for RobotTrace.maybe_snapshot_belief(). Only ever called lazily
+        when a snapshot write is actually due (see the call site in
+        simulation_step()) -- diagnostics/output only, never touches
+        mapping/planning state, only reads it.
+        """
+        points = list(getattr(self, "mapped_obstacle_points", []))
+        snapshot: dict = {
+            "explored_percent": self.estimated_explored_percent(),
+            "robot_pose": (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None,
+            "mapped_obstacle_points_count": len(points),
+        }
+        if points:
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            snapshot["mapped_obstacle_bbox"] = [min(xs), min(ys), max(xs), max(ys)]
+        else:
+            snapshot["mapped_obstacle_bbox"] = None
+        sections = group_obstacle_points_into_sections(points) if points else []
+        snapshot["obstacle_sections_summary"] = [
+            dict(orientation=s.axis, coord=s.coordinate, span_min=s.span_min, span_max=s.span_max, n_points=s.count)
+            for s in sections[:MAX_OBSTACLE_SECTIONS]
+        ]
+
+        belief = getattr(self, "belief_map", None)
+        if belief is not None and hasattr(belief, "grid"):
+            snapshot["grid_resolution"] = float(belief.resolution)
+            grid = belief.grid
+            snapshot["known_free_count"] = int(np.count_nonzero(grid == FREE))
+            snapshot["known_occupied_count"] = int(np.count_nonzero(grid == OCCUPIED))
+            snapshot["unknown_count"] = int(np.count_nonzero(grid == UNKNOWN))
+            snapshot["_grid"] = grid
+        return snapshot
+
     def log_console_message(self, message: str, *, visible_status: bool = False) -> None:
         """Write a readable debugging message to the simulation console.
 
@@ -2400,6 +2545,21 @@ class SimulationControllerMixin:
             simplifier=str(self.config.path_simplifier),
             length=length,
             mapped_obstacle_count=len(self.mapped_obstacle_points),
+        )
+        # Opt-in terminal trace only (ROBOT_TRACE=route).
+        _emit_robot_trace(
+            self,
+            "trace_route",
+            sim_time=float(getattr(self, "simulation_time", 0.0)),
+            robot_label=label,
+            result="ok",
+            start=start_xy,
+            goal=target,
+            waypoint_count=len(waypoints),
+            length=length,
+            mapped_obstacle_count=len(getattr(self, "mapped_obstacle_points", [])),
+            planner=str(self.config.planner_type),
+            simplifier=str(self.config.path_simplifier),
         )
 
     def log_robot_motion(
@@ -2688,6 +2848,7 @@ class SimulationControllerMixin:
         ready to run again.
         """
         self.reset_simulation()
+        self.start_belief_trace_run()
         self.canvas.set_status("Restart complete. Press Start Simulation to run.")
 
     # ========================================================
@@ -2830,6 +2991,41 @@ class SimulationControllerMixin:
         so the two throttles behave consistently.
         """
         return max(0.35, 0.75 * max(0.1, float(self.config.exploration_replan_cooldown)))
+
+    def route_affected_replan_cooldown_seconds(self) -> float:
+        """Cooldown for throttling repeated route_affected repair replans
+        for the same path_goal (see RobotAgent.route_affected_replan_allowed()).
+
+        Deliberately longer than safety_replan_cooldown_seconds(): unlike a
+        safety flag, route_affected fires on ordinary sensor-driven map
+        growth -- near a narrow passage this can trigger on nearly every
+        sensor-update tick as boundary samples accumulate, so it can
+        afford to wait longer between repair attempts for the same
+        target. A directly unsafe active segment always bypasses this
+        cooldown regardless (see active_segment_unsafe).
+        """
+        return max(0.75, 1.5 * max(0.1, float(self.config.exploration_replan_cooldown)))
+
+    def sync_narrow_passage_speed_cap(self, agent) -> None:
+        """Apply or lift the transient narrow-passage speed cap.
+
+        While agent.is_narrow_passage_slowdown_active() (armed by repeated,
+        throttled route_affected replans for the same path_goal -- see
+        RobotAgent.route_affected_replan_allowed()), commanded max speed is
+        temporarily reduced via the robot's existing max_speed setter, NOT
+        config.max_speed and NOT robot dynamics. Restored to the configured
+        value the moment the window expires. Purely a runtime control hint;
+        a no-op when the agent/robot are unavailable.
+        """
+        if agent is None or self.robot is None or not hasattr(self.robot, "max_speed"):
+            return
+
+        if agent.is_narrow_passage_slowdown_active(float(self.simulation_time)):
+            self.robot.max_speed = min(
+                float(self.config.max_speed), agent._NARROW_PASSAGE_SLOWDOWN_SPEED_CAP
+            )
+        else:
+            self.robot.max_speed = float(self.config.max_speed)
 
     def multi_safety_replan_allowed(
         self,
@@ -3360,6 +3556,11 @@ class SimulationControllerMixin:
         self.top_bar.set_status("running")
 
     def start_simulation(self):
+        # Diagnostics/output only: a fresh belief-trace artifact directory
+        # for this run (see start_belief_trace_run()), independent of
+        # ROBOT_TRACE and covering both the single- and multi-robot paths
+        # below since it runs before the mode branch.
+        self.start_belief_trace_run()
         self.config = self.read_config()
         if "Multiple" in self.config.agent_mode:
             self.start_multi_robot_simulation()
@@ -4526,6 +4727,41 @@ class SimulationControllerMixin:
             newly_discovered = self.update_sensed_obstacles(force_status=False)
             if newly_discovered:
                 self.mapping_update_count += 1
+
+            if self.robot is not None:
+                # Opt-in terminal trace only (ROBOT_TRACE=map,obstacles,...);
+                # both no-op immediately when their category is disabled, so
+                # this costs nothing in the default (disabled) case beyond
+                # two cheap attribute checks.
+                _emit_robot_trace(
+                    self,
+                    "trace_map",
+                    sim_time=float(self.simulation_time),
+                    robot_label="R1",
+                    pose=(float(self.robot.x), float(self.robot.y)),
+                    explored_percent=self.estimated_explored_percent(),
+                    mapped_obstacle_samples=len(self.mapped_obstacle_points),
+                )
+                _emit_robot_trace(
+                    self,
+                    "trace_obstacles",
+                    sim_time=float(self.simulation_time),
+                    robot_label="R1",
+                    points=list(newly_discovered) if newly_discovered else [],
+                    explored_percent=self.estimated_explored_percent(),
+                )
+                # Best-effort periodic belief-map snapshot file (see
+                # belief_trace_writer.py): a no-op unless ROBOT_TRACE's file
+                # sink is active, and the (grid-scanning) snapshot dict is
+                # only ever built lazily, on the tick a write is actually
+                # due -- never on every sensor update.
+                _emit_robot_trace(
+                    self,
+                    "maybe_snapshot_belief",
+                    sim_time=float(self.simulation_time),
+                    provider=self._build_belief_trace_snapshot,
+                )
+
             if newly_discovered and self.config.planner_type != "Direct":
                 route_affected = self.new_information_affects_current_route(newly_discovered)
                 self.telemetry.report_map_update(
@@ -4536,6 +4772,90 @@ class SimulationControllerMixin:
                     explored_percent=self.estimated_explored_percent(),
                 )
                 if route_affected:
+                    route_affected_agent = self.runtime_agent(None)
+                    robot_xy_now = (float(self.robot.x), float(self.robot.y))
+
+                    # Diagnostics only: bbox of the specific new points that
+                    # triggered this route_affected=yes occurrence, shared by
+                    # both outcomes (throttled/allowed) below so
+                    # route_affected_events.csv always has it regardless of
+                    # which branch is taken.
+                    new_obstacle_xs = [float(p[0]) for p in newly_discovered]
+                    new_obstacle_ys = [float(p[1]) for p in newly_discovered]
+                    new_obstacle_bbox = (
+                        min(new_obstacle_xs), min(new_obstacle_ys),
+                        max(new_obstacle_xs), max(new_obstacle_ys),
+                    )
+
+                    # No active_segment_unsafe bypass here (an earlier
+                    # version had one): a genuinely urgent, imminent
+                    # collision is REPLAN_FOR_SAFETY's job, driven
+                    # independently by active_segment_blocked/
+                    # predicted_collision in RobotAgent.step() with its own
+                    # separate throttle -- this guard's only job is to
+                    # stop routine map-growth repairs from storming the
+                    # planner, and must apply unconditionally to do that.
+                    allowed = True
+                    if route_affected_agent is not None:
+                        allowed = route_affected_agent.route_affected_replan_allowed(
+                            path_goal=route_affected_agent.active_path_goal_xy,
+                            current_time=float(self.simulation_time),
+                            cooldown=self.route_affected_replan_cooldown_seconds(),
+                        )
+
+                    if not allowed:
+                        # Throttled: either a repair for this exact goal is
+                        # already in flight, or the same path_goal repaired
+                        # too recently -- routine boundary-sample growth
+                        # near a narrow passage must not become a
+                        # background full-replan storm. Diagnostic only,
+                        # DEBUG-level (never spams normal/quiet consoles);
+                        # naturally rate-limited to at most once per
+                        # cooldown per path_goal by the throttle itself.
+                        nearby_distances = [
+                            math.hypot(robot_xy_now[0] - p[0], robot_xy_now[1] - p[1])
+                            for p in self.mapped_obstacle_points
+                        ]
+                        min_clearance = min(nearby_distances) if nearby_distances else None
+                        self.telemetry.debug(
+                            format_narrow_passage_diagnostic(
+                                path_goal=route_affected_agent.active_path_goal_xy if route_affected_agent else None,
+                                route_affected_recent=route_affected_agent.route_affected_replan_count if route_affected_agent else 0,
+                                first_segment_blocked=route_affected_agent.first_segment_blocked_count if route_affected_agent else 0,
+                                predicted_collision=route_affected_agent.safety_replan_count if route_affected_agent else 0,
+                                min_clearance=min_clearance,
+                                action="slowdown",
+                            )
+                        )
+                        # Opt-in terminal trace only (ROBOT_TRACE=safety);
+                        # never printed/GUI-consoled unless explicitly enabled.
+                        _emit_robot_trace(
+                            self,
+                            "trace_safety",
+                            sim_time=float(self.simulation_time),
+                            robot_label="R1",
+                            goal=route_affected_agent.active_path_goal_xy if route_affected_agent else None,
+                            repair_status="throttled",
+                            min_clearance=min_clearance,
+                        )
+                        # Belief-trace artifact completeness (file-only,
+                        # independent of ROBOT_TRACE): every route_affected=yes
+                        # occurrence, throttled or not, must be recorded so
+                        # total_route_affected never silently undercounts.
+                        _emit_robot_trace(
+                            self,
+                            "trace_route_affected",
+                            sim_time=float(self.simulation_time),
+                            robot_id="R1",
+                            path_goal=route_affected_agent.active_path_goal_xy if route_affected_agent else None,
+                            active=robot_xy_now,
+                            mapped_obs=len(self.mapped_obstacle_points),
+                            new_obstacle_count=len(newly_discovered),
+                            bbox=new_obstacle_bbox,
+                            action="repair_throttled",
+                        )
+                        return
+
                     # A route-repair replan is a stronger event than
                     # prefetch: discard any pending path computed under the
                     # OLD route context so it cannot be silently promoted
@@ -4543,11 +4863,28 @@ class SimulationControllerMixin:
                     # accepted (same reasoning as the REPLAN_FOR_SAFETY
                     # branch in apply_navigation_decision()). Does not
                     # touch the active route itself.
-                    route_affected_agent = self.runtime_agent(None)
                     if route_affected_agent is not None:
                         route_affected_agent.invalidate_pending_path(
                             reason="route_affected: new obstacle affects current route"
                         )
+                    # Belief-trace artifact completeness: this is the
+                    # previously-missing case -- route_affected=yes AND the
+                    # repair is actually allowed to proceed (not throttled).
+                    # Without this call, total_route_affected only counted
+                    # throttled occurrences, undercounting every run where
+                    # repairs mostly succeed.
+                    _emit_robot_trace(
+                        self,
+                        "trace_route_affected",
+                        sim_time=float(self.simulation_time),
+                        robot_id="R1",
+                        path_goal=route_affected_agent.active_path_goal_xy if route_affected_agent else None,
+                        active=robot_xy_now,
+                        mapped_obs=len(self.mapped_obstacle_points),
+                        new_obstacle_count=len(newly_discovered),
+                        bbox=new_obstacle_bbox,
+                        action="repair_requested",
+                    )
                     self.replan_after_new_information("New obstacle affects current route.")
                     return
 
@@ -4575,6 +4912,7 @@ class SimulationControllerMixin:
         # stalls.
         agent = self.runtime_agent(None)
         old_mode = mode_name(self.robot)
+        self.sync_narrow_passage_speed_cap(agent)
 
         if agent is not None and RobotObservation is not None:
             # ── New OOP flow ──────────────────────────────────────────────
@@ -4920,6 +5258,16 @@ class SimulationControllerMixin:
 
         REPLAN_FOR_SAFETY:
             Engine triggers a safety replan and brakes while computing.
+
+            Future: a CBF (control barrier function) safety filter could
+            replace this reactive replan-and-brake pattern with a
+            continuous collision-avoidance constraint on the commanded
+            control itself, instead of discrete "detect unsafe -> stop ->
+            replan" cycles. Not implemented here -- narrow-passage
+            stability in this round is handled entirely by throttling/
+            speed-capping the existing reactive path (see
+            RobotAgent.route_affected_replan_allowed()/
+            narrow_passage_slowdown_until_time).
         """
         kind = decision.kind
 
@@ -4970,6 +5318,34 @@ class SimulationControllerMixin:
                 pending_target=getattr(agent, "pending_target_xy", None),
             )
 
+            # Opt-in terminal trace only (ROBOT_TRACE=decision); never
+            # printed/GUI-consoled unless explicitly enabled.
+            _emit_robot_trace(
+                self,
+                "trace_decision",
+                sim_time=float(self.simulation_time),
+                robot_label="R1",
+                kind=kind,
+                reason=str(decision.reason),
+                active_target=getattr(agent, "active_target", lambda: None)(),
+                path_goal=getattr(agent, "active_path_goal_xy", None),
+                pending_target=getattr(agent, "pending_target_xy", None),
+            )
+
+            if (
+                agent is not None
+                and kind == "REQUEST_PLAN"
+                and bool(getattr(decision, "force_new_target", False))
+            ):
+                _emit_robot_trace(
+                    self,
+                    "trace_frontier",
+                    sim_time=float(self.simulation_time),
+                    source="map-wide-fallback" if agent.last_map_wide_fallback_attempted else agent.planner_mode,
+                    selected=decision.target,
+                    generated=agent.last_frontier_candidate_count,
+                )
+
         # Diagnostics only, DEBUG-level (never spams normal/quiet consoles):
         # logged once, exactly at the tick exploration_exhausted() actually
         # fires, using data already computed for this decision -- never a
@@ -4986,6 +5362,15 @@ class SimulationControllerMixin:
                 f"last_frontier_candidates={int(agent.last_frontier_candidate_count)} "
                 f'last_frontier_reason="{agent.last_frontier_selection_reason}" '
                 f'reason="{decision.reason}"'
+            )
+            # Opt-in terminal trace only (ROBOT_TRACE=frontier).
+            _emit_robot_trace(
+                self,
+                "trace_frontier",
+                sim_time=float(self.simulation_time),
+                source="map-wide-fallback" if agent.last_map_wide_fallback_attempted else agent.planner_mode,
+                selected=None,
+                generated=agent.last_frontier_candidate_count,
             )
 
         if kind == "FOLLOW_PATH":
@@ -5015,12 +5400,36 @@ class SimulationControllerMixin:
         if kind == "ACCEPT_PENDING_PATH":
             waypoints = agent.accept_pending_path()
             if waypoints:
+                start_xy = (float(robot.x), float(robot.y))
                 self.set_robot_goal_or_waypoints(robot, waypoints)
-                self.canvas.set_planned_path(
-                    [(float(robot.x), float(robot.y))] + list(waypoints)
-                )
+                self.canvas.set_planned_path([start_xy] + list(waypoints))
                 if self.is_exploration_mode():
                     self.canvas.set_exploration_target(waypoints[-1])
+                # Belief-trace artifact completeness: a promoted prefetched
+                # path is a real route assignment even though it bypasses
+                # log_route_assignment()/report_route_success() (no planner
+                # call happens here) -- record it too, so route_events.csv
+                # covers every path the robot actually starts following.
+                prefetch_length = 0.0
+                previous = start_xy
+                for point in waypoints:
+                    prefetch_length += math.hypot(float(point[0]) - float(previous[0]), float(point[1]) - float(previous[1]))
+                    previous = point
+                _emit_robot_trace(
+                    self,
+                    "trace_route",
+                    sim_time=float(self.simulation_time),
+                    robot_label="R1",
+                    result="ok",
+                    start=start_xy,
+                    goal=waypoints[-1],
+                    reason="accepted pending path (prefetch)",
+                    waypoint_count=len(waypoints),
+                    length=prefetch_length,
+                    mapped_obstacle_count=len(self.mapped_obstacle_points),
+                    planner=str(self.config.planner_type),
+                    simplifier=str(self.config.path_simplifier),
+                )
             return False
 
         if kind == "PREFETCH_NEXT_TARGET":
@@ -5138,6 +5547,18 @@ class SimulationControllerMixin:
                         attempted_target=attempted_target,
                         reason=f"repeated safety replan: {decision.reason}",
                         planner_type=str(self.config.planner_type),
+                        mapped_obstacle_count=len(self.mapped_obstacle_points),
+                    )
+                    # Opt-in terminal trace only (ROBOT_TRACE=route).
+                    _emit_robot_trace(
+                        self,
+                        "trace_route",
+                        sim_time=float(self.simulation_time),
+                        robot_label="R1",
+                        result="fail",
+                        start=hold_xy,
+                        goal=attempted_target,
+                        reason=slug_route_failure_reason(f"repeated safety replan: {decision.reason}"),
                         mapped_obstacle_count=len(self.mapped_obstacle_points),
                     )
             return True  # always brake for safety replans
@@ -5288,6 +5709,33 @@ class SimulationControllerMixin:
                     )
                 self.log_console_message(
                     f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
+                )
+                return
+
+            # Reject a prefetch whose first segment (FROM THE ROBOT'S
+            # CURRENT position, not wherever it was when the prefetch was
+            # requested) is already unsafe by the same rule
+            # apply_route_result() uses for the main route-acceptance
+            # path. Without this, a prefetch computed before new obstacle
+            # samples appeared near the route could still be promoted via
+            # ACCEPT_PENDING_PATH straight into a now-unsafe segment.
+            robot_xy_now = (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None
+            if robot_xy_now is not None and route_first_segment_blocked(
+                self.collision_checker,
+                robot_xy_now,
+                clean_waypoints[0],
+                list(self.mapped_obstacle_points),
+                self.safety_radius(),
+            ):
+                rejected_target = agent.pending_target_xy
+                agent.first_segment_blocked_count += 1
+                agent.reject_pending_path(f"{reason}; first segment blocked on arrival")
+                if rejected_target is not None:
+                    agent.mark_exploration_target_failed(
+                        rejected_target, current_time=float(self.simulation_time)
+                    )
+                self.log_console_message(
+                    f"[PREFETCH] rejected: first segment blocked on arrival; {reason}"
                 )
                 return
 

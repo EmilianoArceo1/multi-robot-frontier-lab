@@ -34,6 +34,7 @@ from robotics_sim.app.map_editor import (
 )
 from robotics_sim.app.render_perf import (
     PerfGuiWarningGate,
+    RenderDetailLogger,
     RenderPerfMonitor,
     format_gui_perf_warning,
 )
@@ -245,6 +246,50 @@ class SimulationCanvas(QWidget):
         # console, via _perf_gui_warning_gate.
         self._render_perf_monitor = RenderPerfMonitor()
         self._perf_gui_warning_gate = PerfGuiWarningGate()
+        # Optional, throttled per-layer paint breakdown -- off by default,
+        # SIM_RENDER_DETAIL_LOG=1 enables a [RENDER] line at most every 2s.
+        # Independent of _render_perf_monitor's own routine (never printed)
+        # paint_fps/paint_ms tracking above.
+        self._render_detail_logger = RenderDetailLogger()
+        self._last_background_cache_hit = False
+        self._render_layer_ms: dict[str, float] = {
+            "background": 0.0, "map_layer": 0.0, "robot_body": 0.0, "robot_fov": 0.0,
+            "route_path": 0.0, "sensor_debug_overlay": 0.0, "overlays": 0.0,
+        }
+        # Render caches for robot-related dynamic layers -- see
+        # draw_executed_path()/draw_planned_route()'s own docstrings for
+        # the invalidation rules.
+        #
+        # The executed trail is painted into a persistent QPixmap rather
+        # than cached as a QPainterPath: a QPainterPath cache still costs
+        # painter.drawPath() proportional to total point count every
+        # single frame, so it grows unboundedly as the trail accumulates
+        # over a long run (this is exactly what the real Office.sim
+        # route_path_ms evidence showed -- 17ms growing to 431ms as the
+        # trail got longer, even though the path object itself was never
+        # rebuilt). A pixmap is blitted in ~constant time regardless of
+        # how many points it was painted from.
+        self._executed_trail_pixmap: QPixmap | None = None
+        self._executed_trail_pixmap_count = 0
+        self._executed_trail_view_signature: tuple | None = None
+        self._executed_trail_source: list | None = None
+        self._executed_trail_style: tuple | None = None
+        self._executed_trail_last_screen_point: tuple | None = None
+        self._executed_trail_segments_painted_last_frame = 0
+        self._planned_route_cache: QPainterPath | None = None
+        self._planned_route_cache_signature: tuple | None = None
+        # Fine-grained route/trail timings, reported via the optional
+        # [RENDER] detail line -- see draw_planned_route()/
+        # draw_executed_path() for where each is measured.
+        self._route_detail: dict = {
+            "planned_route_build_ms": 0.0,
+            "planned_route_paint_ms": 0.0,
+            "executed_trail_build_ms": 0.0,
+            "executed_trail_paint_ms": 0.0,
+            "executed_trail_points": 0,
+            "executed_trail_segments_painted": 0,
+            "executed_trail_cache_hit": False,
+        }
         # Throttles only the high-frequency, simulation-driven repaint
         # requests (set_runtime_state()/set_multi_runtime_state()) to at
         # most DEFAULT_RENDER_THROTTLE_FPS repaints/second -- see
@@ -713,6 +758,17 @@ class SimulationCanvas(QWidget):
             center_x + span_x / 2.0,
             center_y - span_y / 2.0,
             center_y + span_y / 2.0,
+        )
+
+    def _view_transform_signature(self) -> tuple:
+        """Cheap signature capturing everything world_to_screen() depends
+        on (widget size, view center/zoom/pan) -- any screen-space cache
+        keyed on this must be rebuilt when it changes. Shared by
+        draw_executed_path()/draw_planned_route()'s own caches."""
+        return (
+            self.width(),
+            self.height(),
+            tuple(round(float(bound), 3) for bound in self.active_view_bounds_world()),
         )
 
     def world_to_screen(self, x: float, y: float):
@@ -1255,10 +1311,19 @@ class SimulationCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
+        _chrome_start = time.perf_counter()
         self.draw_card(painter)
         self.draw_title(painter)
+        chrome_ms_before_plot = (time.perf_counter() - _chrome_start) * 1000.0
+
         self.draw_plot(painter)
+
+        _chrome_start = time.perf_counter()
         self.draw_telemetry(painter)
+        # Card/title/telemetry chrome is small, one-off UI decoration, not
+        # a simulation/map/robot layer -- folded into "overlays" for the
+        # optional [RENDER] detail line rather than given its own bucket.
+        self._render_layer_ms["overlays"] += chrome_ms_before_plot + (time.perf_counter() - _chrome_start) * 1000.0
 
         self._report_render_perf(frame_start)
 
@@ -1304,6 +1369,27 @@ class SimulationCanvas(QWidget):
         }
 
         self._maybe_emit_perf_gui_warning()
+
+        # Optional, throttled per-layer breakdown (SIM_RENDER_DETAIL_LOG=1);
+        # a no-op unless explicitly enabled -- see RenderDetailLogger.
+        self._render_detail_logger.maybe_log(
+            total_ms=paint_ms,
+            background_ms=self._render_layer_ms.get("background", 0.0),
+            map_layer_ms=self._render_layer_ms.get("map_layer", 0.0),
+            robot_body_ms=self._render_layer_ms.get("robot_body", 0.0),
+            robot_fov_ms=self._render_layer_ms.get("robot_fov", 0.0),
+            route_path_ms=self._render_layer_ms.get("route_path", 0.0),
+            planned_route_build_ms=self._route_detail.get("planned_route_build_ms", 0.0),
+            planned_route_paint_ms=self._route_detail.get("planned_route_paint_ms", 0.0),
+            executed_trail_build_ms=self._route_detail.get("executed_trail_build_ms", 0.0),
+            executed_trail_paint_ms=self._route_detail.get("executed_trail_paint_ms", 0.0),
+            executed_trail_points=self._route_detail.get("executed_trail_points", 0),
+            executed_trail_segments_painted=self._route_detail.get("executed_trail_segments_painted", 0),
+            executed_trail_cache_hit=self._route_detail.get("executed_trail_cache_hit", False),
+            sensor_debug_overlay_ms=self._render_layer_ms.get("sensor_debug_overlay", 0.0),
+            overlays_ms=self._render_layer_ms.get("overlays", 0.0),
+            cache_hit=self._last_background_cache_hit,
+        )
 
     def _maybe_emit_perf_gui_warning(self) -> None:
         """Append a rare, heavily throttled GUI-console line when paint_fps
@@ -1620,13 +1706,21 @@ class SimulationCanvas(QWidget):
         painter.save()
         painter.setClipRect(rect)
 
+        # Layer timing buckets for the optional [RENDER] detail line (see
+        # RenderDetailLogger) -- cheap (a handful of time.perf_counter()
+        # calls) and only ever printed when SIM_RENDER_DETAIL_LOG=1.
+        _background_start = time.perf_counter()
+        cache_hit = self._static_plot_cache is not None
         self.ensure_static_plot_cache()
         if self._static_plot_cache is not None:
             painter.drawPixmap(0, 0, self._static_plot_cache)
         else:
             painter.fillRect(rect, QColor("#F9FBFD"))
             self.draw_grid(painter, rect)
+        self._last_background_cache_hit = cache_hit
+        self._render_layer_ms["background"] = (time.perf_counter() - _background_start) * 1000.0
 
+        _map_layer_start = time.perf_counter()
         # Persistent "Show Grid" overlay, drawn just above the background so
         # every other layer below (obstacles, mapped points, routes, robot,
         # safety radius, FoV, labels) stays clearly visible on top of it.
@@ -1636,24 +1730,42 @@ class SimulationCanvas(QWidget):
         # These are not "robot orders"; they are what the simulation world
         # actually contains or what the robot has already sensed.
         self.draw_explored_area_trace(painter)
-        self.draw_sensor_range(painter)
-
-        if self.config.show_robot_orders:
-            self.draw_safety_radius(painter)
 
         # Ground-truth obstacles are a human-facing visual layer. They can be
         # hidden without changing the robot's partial map or planner inputs.
         if self.config.show_obstacles:
             self.draw_ground_truth_obstacles(painter)
 
-        self.draw_editor_preview(painter)
-        self.draw_editor_move_selection(painter)
-        self.draw_editor_camera_frame(painter)
-
         # Mapped points remain visible because they represent the discovered map.
         # They are drawn above the vision/r layer and below routes/waypoints/robot.
         self.draw_mapped_obstacle_points(painter)
+        self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 
+        # Robot-related layers, broken down into named sub-buckets for the
+        # optional [RENDER] detail line -- moved out of map_layer/a single
+        # combined robot_layer bucket so it's clear at a glance which
+        # specific robot-drawing concern dominates paint cost.
+        _fov_start = time.perf_counter()
+        self.draw_sensor_range(painter)
+        self._render_layer_ms["robot_fov"] = (time.perf_counter() - _fov_start) * 1000.0
+
+        _sensor_debug_start = time.perf_counter()
+        if self.config.show_robot_orders:
+            self.draw_safety_radius(painter)
+        self._render_layer_ms["sensor_debug_overlay"] = (time.perf_counter() - _sensor_debug_start) * 1000.0
+
+        _overlays_start = time.perf_counter()
+        self.draw_editor_preview(painter)
+        self.draw_editor_move_selection(painter)
+        self.draw_editor_camera_frame(painter)
+        self._render_layer_ms["overlays"] = (time.perf_counter() - _overlays_start) * 1000.0
+
+        _route_path_start = time.perf_counter()
+        self._route_detail["planned_route_build_ms"] = 0.0
+        self._route_detail["planned_route_paint_ms"] = 0.0
+        self._route_detail["executed_trail_build_ms"] = 0.0
+        self._route_detail["executed_trail_paint_ms"] = 0.0
+        self._route_detail["executed_trail_segments_painted"] = 0
         # Robot Orders layers. These reveal internal commands/decisions.
         if self.config.show_robot_orders:
             if self.robots and "Multiple" in self.config.agent_mode:
@@ -1661,9 +1773,13 @@ class SimulationCanvas(QWidget):
             else:
                 self.draw_planned_route(painter)
                 self.draw_executed_path(painter)
+        self._render_layer_ms["route_path"] = (time.perf_counter() - _route_path_start) * 1000.0
 
+        _robot_body_start = time.perf_counter()
         self.draw_goal_and_robot(painter)
+        self._render_layer_ms["robot_body"] = (time.perf_counter() - _robot_body_start) * 1000.0
 
+        _overlays_tail_start = time.perf_counter()
         # Drawn last so the temporary red preview is clearly visible over
         # every other layer while the user is comparing grid resolutions.
         self.draw_grid_resolution_preview(painter, rect)
@@ -1672,6 +1788,7 @@ class SimulationCanvas(QWidget):
 
         painter.setPen(QPen(QColor(BORDER), 1))
         painter.drawRect(rect)
+        self._render_layer_ms["overlays"] += (time.perf_counter() - _overlays_tail_start) * 1000.0
 
     def draw_topography(self, painter: QPainter, rect):
         painter.save()
@@ -2795,18 +2912,42 @@ class SimulationCanvas(QWidget):
 
         return -1
 
+    def _rebuild_planned_route_cache(self) -> QPainterPath:
+        path = QPainterPath()
+        sx, sy = self.world_to_screen(*self.planned_path_points[0])
+        path.moveTo(sx, sy)
+        for point in self.planned_path_points[1:]:
+            sx, sy = self.world_to_screen(*point)
+            path.lineTo(sx, sy)
+        return path
+
     def draw_planned_route(self, painter: QPainter):
+        """The line segments are cached as a single QPainterPath, keyed on
+        (waypoint coordinates, view transform) -- rebuilt only when the
+        planned route itself changes or the view (zoom/pan/size) changes,
+        never on every paintEvent. planned_path_points is normally a
+        short list (a handful of A* waypoints), so a value-based
+        signature (not object identity, unlike the much longer executed-
+        path trace below) is cheap here. Waypoint/label markers are drawn
+        fresh every frame regardless -- there are few of them, and their
+        halo highlighting active_planned_waypoint_index() can change
+        every tick even when the route itself has not."""
         if len(self.planned_path_points) < 2:
             return
 
+        _build_start = time.perf_counter()
+        view_signature = self._view_transform_signature()
+        path_signature = (tuple(self.planned_path_points), view_signature)
+        if self._planned_route_cache is None or self._planned_route_cache_signature != path_signature:
+            self._planned_route_cache = self._rebuild_planned_route_cache()
+            self._planned_route_cache_signature = path_signature
+        self._route_detail["planned_route_build_ms"] = (time.perf_counter() - _build_start) * 1000.0
+
+        _paint_start = time.perf_counter()
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
-
         painter.setPen(QPen(QColor(ORANGE), 2.4, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
-        for i in range(len(self.planned_path_points) - 1):
-            x1, y1 = self.world_to_screen(*self.planned_path_points[i])
-            x2, y2 = self.world_to_screen(*self.planned_path_points[i + 1])
-            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        painter.drawPath(self._planned_route_cache)
 
         active_index = self.active_planned_waypoint_index()
         last_index = len(self.planned_path_points) - 1
@@ -2853,6 +2994,7 @@ class SimulationCanvas(QWidget):
             painter.drawText(QRectF(sx - radius, sy - radius, 2 * radius, 2 * radius), Qt.AlignCenter, label)
 
         painter.restore()
+        self._route_detail["planned_route_paint_ms"] = (time.perf_counter() - _paint_start) * 1000.0
 
     def draw_multi_planned_routes(self, painter: QPainter):
         """Draw planned routes/waypoints for every runtime robot."""
@@ -2909,17 +3051,126 @@ class SimulationCanvas(QWidget):
 
         painter.restore()
 
+    def _executed_trail_style_signature(self) -> tuple:
+        """Color/width the trail is stroked with. Currently fixed
+        constants (no user-facing toggle exists yet), but kept as an
+        explicit part of the cache key so that if a visibility/color/
+        width control is ever added, changing it correctly invalidates
+        the pixmap layer instead of leaving stale pixels behind."""
+        return (BLUE, 1.7)
+
+    def _paint_executed_trail_segments(
+        self,
+        cache_painter: QPainter,
+        points: list,
+        last_screen_point: tuple | None,
+    ) -> tuple[int, tuple | None]:
+        """Paint `points` as connected line segments continuing from
+        last_screen_point (None if `points` starts the whole trail).
+        Consecutive points landing within 1 screen pixel of the last
+        actually-painted point are skipped -- visualization-only
+        decimation; path_points/simulation data is never touched. Returns
+        (segments_painted, new_last_screen_point)."""
+        segments_painted = 0
+        prev = last_screen_point
+        for point in points:
+            sx, sy = self.world_to_screen(*point)
+            if prev is not None and abs(sx - prev[0]) <= 1.0 and abs(sy - prev[1]) <= 1.0:
+                continue
+            if prev is not None:
+                cache_painter.drawLine(QPointF(prev[0], prev[1]), QPointF(sx, sy))
+                segments_painted += 1
+            prev = (sx, sy)
+        return segments_painted, prev
+
+    def _rebuild_executed_trail_cache(self, view_signature: tuple, style_signature: tuple) -> None:
+        pixmap = QPixmap(self.size())
+        pixmap.fill(Qt.transparent)
+        cache_painter = QPainter(pixmap)
+        cache_painter.setPen(QPen(QColor(style_signature[0]), style_signature[1]))
+        segments_painted, last_point = self._paint_executed_trail_segments(
+            cache_painter, self.path_points, None,
+        )
+        cache_painter.end()
+
+        self._executed_trail_pixmap = pixmap
+        self._executed_trail_pixmap_count = len(self.path_points)
+        self._executed_trail_view_signature = view_signature
+        self._executed_trail_style = style_signature
+        self._executed_trail_source = self.path_points
+        self._executed_trail_last_screen_point = last_point
+        self._executed_trail_segments_painted_last_frame = segments_painted
+
+    def _append_executed_trail_segments(self) -> None:
+        cache_painter = QPainter(self._executed_trail_pixmap)
+        style = self._executed_trail_style
+        cache_painter.setPen(QPen(QColor(style[0]), style[1]))
+        new_points = self.path_points[self._executed_trail_pixmap_count:]
+        segments_painted, last_point = self._paint_executed_trail_segments(
+            cache_painter, new_points, self._executed_trail_last_screen_point,
+        )
+        cache_painter.end()
+
+        self._executed_trail_pixmap_count = len(self.path_points)
+        self._executed_trail_last_screen_point = last_point
+        self._executed_trail_segments_painted_last_frame = segments_painted
+
     def draw_executed_path(self, painter: QPainter):
+        """The executed trail can grow to hundreds/thousands of points
+        over a long run. It was previously cached as a single
+        QPainterPath, appended to incrementally rather than rebuilt --
+        but painter.drawPath() still rasterizes the ENTIRE accumulated
+        path on every single paintEvent, so per-frame paint cost grew
+        unboundedly with total trail length even though the path object
+        itself was never rebuilt (this is exactly what the real
+        Office.sim route_path_ms evidence showed: 17ms growing to
+        431ms as the run went on).
+
+        The trail is now painted into a persistent QPixmap instead: new
+        points are painted into it ONCE, the moment they arrive, and every
+        frame just blits the pixmap -- drawPixmap() cost depends on screen
+        area, not on how many points were ever painted into it. Rebuilt
+        (not incrementally appended to) when: the view transform changes,
+        path_points is truncated/reset (a new list object -- see the `is`
+        check below, since a length-only comparison would miss an
+        in-place truncation that keeps the same length forever after), or
+        the trail's stroke style changes."""
         if len(self.path_points) < 2:
+            self._route_detail["executed_trail_points"] = len(self.path_points)
+            self._route_detail["executed_trail_segments_painted"] = 0
+            self._route_detail["executed_trail_build_ms"] = 0.0
+            self._route_detail["executed_trail_paint_ms"] = 0.0
             return
 
+        _build_start = time.perf_counter()
+        view_signature = self._view_transform_signature()
+        style_signature = self._executed_trail_style_signature()
+        same_source = self._executed_trail_source is self.path_points
+        same_view = self._executed_trail_view_signature == view_signature
+        same_style = self._executed_trail_style == style_signature
+        truncated = (
+            self._executed_trail_pixmap is not None
+            and len(self.path_points) < self._executed_trail_pixmap_count
+        )
+
+        if self._executed_trail_pixmap is None or not same_source or not same_view or not same_style or truncated:
+            self._rebuild_executed_trail_cache(view_signature, style_signature)
+            self._route_detail["executed_trail_cache_hit"] = False
+        elif len(self.path_points) > self._executed_trail_pixmap_count:
+            self._append_executed_trail_segments()
+            self._route_detail["executed_trail_cache_hit"] = True
+        else:
+            self._executed_trail_segments_painted_last_frame = 0
+            self._route_detail["executed_trail_cache_hit"] = True
+        self._route_detail["executed_trail_build_ms"] = (time.perf_counter() - _build_start) * 1000.0
+        self._route_detail["executed_trail_points"] = len(self.path_points)
+        self._route_detail["executed_trail_segments_painted"] = self._executed_trail_segments_painted_last_frame
+
+        _paint_start = time.perf_counter()
         painter.save()
-        painter.setPen(QPen(QColor(BLUE), 1.7))
-        for i in range(len(self.path_points) - 1):
-            x1, y1 = self.world_to_screen(*self.path_points[i])
-            x2, y2 = self.world_to_screen(*self.path_points[i + 1])
-            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        painter.drawPixmap(0, 0, self._executed_trail_pixmap)
         painter.restore()
+        self._route_detail["executed_trail_paint_ms"] = (time.perf_counter() - _paint_start) * 1000.0
 
     def draw_goal_and_robot(self, painter: QPainter):
         x, y, theta, _ = self.current_robot_pose()

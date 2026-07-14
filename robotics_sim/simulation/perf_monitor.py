@@ -82,6 +82,38 @@ per-phase fields (obstacle_extract_ms, controller_ms, etc.) are left as
 average_ms() -- per-occurrence -- since "how expensive is this phase when
 it runs" remains useful diagnostic information; only the unaccounted_ms
 SUM was the actual bug.
+
+planner_services_refresh_ms accounting (diagnosis-only round): engine.py's
+ensure_planner_services() call sat between the "controller" and
+"nav_decision" timers with no timer of its own, and its own docstring says
+it refreshes is_candidate_reachable on EVERY call (not just when a new
+frontier is actually selected) -- so its cost was silently folded into
+unaccounted_ms, and real Office.sim evidence showed unaccounted_ms growing
+with mapped_obs, which is exactly what sanitize_planner_obstacle_points()/
+build_planning_grid_for_robot() scale with. planner_services_refresh_ms
+is a TOP-LEVEL section (added to _UNACCOUNTED_SECTIONS, so it now reduces
+unaccounted_ms like any other top-level section). Its own internals --
+reachability_context_build_ms, reachability_obstacle_prepare_ms,
+reachability_grid_build_ms -- are NESTED entirely inside it (the same
+call), so they are reported as their own diagnostic fields but
+deliberately excluded from _UNACCOUNTED_SECTIONS, exactly like
+planner_dispatch_ms/route_result_ms/etc. above -- including them too would
+double-subtract time already counted once via planner_services_refresh_ms.
+reachability_context_builds counts how many times a fresh reachability
+callback was actually built this window (diagnostic only).
+
+visible_candidate_obstacles_ms is a SEPARATE top-level section, not nested:
+it times self.visible_candidate_obstacles() inside update_sensed_obstacles(),
+measured in its own non-overlapping time.perf_counter() window BEFORE
+"obstacle_extract"/"belief_update" start -- update_sensed_obstacles() itself
+has no wrapping timer of its own that would already include this time, so
+it is a genuine top-level gap (the same kind of previously-silent gap
+planner_services_refresh_ms closed) and IS included in
+_UNACCOUNTED_SECTIONS. It is intermittent rather than per-tick (gated by
+should_run_sensor_update(), same as obstacle_extract/belief_update above),
+but per_tick_ms() already normalizes every _UNACCOUNTED_SECTIONS entry by
+the total sim_step count regardless of how often the phase itself runs, so
+this does not cause double counting or an incorrect denominator.
 """
 from __future__ import annotations
 
@@ -116,6 +148,8 @@ _UNACCOUNTED_SECTIONS: tuple[str, ...] = (
     "canvas_state_update",
     "belief_snapshot",
     "misc",
+    "planner_services_refresh",
+    "visible_candidate_obstacles",
 )
 
 # Cumulative counters the caller reports each window; PerfMonitor diffs
@@ -131,6 +165,7 @@ _WINDOW_COUNTER_NAMES: tuple[str, ...] = (
     "exhausted_idle_full_updates",
     "exhausted_idle_skipped_canvas_updates",
     "exhausted_idle_skipped_sensor_updates",
+    "reachability_context_builds",
 )
 
 
@@ -162,6 +197,11 @@ def format_perf_summary_line(
     render_ms: float = 0.0,
     console_ms: float = 0.0,
     misc_ms: float = 0.0,
+    planner_services_refresh_ms: float = 0.0,
+    reachability_context_build_ms: float = 0.0,
+    reachability_obstacle_prepare_ms: float = 0.0,
+    reachability_grid_build_ms: float = 0.0,
+    visible_candidate_obstacles_ms: float = 0.0,
     top_level_sum_ms: float = 0.0,
     unaccounted_ms: float = 0.0,
     phase_coverage_pct: float = 0.0,
@@ -180,6 +220,7 @@ def format_perf_summary_line(
     exhausted_idle_full_updates: int = 0,
     exhausted_idle_skipped_canvas_updates: int = 0,
     exhausted_idle_skipped_sensor_updates: int = 0,
+    reachability_context_builds: int = 0,
 ) -> str:
     """Pure formatter, kept separate from PerfMonitor's timing/throttle
     state so the exact line format can be tested without driving a real
@@ -198,6 +239,21 @@ def format_perf_summary_line(
     subtracted from avg_sim_step_ms to get unaccounted_ms; phase_coverage_pct
     is top_level_sum_ms as a percentage of avg_sim_step_ms, for a quick
     sanity check that the named phases account for most of a tick.
+
+    planner_services_refresh_ms is a TOP-LEVEL section (see module
+    docstring) -- ensure_planner_services()'s entire call, previously
+    unmeasured time sitting between controller_ms and nav_ms.
+    reachability_context_build_ms/reachability_obstacle_prepare_ms/
+    reachability_grid_build_ms are NESTED inside it (diagnostic only, never
+    subtracted from unaccounted_ms a second time) and break down where
+    inside that refresh the time actually goes.
+    reachability_context_builds counts how many fresh reachability
+    callbacks were built this window. visible_candidate_obstacles_ms is a
+    SEPARATE, unrelated TOP-LEVEL section (see module docstring) -- inside
+    update_sensed_obstacles(), gated by should_run_sensor_update() rather
+    than running every tick, but still its own non-overlapping gap that is
+    subtracted from unaccounted_ms like any other _UNACCOUNTED_SECTIONS
+    entry.
     """
     parts = [
         "[PERF]",
@@ -210,6 +266,12 @@ def format_perf_summary_line(
         f"belief_update_ms={float(belief_update_ms):.1f}",
         f"runtime_state_build_ms={float(runtime_state_build_ms):.1f}",
         f"controller_ms={float(controller_ms):.1f}",
+        f"planner_services_refresh_ms={float(planner_services_refresh_ms):.1f}",
+        f"reachability_context_build_ms={float(reachability_context_build_ms):.1f}",
+        f"reachability_obstacle_prepare_ms={float(reachability_obstacle_prepare_ms):.1f}",
+        f"reachability_grid_build_ms={float(reachability_grid_build_ms):.1f}",
+        f"reachability_context_builds={int(reachability_context_builds)}",
+        f"visible_candidate_obstacles_ms={float(visible_candidate_obstacles_ms):.1f}",
         f"nav_ms={float(nav_ms):.1f}",
         f"apply_ms={float(apply_decision_ms):.1f}",
         f"motion_ms={float(motion_ms):.1f}",
@@ -371,6 +433,7 @@ class PerfMonitor:
         exhausted_idle_full_updates: int = 0,
         exhausted_idle_skipped_canvas_updates: int = 0,
         exhausted_idle_skipped_sensor_updates: int = 0,
+        reachability_context_builds: int = 0,
         log: Callable[[str], None] | None = None,
         now: float | None = None,
     ) -> bool:
@@ -382,11 +445,11 @@ class PerfMonitor:
         Every *_ms section in the emitted line (other than render_ms) is
         pulled from this instance's own PER-WINDOW accumulators
         (record()/time_phase()), which are reset immediately after a
-        successful emit -- see the module docstring. The nine job/replan/
-        failure/exhausted-idle counters are diffed against their own
-        per-window baseline (_window_delta()) so they too read 0 in a
-        window where nothing new happened, never a stale carried-forward
-        figure.
+        successful emit -- see the module docstring. The ten job/replan/
+        failure/exhausted-idle/reachability counters are diffed against
+        their own per-window baseline (_window_delta()) so they too read 0
+        in a window where nothing new happened, never a stale carried-
+        forward figure.
 
         top_level_sum_ms/unaccounted_ms use per_tick_ms() (normalized by
         total sim_step ticks), NOT average_ms() (normalized by each
@@ -424,6 +487,14 @@ class PerfMonitor:
             belief_update_ms=self.average_ms("belief_update"),
             runtime_state_build_ms=self.average_ms("runtime_state_build"),
             controller_ms=self.average_ms("controller"),
+            planner_services_refresh_ms=self.average_ms("planner_services_refresh"),
+            reachability_context_build_ms=self.average_ms("reachability_context_build"),
+            reachability_obstacle_prepare_ms=self.average_ms("reachability_obstacle_prepare"),
+            reachability_grid_build_ms=self.average_ms("reachability_grid_build"),
+            reachability_context_builds=self._window_delta(
+                "reachability_context_builds", reachability_context_builds
+            ),
+            visible_candidate_obstacles_ms=self.average_ms("visible_candidate_obstacles"),
             nav_ms=self.average_ms("nav_decision"),
             apply_decision_ms=self.average_ms("apply_decision"),
             motion_ms=self.average_ms("motion_update"),

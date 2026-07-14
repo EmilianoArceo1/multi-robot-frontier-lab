@@ -189,6 +189,36 @@ class RobotAgent:
     # forever just because each retry happens to accept a "new" route.
     _safety_replan_grace_used_for: tuple[str, tuple[float, float] | None] | None = None
 
+    # Throttle for repeated route_affected repair replans for the SAME
+    # path_goal, deliberately separate from the safety-replan throttle
+    # above -- see route_affected_replan_allowed(). Near a narrow passage,
+    # ordinary sensor-driven map growth can mark route_affected=True on
+    # nearly every sensor-update tick even though the route is still safe;
+    # without this, that becomes a background full-replan storm.
+    last_route_affected_replan_time: float = field(default=-1.0e9)
+    last_route_affected_path_goal: tuple[float, float] | None = None
+    # Set to the path_goal a route_affected repair was just launched for
+    # (route_affected_replan_allowed() returning True), cleared by
+    # assign_path()/invalidate_route() once the route result actually
+    # arrives (success or failure). While set, a repeated route_affected
+    # for the SAME goal is denied immediately -- a repair for it is
+    # already in flight, so nothing should enqueue a second planner job
+    # on top of the first.
+    route_repair_in_progress_for_goal: tuple[float, float] | None = None
+    # Cumulative diagnostic counters (see engine.py's [NARROW_DIAG] line).
+    # Never used for any decision logic, purely observational.
+    route_affected_replan_count: int = 0
+    first_segment_blocked_count: int = 0
+
+    # Transient speed-cap window (see trigger_narrow_passage_slowdown()/
+    # is_narrow_passage_slowdown_active()), armed when route_affected
+    # repeats for the same path_goal faster than its cooldown allows --
+    # i.e. a genuinely unstable, tightly-replanned area (typically a
+    # narrow passage). Purely a runtime control hint the engine may use to
+    # temporarily reduce robot.max_speed; never changes config.max_speed
+    # or robot dynamics itself.
+    narrow_passage_slowdown_until_time: float = field(default=-1.0e9)
+
     # Consecutive exploration-recovery failures (no successful route
     # assigned in between). Reset by assign_path()/accept_pending_path() on
     # any successful route. Once this reaches _EXPLORATION_FAILURE_BUDGET,
@@ -211,6 +241,13 @@ class RobotAgent:
     _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
     _EXPLORATION_FAILURE_BUDGET: ClassVar[int] = 3
     _RECENT_SAFE_POSITION_LIMIT: ClassVar[int] = 20
+
+    # How long a narrow-passage speed-cap window stays armed once
+    # triggered, and the capped speed itself (m/s) -- within the
+    # suggested 0.35-0.50 m/s range, well below a typical configured
+    # max_speed (commonly ~1.2 m/s). Never changes config.max_speed.
+    _NARROW_PASSAGE_SLOWDOWN_WINDOW_S: ClassVar[float] = 3.0
+    _NARROW_PASSAGE_SLOWDOWN_SPEED_CAP: ClassVar[float] = 0.40
 
     # Metrics counters (not displayed yet; available for future dashboard).
     stop_count_exploration: int = 0
@@ -323,6 +360,7 @@ class RobotAgent:
         self.pending_target_xy = None
         self.pending_path_route_generation = None
         self.pending_path_created_for_active_goal = None
+        self.route_repair_in_progress_for_goal = None
         self.status = "idle"
         if reason:
             self.last_plan_reason = reason
@@ -563,6 +601,93 @@ class RobotAgent:
             self._safety_replan_grace_used_for = None
         return True
 
+    # ------------------------------------------------------------------ route_affected throttle
+
+    def route_affected_replan_allowed(
+        self,
+        *,
+        path_goal: tuple[float, float] | None,
+        current_time: float,
+        cooldown: float,
+    ) -> bool:
+        """Throttle repeated route_affected repair replans for the SAME
+        path_goal within `cooldown` seconds of SIMULATION time.
+
+        Deliberately separate from safety_replan_allowed(): route_affected
+        fires whenever ANY newly-mapped obstacle sample intersects the
+        current route -- near a narrow passage this can happen on nearly
+        every sensor-update tick as boundary samples accumulate, even
+        though the route itself is still perfectly safe. Without this
+        throttle that becomes a background full-replan storm (repeated
+        "New obstacle affects current route" for the same target).
+
+        There is deliberately NO active_segment_unsafe bypass (an earlier
+        version of this guard had one). Near a narrow passage, the very
+        obstacle samples that trigger route_affected also tend to make a
+        coarse "is the current segment blocked" check read True on nearly
+        every call -- that made the bypass fire almost unconditionally and
+        defeated the throttle completely (confirmed via manual Office.sim
+        telemetry: repeated route_affected for the same path_goal, no
+        throttling observed). A genuinely urgent, imminent collision is
+        REPLAN_FOR_SAFETY's job -- driven independently by
+        active_segment_blocked/predicted_collision in RobotAgent.step(),
+        with its own separate safety_replan_allowed() throttle, and never
+        routed through this method at all. This guard's only job is to
+        stop routine map-growth repairs from storming the planner, so it
+        must never be bypassed by a condition that becomes chronically
+        true in exactly the situation it exists to fix.
+
+        Also denies immediately -- without touching the cooldown clock --
+        when a repair for this exact goal is already in flight
+        (route_repair_in_progress_for_goal, cleared by assign_path()/
+        invalidate_route() once the route result arrives), so a repeated
+        route_affected while an async worker is still computing cannot
+        enqueue a second planner job on top of the first.
+
+        When throttled, arms the narrow-passage speed-cap window (see
+        trigger_narrow_passage_slowdown()) -- repeated route_affected for
+        the same target within cooldown is exactly the "unstable, tightly
+        replanned area" signal that window exists for.
+        """
+        self.route_affected_replan_count += 1
+
+        if (
+            self.route_repair_in_progress_for_goal is not None
+            and path_goal is not None
+            and self.route_repair_in_progress_for_goal == path_goal
+        ):
+            self.trigger_narrow_passage_slowdown(current_time)
+            return False
+
+        same_goal = path_goal == self.last_route_affected_path_goal
+        elapsed = float(current_time) - float(self.last_route_affected_replan_time)
+        if same_goal and elapsed < float(cooldown):
+            self.trigger_narrow_passage_slowdown(current_time)
+            return False
+
+        self.last_route_affected_replan_time = float(current_time)
+        self.last_route_affected_path_goal = path_goal
+        self.route_repair_in_progress_for_goal = path_goal
+        return True
+
+    # ------------------------------------------------------------------ narrow-passage slowdown
+
+    def trigger_narrow_passage_slowdown(self, current_time: float) -> None:
+        """Arm a transient speed-cap window.
+
+        The engine checks is_narrow_passage_slowdown_active() each tick
+        and, while active, may temporarily reduce robot.max_speed (an
+        existing runtime hook) to _NARROW_PASSAGE_SLOWDOWN_SPEED_CAP --
+        giving the planner/controller more slack in a tight, repeatedly
+        replanned area without touching config.max_speed or robot
+        dynamics. Re-triggering (e.g. another throttled route_affected)
+        simply extends the window.
+        """
+        self.narrow_passage_slowdown_until_time = float(current_time) + self._NARROW_PASSAGE_SLOWDOWN_WINDOW_S
+
+    def is_narrow_passage_slowdown_active(self, current_time: float) -> bool:
+        return float(current_time) < self.narrow_passage_slowdown_until_time
+
     def assign_path(
         self,
         *,
@@ -580,6 +705,9 @@ class RobotAgent:
         # A genuinely new route was just accepted -- see
         # safety_replan_allowed()'s route_generation grace period.
         self.route_generation += 1
+        # Whatever route_affected repair (if any) was in flight has now
+        # resolved -- see route_affected_replan_allowed().
+        self.route_repair_in_progress_for_goal = None
         self.last_plan_reason = planner_reason
         self.status = "moving" if self.waypoints.has_path() else "finished"
         # A route was successfully committed: exploration is progressing

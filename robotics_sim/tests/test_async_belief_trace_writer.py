@@ -153,3 +153,28 @@ def test_async_trace_writer_write_error_disables_sink_without_crashing():
     # Further enqueues after disable are silent no-ops, never raise.
     accepted = writer.record_route_event(simulation_time=2.0, robot_id="R1", result="ok")
     assert accepted is False
+
+
+# ---------------------------------------------------------------------------
+# F. Regression: at a realistic simulation cadence (not an adversarial
+#    tight loop), the queue never builds up and nothing is dropped -- the
+#    manual PERF evidence confirming trace_queue=0/dropped_trace_events=0
+#    even while sim_step_ms grows must keep holding after this round's
+#    exhausted-hold throttling changes.
+# ---------------------------------------------------------------------------
+
+
+def test_no_trace_queue_regression():
+    writer = AsyncTraceWriter(_RecordingWriter(), maxsize=500, start_worker=True)
+
+    for i in range(100):
+        writer.record_route_event(simulation_time=float(i), robot_id="R1", result="ok")
+        writer.record_decision_event(simulation_time=float(i), robot_id="R1", kind="HOLD")
+        writer.record_event(event_type="map", simulation_time=float(i))
+        time.sleep(0.002)  # ~500Hz, still far faster than real tick cadence
+
+    writer.flush(timeout=3.0)
+
+    assert writer.queue_size == 0
+    assert writer.dropped_total == 0
+    writer.close(timeout=2.0)

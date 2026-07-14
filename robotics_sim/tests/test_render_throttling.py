@@ -48,3 +48,23 @@ def test_render_throttler_allows_immediate_paint_when_paused_or_forced():
     # Normal throttling resumes immediately after a forced render.
     assert throttler.should_render(now=0.006) is False
     assert throttler.should_render(now=0.04) is True
+
+
+# ---------------------------------------------------------------------------
+# C. SIM_RENDER_FPS env var overrides the default target FPS.
+# ---------------------------------------------------------------------------
+
+
+def test_render_throttler_uses_env_target_fps():
+    throttler = RenderThrottler(env={"SIM_RENDER_FPS": "20"})
+    assert throttler.target_fps == 20.0
+
+    # ~0.05s minimum interval at 20 FPS -- stricter than the 30 FPS default.
+    assert throttler.should_render(now=0.0) is True
+    assert throttler.should_render(now=0.04) is False, "still within the 20 FPS window"
+    assert throttler.should_render(now=0.05) is True
+
+
+def test_render_throttler_defaults_to_30_fps_when_env_unset():
+    throttler = RenderThrottler(env={})
+    assert throttler.target_fps == DEFAULT_RENDER_THROTTLE_FPS

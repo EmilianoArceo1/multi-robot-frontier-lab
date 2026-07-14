@@ -9,6 +9,7 @@ It emits interaction events, but it does not choose frontiers or compute routes.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import numpy as np
@@ -78,9 +79,23 @@ class RenderThrottler:
     already only ever fire on user action or while not actively
     simulating) is untouched and stays immediate, matching "render
     immediately after user interactions".
+
+    target_fps defaults to the SIM_RENDER_FPS environment variable
+    (read at construction time, mirroring RobotTrace/PerfMonitor's own
+    env-reading convention) when not given explicitly, falling back to
+    DEFAULT_RENDER_THROTTLE_FPS if that env var is unset. Pass `env=`
+    explicitly in tests for a deterministic instance.
     """
 
-    def __init__(self, target_fps: float = DEFAULT_RENDER_THROTTLE_FPS):
+    def __init__(
+        self,
+        target_fps: float | None = None,
+        *,
+        env: "dict[str, str] | None" = None,
+    ):
+        if target_fps is None:
+            source = env if env is not None else os.environ
+            target_fps = float(source.get("SIM_RENDER_FPS", DEFAULT_RENDER_THROTTLE_FPS))
         self.target_fps = float(target_fps)
         self._min_interval = (1.0 / self.target_fps) if self.target_fps > 0 else 0.0
         self._last_render_time: float | None = None

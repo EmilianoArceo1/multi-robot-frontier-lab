@@ -5004,6 +5004,38 @@ class SimulationControllerMixin:
             simulation_speed=self.simulation_speed,
         )
 
+    def _append_executed_path_point(self, new_path_point: tuple[float, float]) -> None:
+        """Append one point to the single-robot executed trail
+        (self.path_points), trimming back to EXECUTED_TRAIL_MAX_POINTS
+        only once EXECUTED_TRAIL_TRIM_MARGIN extra points have
+        accumulated past the cap -- not on the very next tick after the
+        cap is first reached.
+
+        Trimming replaces self.path_points with a NEW list object (see
+        SimulationCanvas.draw_executed_path()'s docstring: its executed-
+        trail pixmap cache uses object identity to detect exactly this,
+        forcing a full pixmap rebuild whenever it happens). One point is
+        appended every tick, so a naive "> EXECUTED_TRAIL_MAX_POINTS: trim
+        to EXECUTED_TRAIL_MAX_POINTS" would replace the list object on
+        EVERY tick forever after the cap is first reached -- permanently
+        defeating that cache (real Office.sim evidence:
+        executed_trail_build_ms climbing to 5-10ms+ per frame once
+        executed_trail_points hit 1200, with route_path_ms spikes over
+        100ms). The margin means that identity change -- and the rebuild
+        it forces -- happens once every EXECUTED_TRAIL_TRIM_MARGIN ticks
+        instead of every tick, matching the "grew in place" case the
+        pixmap cache is actually optimized for.
+        """
+        if self.path_points:
+            self.total_distance_traveled += math.hypot(
+                new_path_point[0] - float(self.path_points[-1][0]),
+                new_path_point[1] - float(self.path_points[-1][1]),
+            )
+        self.path_points.append(new_path_point)
+
+        if len(self.path_points) > EXECUTED_TRAIL_MAX_POINTS + EXECUTED_TRAIL_TRIM_MARGIN:
+            self.path_points = self.path_points[-EXECUTED_TRAIL_MAX_POINTS:]
+
     def simulation_step(self):
         now = time.perf_counter()
         real_dt = now - self.last_time
@@ -5425,15 +5457,7 @@ class SimulationControllerMixin:
 
         _misc_path_perf_start = time.perf_counter()
         new_path_point = (float(self.robot.x), float(self.robot.y))
-        if self.path_points:
-            self.total_distance_traveled += math.hypot(
-                new_path_point[0] - float(self.path_points[-1][0]),
-                new_path_point[1] - float(self.path_points[-1][1]),
-            )
-        self.path_points.append(new_path_point)
-
-        if len(self.path_points) > 1200:
-            self.path_points = self.path_points[-1200:]
+        self._append_executed_path_point(new_path_point)
         _record_perf(self, "misc", time.perf_counter() - _misc_path_perf_start)
 
         # Skip the forced per-tick canvas repaint while latched in an

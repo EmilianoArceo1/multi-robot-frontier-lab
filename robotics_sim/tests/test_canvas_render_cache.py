@@ -332,3 +332,60 @@ def test_executed_trail_cache_rebuilds_after_path_truncation():
 
     assert canvas._executed_trail_pixmap is not first_pixmap
     assert canvas._executed_trail_pixmap_count == 5
+
+
+def test_executed_trail_cache_stays_hot_across_engine_style_sliding_window_trims():
+    """Integration regression for the real Office.sim bug: once
+    executed_trail_points reached 1200, cache_hit=False appeared on nearly
+    every frame because engine.py used to trim path_points back to exactly
+    1200 the instant it exceeded 1200 -- replacing the list object (and
+    forcing a full pixmap rebuild) on EVERY tick forever after. This
+    mirrors engine.py's fixed _append_executed_path_point() trim pattern
+    (grow to cap + margin, then trim back to cap) directly against
+    path_points/set_path(), and asserts the pixmap object identity is
+    preserved for the whole margin, only changing once per trim cycle --
+    not once per tick."""
+    canvas = _make_canvas()
+    max_points = 1200
+    margin = 200
+
+    state = {"points": []}
+
+    def _append(point):
+        # Mirrors engine.py's _append_executed_path_point() exactly:
+        # append in place (same list object) every tick, only replacing
+        # the list object (a slice -> new list) once cap + margin is
+        # exceeded.
+        state["points"].append(point)
+        if len(state["points"]) > max_points + margin:
+            state["points"] = state["points"][-max_points:]
+
+    for i in range(max_points):
+        _append((float(i), 0.0))
+    canvas.set_path(state["points"])
+    _draw_executed_path_once(canvas)
+    assert canvas._executed_trail_pixmap is not None
+
+    rebuild_count = 0
+    previous_pixmap = canvas._executed_trail_pixmap
+
+    # Run well past several trim cycles -- exactly the "trail stuck at/
+    # above 1200 points" regime from the real bug report.
+    for i in range(4 * margin):
+        _append((float(max_points + i), 0.0))
+        canvas.set_path(state["points"])
+        _draw_executed_path_once(canvas)
+
+        if canvas._executed_trail_pixmap is not previous_pixmap:
+            rebuild_count += 1
+            previous_pixmap = canvas._executed_trail_pixmap
+        else:
+            # A cache hit (append, not rebuild) must paint at most the one
+            # new segment -- never the whole trail again.
+            assert canvas._route_detail["executed_trail_segments_painted"] <= 1
+            assert canvas._route_detail["executed_trail_cache_hit"] is True
+
+    # A handful of rebuilds (one per trim cycle) across 4 cycles' worth of
+    # ticks -- NOT one rebuild per tick (which would be 4*margin rebuilds,
+    # exactly reproducing the reported cache_hit=False-every-frame bug).
+    assert 2 <= rebuild_count <= 6

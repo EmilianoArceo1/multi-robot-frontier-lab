@@ -170,6 +170,10 @@ def _build_fake_engine_for_route_result(tmp_path, *, robot_xy=(0.0, 0.0)) -> Sim
     fake.clean_waypoints_for_current_start = SimulationControllerMixin.clean_waypoints_for_current_start.__get__(fake)
     fake.log_route_assignment = SimulationControllerMixin.log_route_assignment.__get__(fake)
     fake.apply_route_result = SimulationControllerMixin.apply_route_result.__get__(fake)
+    fake.sanitize_planner_obstacle_points = SimulationControllerMixin.sanitize_planner_obstacle_points.__get__(fake)
+    fake.obstacle_points_for_segment_safety_check = (
+        SimulationControllerMixin.obstacle_points_for_segment_safety_check.__get__(fake)
+    )
     return fake
 
 

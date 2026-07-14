@@ -139,6 +139,8 @@ def _build_fake_engine(*, position=(6.0, 3.0), goal_tolerance=0.25) -> SimpleNam
         "apply_route_result",
         "request_route_async",
         "replan_after_new_information",
+        "sanitize_planner_obstacle_points",
+        "obstacle_points_for_segment_safety_check",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 

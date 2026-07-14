@@ -965,6 +965,54 @@ class SimulationControllerMixin:
             kept.append((px, py))
         return kept, removed
 
+    def obstacle_points_for_segment_safety_check(
+        self,
+        start_xy: tuple[float, float],
+        robot_radius: float,
+    ) -> list[tuple[float, float]]:
+        """Return self.mapped_obstacle_points with the SAME near-start
+        sanitization sanitize_planner_obstacle_points() already applies
+        before the planner ever sees them, for use by every post-hoc
+        segment/motion safety check (route_first_segment_blocked(),
+        active_segment_blocked in build_observation(), predicted_collision
+        in predicted_motion_report()).
+
+        Root cause this closes: the planner (A*/reachability) has always
+        sanitized mapped_obstacle_points before building its planning grid
+        -- clearing a small disk around the robot's own current position,
+        because a boundary sample the robot's own sensor just placed a few
+        centimeters from its center is expected, not a real obstacle, and
+        would otherwise make A* reject the route before it starts (see
+        sanitize_planner_obstacle_points()'s own docstring). The four
+        safety/validation checks above were never given the same
+        sanitization -- they used the raw mapped_obstacle_points list
+        directly, so CollisionChecker.check_segment_points()'s "distance
+        from any obstacle point to the segment" rule always found that same
+        near-start sample sitting well inside robot_radius of start_xy
+        (since t=0 of any segment starting AT the robot is exactly where
+        that sample was recorded), and rejected the route's first segment
+        as "blocked" regardless of which direction it actually pointed.
+        This is exactly the reproducible Office.sim sequence: reachability
+        approves a candidate, A* finds a path on the sanitized grid, the
+        simplifier agrees, and then route validation -- and predicted
+        collision, using the same unsanitized list -- immediately rejects
+        it. Using the SAME sanitized list here makes every checker agree
+        with what the planner already assumed about the robot's own
+        immediate surroundings. clear_radius stays exactly what
+        sanitize_planner_obstacle_points() already computes (~1.25x grid
+        resolution) -- this does not touch robot_radius/safety_radius, does
+        not relax any check away from the robot's current position, and
+        does not change the disk beyond the one already used to plan the
+        route.
+        """
+        points, _ = self.sanitize_planner_obstacle_points(
+            list(self.mapped_obstacle_points),
+            start_xy=start_xy,
+            robot_radius=robot_radius,
+            resolution=float(self.config.grid_resolution),
+        )
+        return points
+
     def build_planning_grid_for_robot(
         self,
         robot,
@@ -2051,12 +2099,13 @@ class SimulationControllerMixin:
             # assigned, producing a safety-replan loop instead of a working
             # route. Falls through to the shared failure-handling code below.
             start_xy = (float(self.robot.x), float(self.robot.y))
+            segment_robot_radius = self.safety_radius()
             blocked_on_arrival = bool(clean_waypoints) and route_first_segment_blocked(
                 self.collision_checker,
                 start_xy,
                 clean_waypoints[0],
-                list(self.mapped_obstacle_points),
-                self.safety_radius(),
+                self.obstacle_points_for_segment_safety_check(start_xy, segment_robot_radius),
+                segment_robot_radius,
             )
 
             # Reject a route that claims success but whose final waypoint
@@ -5347,7 +5396,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=list(self.mapped_obstacle_points),
+                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
                 use_ground_truth=True,
             )
             _record_perf(self, "controller", time.perf_counter() - _controller_perf_start)
@@ -5666,7 +5715,7 @@ class SimulationControllerMixin:
                 report = self.collision_checker.check_segment_points(
                     start=robot_xy,
                     end=target,
-                    obstacle_points=list(self.mapped_obstacle_points) + dynamic_pts,
+                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_xy, robot_radius) + dynamic_pts,
                     robot_radius=robot_radius,
                 )
                 active_segment_blocked = bool(report.collision)
@@ -6227,12 +6276,13 @@ class SimulationControllerMixin:
             # samples appeared near the route could still be promoted via
             # ACCEPT_PENDING_PATH straight into a now-unsafe segment.
             robot_xy_now = (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None
+            prefetch_segment_robot_radius = self.safety_radius()
             if robot_xy_now is not None and route_first_segment_blocked(
                 self.collision_checker,
                 robot_xy_now,
                 clean_waypoints[0],
-                list(self.mapped_obstacle_points),
-                self.safety_radius(),
+                self.obstacle_points_for_segment_safety_check(robot_xy_now, prefetch_segment_robot_radius),
+                prefetch_segment_robot_radius,
             ):
                 rejected_target = agent.pending_target_xy
                 agent.first_segment_blocked_count += 1

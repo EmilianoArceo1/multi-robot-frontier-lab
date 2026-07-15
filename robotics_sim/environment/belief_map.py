@@ -106,6 +106,10 @@ class BeliefMap:
         self.visit_count = np.zeros((self.height, self.width), dtype=np.uint16)
         self.explored_by_robot = np.zeros((self.robot_count, self.height, self.width), dtype=bool)
         self.last_seen = np.full((self.height, self.width), -1.0, dtype=np.float32)
+        # Monotonic visual-state revision used by immutable debug replay.
+        # It changes only when occupancy or per-robot explored masks change,
+        # not for visit-count/last-seen updates that do not alter rendering.
+        self.revision = 0
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
@@ -120,6 +124,7 @@ class BeliefMap:
         self.visit_count.fill(0)
         self.explored_by_robot.fill(False)
         self.last_seen.fill(-1.0)
+        self.revision += 1
 
     # ------------------------------------------------------------------
     # Coordinate conversion
@@ -162,8 +167,10 @@ class BeliefMap:
         if not self._valid_cell((row, col)):
             return
 
-        if self.grid[row, col] != OCCUPIED:
+        changed = False
+        if self.grid[row, col] != OCCUPIED and self.grid[row, col] != FREE:
             self.grid[row, col] = FREE
+            changed = True
 
         self.visit_count[row, col] = min(
             int(self.visit_count[row, col]) + 1,
@@ -171,10 +178,16 @@ class BeliefMap:
         )
 
         if robot_index is not None and 0 <= int(robot_index) < self.robot_count:
-            self.explored_by_robot[int(robot_index), row, col] = True
+            robot_index = int(robot_index)
+            if not self.explored_by_robot[robot_index, row, col]:
+                self.explored_by_robot[robot_index, row, col] = True
+                changed = True
 
         if time_s is not None:
             self.last_seen[row, col] = float(time_s)
+
+        if changed:
+            self.revision += 1
 
     def force_free_cell(
         self,
@@ -196,11 +209,16 @@ class BeliefMap:
         self.visit_count[row, col] = max(1, int(self.visit_count[row, col]))
 
         if robot_index is not None and 0 <= int(robot_index) < self.robot_count:
-            self.explored_by_robot[int(robot_index), row, col] = True
+            robot_index = int(robot_index)
+            if not self.explored_by_robot[robot_index, row, col]:
+                self.explored_by_robot[robot_index, row, col] = True
+                changed = True
 
         if time_s is not None:
             self.last_seen[row, col] = float(time_s)
 
+        if changed:
+            self.revision += 1
         return bool(changed)
 
     def force_free_point(
@@ -219,9 +237,12 @@ class BeliefMap:
         if not self._valid_cell((row, col)):
             return
 
+        changed = self.grid[row, col] != OCCUPIED
         self.grid[row, col] = OCCUPIED
         if time_s is not None:
             self.last_seen[row, col] = float(time_s)
+        if changed:
+            self.revision += 1
 
     def mark_visible_polygon(
         self,

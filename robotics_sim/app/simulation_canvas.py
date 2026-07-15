@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import zlib
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize, QTimer
@@ -284,6 +285,13 @@ class SimulationCanvas(QWidget):
         self._nav_debug_history_position: tuple[int | None, int] = (None, 0)
         self._nav_debug_overlay_cache: dict | None = None
         self._nav_debug_overlay_cache_key: tuple | None = None
+        # Decoded historical belief/exploration state and its raster cache.
+        # Both are rebuilt only when the selected snapshot revision or view
+        # transform changes, never on every paintEvent.
+        self._nav_debug_environment_decode_key: tuple | None = None
+        self._nav_debug_environment_decoded: dict | None = None
+        self._nav_debug_explored_cache: QPixmap | None = None
+        self._nav_debug_explored_cache_key: tuple | None = None
         # Optional docked panel the full field breakdown is forwarded
         # to -- see set_navigation_reasoning_window(). None until
         # main_window.py registers one.
@@ -2007,7 +2015,8 @@ class SimulationCanvas(QWidget):
         # Mapped points remain visible because they represent the discovered map.
         # They are drawn above the vision/r layer and below routes/waypoints/robot.
         _mapped_obstacle_points_start = time.perf_counter()
-        self.draw_mapped_obstacle_points(painter)
+        if self._navigation_debug_history_snapshot() is None:
+            self.draw_mapped_obstacle_points(painter)
         self._render_layer_ms["mapped_obstacle_points"] = (
             (time.perf_counter() - _mapped_obstacle_points_start) * 1000.0
         )
@@ -2300,6 +2309,53 @@ class SimulationCanvas(QWidget):
     def is_navigation_debug_enabled(self) -> bool:
         return bool(self.navigation_debug_enabled)
 
+    def _navigation_debug_history_snapshot(self):
+        """Return the selected frozen frame, never the live snapshot."""
+        position, _total = self._nav_debug_history_position
+        if not self.navigation_debug_enabled or position is None:
+            return None
+        return self._nav_debug_snapshot
+
+    def _decoded_navigation_debug_environment(self) -> dict | None:
+        """Decode the selected snapshot's compressed map exactly once.
+
+        The returned arrays are read-only replay data. They are never fed back
+        into planning or the live BeliefMap.
+        """
+        snapshot = self._navigation_debug_history_snapshot()
+        if snapshot is None:
+            return None
+        maybe_frame = getattr(snapshot, "belief_map", None)
+        if maybe_frame is None or maybe_frame.unavailable or maybe_frame.value is None:
+            return None
+        frame = maybe_frame.value
+        key = (id(frame), int(frame.revision))
+        if self._nav_debug_environment_decode_key == key:
+            return self._nav_debug_environment_decoded
+
+        grid_bytes = zlib.decompress(frame.grid_zlib)
+        grid = np.frombuffer(grid_bytes, dtype=np.int8).reshape(frame.grid_shape)
+
+        packed = np.frombuffer(
+            zlib.decompress(frame.explored_packbits_zlib), dtype=np.uint8
+        )
+        explored_count = int(np.prod(frame.explored_shape))
+        explored = np.unpackbits(
+            packed, bitorder="little", count=explored_count
+        ).reshape(frame.explored_shape).astype(bool, copy=False)
+
+        decoded = {
+            "frame": frame,
+            "resolution": float(frame.resolution),
+            "bounds": tuple(frame.bounds),
+            "grid": grid,
+            "explored_by_robot": explored,
+            "revision": int(frame.revision),
+        }
+        self._nav_debug_environment_decode_key = key
+        self._nav_debug_environment_decoded = decoded
+        return decoded
+
     def set_navigation_reasoning_window(self, window) -> None:
         """Register the docked NavigationReasoningWindow so the 3
         setters below can forward pushes to it too. Optional -- None (the
@@ -2319,6 +2375,11 @@ class SimulationCanvas(QWidget):
         so pausing the simulation (which just stops those calls) leaves the
         last relevant snapshot in place across any number of repaints."""
         self._nav_debug_snapshot = snapshot
+        if snapshot is None:
+            self._nav_debug_environment_decode_key = None
+            self._nav_debug_environment_decoded = None
+            self._nav_debug_explored_cache = None
+            self._nav_debug_explored_cache_key = None
         self._refresh_navigation_reasoning_window()
         self.update()
 
@@ -2436,7 +2497,9 @@ class SimulationCanvas(QWidget):
         rebuild -- grid lines are still drawn -- so this can never freeze
         the UI trying to draw every cell.
         """
-        if not self.grid_overlay_enabled:
+        historical_environment = self._decoded_navigation_debug_environment()
+        history_active = historical_environment is not None
+        if not self.grid_overlay_enabled and not history_active:
             self._grid_overlay_last_cache_status = "off"
             self._grid_overlay_last_visible_cells = 0
             self._grid_overlay_degraded = False
@@ -2446,8 +2509,14 @@ class SimulationCanvas(QWidget):
             self._grid_overlay_lines_ms = 0.0
             return
 
-        resolution = self._grid_overlay_resolution
-        snapshot = self._grid_overlay_snapshot
+        if history_active:
+            resolution = float(historical_environment["resolution"])
+            snapshot = historical_environment
+            snapshot_version = ("history", int(historical_environment["revision"]))
+        else:
+            resolution = self._grid_overlay_resolution
+            snapshot = self._grid_overlay_snapshot
+            snapshot_version = ("live", self._grid_overlay_snapshot_version)
 
         cell_bounds = self._grid_overlay_cell_bounds(resolution, snapshot)
         if cell_bounds is not None:
@@ -2479,7 +2548,7 @@ class SimulationCanvas(QWidget):
             self.width(),
             self.height(),
             tuple(round(float(bound), 2) for bound in self.active_view_bounds_world()),
-            self._grid_overlay_snapshot_version if cell_bounds is not None else -1,
+            snapshot_version if cell_bounds is not None else -1,
         )
 
         if self._grid_overlay_cache is not None and self._grid_overlay_cache_key == cache_key:
@@ -2629,13 +2698,12 @@ class SimulationCanvas(QWidget):
         return float(self.config.goal_x), float(self.config.goal_y)
 
     def draw_explored_area_trace(self, painter: QPainter):
-        """
-        Draw explored coverage from a cached pixmap.
+        """Draw live coverage, or the frozen explored mask while replaying."""
+        historical_environment = self._decoded_navigation_debug_environment()
+        if historical_environment is not None:
+            self._draw_historical_explored_area(painter, historical_environment)
+            return
 
-        The cache is updated incrementally when a new sensor footprint is
-        recorded, so paintEvent no longer rebuilds a large QPainterPath every
-        frame.
-        """
         if not self.config.show_explored_area:
             return
 
@@ -2656,6 +2724,56 @@ class SimulationCanvas(QWidget):
         self.ensure_explored_area_cache()
         if self._explored_area_cache is not None:
             painter.drawPixmap(0, 0, self._explored_area_cache)
+        painter.restore()
+
+    def _draw_historical_explored_area(self, painter: QPainter, environment: dict) -> None:
+        """Rasterize the frozen per-robot explored masks for one replay frame."""
+        frame = environment["frame"]
+        cache_key = (
+            int(frame.revision),
+            self.width(),
+            self.height(),
+            self._view_transform_signature(),
+        )
+        if self._nav_debug_explored_cache is None or self._nav_debug_explored_cache_key != cache_key:
+            cache = QPixmap(self.size())
+            cache.fill(Qt.transparent)
+            cache_painter = QPainter(cache)
+            cache_painter.save()
+            cache_painter.setClipRect(self.plot_rect())
+            cache_painter.setPen(Qt.NoPen)
+
+            masks = environment["explored_by_robot"]
+            resolution = float(environment["resolution"])
+            x_min, _x_max, y_min, _y_max = environment["bounds"]
+            cell_bounds = self._grid_overlay_cell_bounds(resolution, environment)
+            if cell_bounds is not None:
+                col_start, col_end, row_start, row_end = cell_bounds
+                for robot_index in range(masks.shape[0]):
+                    color = QColor(BLUE) if masks.shape[0] == 1 else robot_color(robot_index)
+                    color.setAlpha(30)
+                    cache_painter.setBrush(QBrush(color))
+                    mask = masks[robot_index]
+                    rows, cols = np.where(mask[row_start:row_end + 1, col_start:col_end + 1])
+                    for local_row, local_col in zip(rows, cols):
+                        row = row_start + int(local_row)
+                        col = col_start + int(local_col)
+                        x0 = x_min + col * resolution
+                        y0 = y_min + row * resolution
+                        sx0, sy0 = self.world_to_screen(x0, y0)
+                        sx1, sy1 = self.world_to_screen(x0 + resolution, y0 + resolution)
+                        cache_painter.drawRect(QRectF(
+                            min(sx0, sx1), min(sy0, sy1),
+                            abs(sx1 - sx0), abs(sy1 - sy0),
+                        ))
+
+            cache_painter.restore()
+            cache_painter.end()
+            self._nav_debug_explored_cache = cache
+            self._nav_debug_explored_cache_key = cache_key
+
+        painter.save()
+        painter.drawPixmap(0, 0, self._nav_debug_explored_cache)
         painter.restore()
 
     def sensor_polygon_for_pose(
@@ -2782,6 +2900,31 @@ class SimulationCanvas(QWidget):
         self._fov_detail["robot_fov_compute_ms"] = 0.0
         self._fov_detail["robot_fov_paint_ms"] = 0.0
         if not self.config.show_vision:
+            return
+
+        historical_snapshot = self._navigation_debug_history_snapshot()
+        if historical_snapshot is not None:
+            sensor_debug = historical_snapshot.sensor
+            polygon = []
+            point_count = int(getattr(sensor_debug, "visible_polygon_count", 0))
+            polygon_bytes = getattr(sensor_debug, "visible_polygon_f32_zlib", b"")
+            if point_count > 0 and polygon_bytes:
+                points = np.frombuffer(
+                    zlib.decompress(polygon_bytes), dtype=np.float32
+                ).reshape((point_count, 2))
+                polygon = [(float(point[0]), float(point[1])) for point in points]
+            if not polygon:
+                polygon = self.sensor_polygon_for_pose(
+                    -999,
+                    float(historical_snapshot.robot_pose.x),
+                    float(historical_snapshot.robot_pose.y),
+                    float(historical_snapshot.robot_pose.theta),
+                    float(getattr(historical_snapshot.sensor, "vision_range", 0.0) or self.config.vision),
+                )
+            painter.save()
+            self.draw_sensor_polygon(painter, polygon, QColor(BLUE))
+            painter.restore()
+            self._fov_detail["robot_fov_cache_hit"] = True
             return
 
         painter.save()

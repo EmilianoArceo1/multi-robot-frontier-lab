@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import time
+import zlib
 from types import SimpleNamespace
 
 import numpy as np
@@ -106,6 +107,7 @@ from robotics_sim.diagnostics.event_log import (
     NavigationDebugEventLog,
 )
 from robotics_sim.diagnostics.navigation_snapshot import (
+    BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
     Maybe,
@@ -116,6 +118,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     PredictedMotionDebug,
     RouteValidationDebug,
     SafetyDebug,
+    SensorDebug,
 )
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
@@ -2594,6 +2597,45 @@ class SimulationControllerMixin:
             return NavigationDebugEventKind.HOLD
         return NavigationDebugEventKind.TICK
 
+    def _navigation_debug_belief_frame(self) -> Maybe[BeliefMapDebug]:
+        """Return a compact immutable map frame, reusing it until the belief changes.
+
+        Navigation history records every simulation tick. Copying a full grid on
+        every tick would make the replay prohibitively large, so BeliefMap exposes
+        a monotonic visual revision and all snapshots for the same revision share
+        one compressed BeliefMapDebug object.
+        """
+        belief = getattr(self, "belief_map", None)
+        if belief is None:
+            return Maybe.missing()
+
+        revision = int(getattr(belief, "revision", 0))
+        cache_key = (id(belief), revision, int(getattr(belief, "robot_count", 1)))
+        cached_key = getattr(self, "_nav_debug_belief_frame_key", None)
+        cached_frame = getattr(self, "_nav_debug_belief_frame_cache", None)
+        if cached_key == cache_key and cached_frame is not None:
+            return Maybe.of(cached_frame)
+
+        grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
+        explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
+        packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
+        frame = BeliefMapDebug(
+            revision=revision,
+            resolution=float(belief.resolution),
+            bounds=tuple(float(v) for v in belief.bounds),
+            grid_shape=(int(grid.shape[0]), int(grid.shape[1])),
+            grid_zlib=zlib.compress(grid.tobytes(order="C"), level=1),
+            explored_shape=(
+                int(explored.shape[0]),
+                int(explored.shape[1]),
+                int(explored.shape[2]),
+            ),
+            explored_packbits_zlib=zlib.compress(packed_explored.tobytes(), level=1),
+        )
+        self._nav_debug_belief_frame_key = cache_key
+        self._nav_debug_belief_frame_cache = frame
+        return Maybe.of(frame)
+
     def _finalize_navigation_debug_snapshot(
         self,
         *,
@@ -2759,6 +2801,28 @@ class SimulationControllerMixin:
             route=route,
         )
 
+        sensor_polygon = sensor_visible_polygon_world(
+            origin=robot_xy,
+            theta=float(robot.theta),
+            vision=float(robot.vision),
+            vision_model=self.config.vision_model,
+            obstacles=list(self.config.obstacles),
+            ray_count=(
+                SENSOR_DRAW_RAYS_CAMERA
+                if "Camera" in self.config.vision_model
+                else SENSOR_DRAW_RAYS_OMNI
+            ),
+        )
+        sensor_polygon_array = np.ascontiguousarray(sensor_polygon, dtype=np.float32)
+        sensor = SensorDebug(
+            vision_range=float(robot.vision),
+            visible_polygon_count=int(sensor_polygon_array.shape[0]),
+            visible_polygon_f32_zlib=zlib.compress(
+                sensor_polygon_array.tobytes(order="C"), level=1
+            ),
+        )
+        belief_map_debug = self._navigation_debug_belief_frame()
+
         self._nav_debug_seq = getattr(self, "_nav_debug_seq", 0) + 1
         snapshot = NavigationDebugSnapshot(
             snapshot_id=self._nav_debug_seq,
@@ -2779,6 +2843,8 @@ class SimulationControllerMixin:
             rotate_threshold=rotate_threshold,
             explanation=explanation,
             mapped_obstacle_points_count=len(getattr(self, "mapped_obstacle_points", ())),
+            sensor=sensor,
+            belief_map=belief_map_debug,
         )
 
         # The ring buffer records every tick (a full in-memory history for
@@ -2821,6 +2887,8 @@ class SimulationControllerMixin:
         self._nav_debug_last_accepted_plan = None
         self._nav_debug_live_snapshot = None
         self._nav_debug_pending_plan_capture_by_robot = {}
+        self._nav_debug_belief_frame_key = None
+        self._nav_debug_belief_frame_cache = None
 
         stop_scrub = getattr(self, "stop_navigation_history_scrub", None)
         if callable(stop_scrub):

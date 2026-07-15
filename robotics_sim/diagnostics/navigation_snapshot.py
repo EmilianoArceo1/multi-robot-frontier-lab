@@ -60,6 +60,39 @@ class Pose:
 
 
 @dataclass(frozen=True)
+class SensorDebug:
+    """Sensor state frozen for replay.
+
+    The exact occlusion-aware FoV polygon is stored as compressed float32
+    coordinates. Keeping it in the snapshot prevents the replayed robot pose
+    from separating from a live/recomputed FoV.
+    """
+
+    vision_range: float = 0.0
+    visible_polygon_count: int = 0
+    visible_polygon_f32_zlib: bytes = b""
+
+
+@dataclass(frozen=True)
+class BeliefMapDebug:
+    """Compact immutable belief/exploration frame for in-memory replay.
+
+    Arrays are compressed bytes rather than live NumPy references, so a
+    historical snapshot cannot be changed by later mapping updates. Multiple
+    navigation snapshots may share the same BeliefMapDebug object when the
+    map revision did not change.
+    """
+
+    revision: int
+    resolution: float
+    bounds: tuple[float, float, float, float]
+    grid_shape: tuple[int, int]
+    grid_zlib: bytes
+    explored_shape: tuple[int, int, int]
+    explored_packbits_zlib: bytes
+
+
+@dataclass(frozen=True)
 class ClearanceTerms:
     """The exact boolean safety condition a checker evaluated, with the real
     terms it used -- not a generic distance-vs-radius formula invented for
@@ -207,3 +240,6 @@ class NavigationDebugSnapshot:
     # Kept in the immutable snapshot so historical views do not mix the
     # current map count with an older robot/control state.
     mapped_obstacle_points_count: int = 0
+    # Exact sensor footprint and compact map state for coherent history replay.
+    sensor: SensorDebug = field(default_factory=SensorDebug)
+    belief_map: Maybe[BeliefMapDebug] = field(default_factory=Maybe.missing)

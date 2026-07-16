@@ -695,6 +695,7 @@ class SimulationControllerMixin:
         self.hazard_service = RuntimeHazardService(
             bounds=self.belief_map.bounds,
             resolution=self.belief_map.resolution,
+            robot_count=self.belief_map.robot_count,
             default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
             default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
             selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
@@ -726,10 +727,12 @@ class SimulationControllerMixin:
             or service.field.shape != belief.grid.shape
             or abs(service.field.resolution - belief.resolution) > 1e-9
             or service.field.bounds != belief.bounds
+            or service.belief.robot_count != belief.robot_count
         ):
             self.hazard_service = RuntimeHazardService(
                 bounds=belief.bounds,
                 resolution=belief.resolution,
+                robot_count=belief.robot_count,
                 default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
                 default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
                 selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
@@ -5886,6 +5889,15 @@ class SimulationControllerMixin:
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
         self.explored_free_points = belief.explored_points()
+
+        # Same sensor update, same polygon: fuse ground-truth hazard into
+        # the team HazardBelief for exactly the cells this FoV covers. Never
+        # pass robot_index=None here -- HazardBelief requires a concrete
+        # attribution index (see belief_robot_index's own None->0 mapping
+        # above for single-robot).
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None and belief_robot_index is not None:
+            hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
 
     def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
         """

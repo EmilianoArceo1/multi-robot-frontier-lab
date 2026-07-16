@@ -77,6 +77,16 @@ class ExplorationBehavior:
 
     _PREFETCH_COOLDOWN: float = 0.75  # seconds between consecutive prefetch attempts
 
+    # After a planner failure clears exploration_target_xy, wait this long
+    # before attempting frontier re-selection again -- avoids re-running
+    # frontier detection every single tick when nothing reachable exists.
+    _FAILURE_RETRY_COOLDOWN: float = 1.5
+
+    # How long a target that just failed to plan stays excluded from
+    # re-selection. Longer than _FAILURE_RETRY_COOLDOWN so it is still
+    # excluded on the very first retry attempt once the cooldown opens.
+    _FAILED_TARGET_EXCLUSION_WINDOW: float = 3.0
+
     def should_prefetch_next_target(
         self,
         agent: "RobotAgent",
@@ -151,7 +161,20 @@ class ExplorationBehavior:
           6. No path at all → REQUEST_PLAN (first frontier) or HOLD
         """
         # ── 1. Safety ────────────────────────────────────────────────────────
-        if observation.active_segment_blocked or observation.predicted_collision:
+        # REPLAN_FOR_SAFETY only makes sense when there is an active route to
+        # replan. predicted_collision/active_segment_blocked are computed
+        # from the robot's current physical motion independent of navigation
+        # state, so they can stay True while the robot is simply holding
+        # (e.g. after exploration_exhausted()) with nothing to replan.
+        # Without this guard, a route-less HOLD keeps re-emitting
+        # REPLAN_FOR_SAFETY(target=None) every tick; the engine's safety
+        # replan throttle eventually treats that as "repeated safety replan
+        # for the same target" and marks a target that never existed as
+        # failed. When there is no active route, ignore the safety flags
+        # here and let the normal decision flow below (steps 2-6) run --
+        # it resolves to whatever HOLD state already applies.
+        has_active_route = agent.active_path_goal_xy is not None and agent.active_target() is not None
+        if has_active_route and (observation.active_segment_blocked or observation.predicted_collision):
             reason = (
                 "predicted collision"
                 if observation.predicted_collision
@@ -192,8 +215,23 @@ class ExplorationBehavior:
                     return accept_pending_path(reason=reason)
 
         # ── 3. Frontier reached — need a new target ───────────────────────
+        # "Reached" means the robot is at the FINAL destination of the
+        # active route (active_path_goal_xy / distance_to_active_path_goal()),
+        # not merely at whatever intermediate waypoint active_target()
+        # currently points to. A route can be reassigned mid-flight (safety
+        # replan, prefetch accept) with a fresh, shorter waypoint list that
+        # starts near the robot's current position -- active_target() then
+        # points at a waypoint close to the robot even though the true
+        # exploration target (active_path_goal_xy) is still far away.
+        # Treating that as "frontier reached" stops the robot prematurely,
+        # mid-route. active_target() is still the right thing for the
+        # low-level controller to track (see step 5, FOLLOW_PATH).
         target = agent.active_target()
-        if target is not None and agent.distance_to_active_target() <= observation.goal_tolerance:
+        path_goal_reached = (
+            agent.active_path_goal_xy is not None
+            and agent.distance_to_active_path_goal() <= observation.goal_tolerance
+        )
+        if path_goal_reached:
             agent.target_switch_count += 1
             # Clear the reached frontier so that neither _pick_next_target()
             # nor the engine's select_navigation_goal() can return it again
@@ -243,11 +281,45 @@ class ExplorationBehavior:
 
         # ── 6. No path — need first plan ─────────────────────────────────
         desired = agent.desired_target_from_mode()
-        if desired is None:
-            agent.stop_count_exploration += 1
-            return hold(reason="no target available in current exploration mode")
+        if desired is not None:
+            return request_plan(desired, reason="no active path; requesting initial frontier plan")
 
-        return request_plan(desired, reason="no active path; requesting initial frontier plan")
+        # No exploration target assigned. Reached either on a genuine cold
+        # start, or in recovery after a planner failure (or an earlier
+        # empty retry) cleared exploration_target_xy via
+        # RobotAgent.invalidate_failed_exploration_route().
+        map_signature = len(observation.mapped_obstacle_points)
+
+        # Exploration exhausted: enough consecutive recovery failures have
+        # happened with no new map information since we gave up. Stay in a
+        # stable hold instead of re-running frontier detection every
+        # cooldown cycle forever -- this is what distinguishes "one target
+        # failed, try another" from "nothing reachable remains, stop
+        # asking". exploration_exhausted() itself clears this state (and
+        # lets recovery resume) once map_signature changes.
+        if agent.exploration_exhausted(map_signature=map_signature):
+            return hold(reason="exploration exhausted: no reachable frontier candidates")
+
+        # Gate re-selection behind a cooldown so a fully-explored map does
+        # not re-run frontier detection every single tick.
+        if agent.exploration_retry_on_cooldown(
+            current_time=observation.current_time, cooldown=self._FAILURE_RETRY_COOLDOWN
+        ):
+            agent.stop_count_exploration += 1
+            return hold(reason="recovering after planner failure; retry cooldown active")
+
+        next_target = self._pick_next_target(agent, observation, planner_services)
+        if next_target is None:
+            agent.stop_count_exploration += 1
+            agent.note_exploration_retry_attempt(observation.current_time)
+            agent.register_exploration_failure(map_signature=map_signature)
+            return hold(reason="no reachable frontier candidates remain")
+
+        return request_plan(
+            next_target,
+            reason="recovered after planner failure; requesting fresh frontier",
+            force_new_target=True,
+        )
 
     # ------------------------------------------------------------------ private
 
@@ -268,6 +340,26 @@ class ExplorationBehavior:
             # Should not be called in goal-seeking, but guard defensively.
             return agent.final_goal_xy
 
+        # Exclude other robots' claimed targets (observation.excluded_targets)
+        # plus this agent's own recently-failed targets, so a target that
+        # just failed to plan is not immediately re-selected while an
+        # alternative frontier exists.
+        excluded = list(observation.excluded_targets) + agent.recently_failed_exploration_targets(
+            current_time=observation.current_time,
+            cooldown=self._FAILED_TARGET_EXCLUSION_WINDOW,
+        )
+
+        # Never re-propose something already effectively reached: the
+        # robot's own current position (a candidate "here" is not a
+        # frontier worth driving to), and the route that was just
+        # completed, if any. Without this, FoV-aware frontier detection can
+        # immediately re-select the exact same nearby point right after
+        # "frontier reached", producing a near-zero-length route that gets
+        # "reached" again within a tick or two -- a fast REQUEST_PLAN loop.
+        excluded.append(observation.robot_xy)
+        if agent.active_path_goal_xy is not None:
+            excluded.append(agent.active_path_goal_xy)
+
         result = planner_services.select_exploration_target(
             planner_name=agent.planner_mode,
             belief_map=observation.belief_map,
@@ -279,10 +371,22 @@ class ExplorationBehavior:
             sensor_range=observation.sensor_range,
             vision_model=observation.vision_model,
             ipp_distance_penalty=observation.ipp_distance_penalty,
-            excluded_targets=list(observation.excluded_targets),
+            excluded_targets=excluded,
         )
 
         if not result.success or result.target is None:
             return None
 
-        return (float(result.target[0]), float(result.target[1]))
+        candidate = (float(result.target[0]), float(result.target[1]))
+
+        # Belt-and-suspenders: reject a candidate at/near the robot's
+        # current position outright, regardless of whether the planner
+        # actually honored the exclusion above -- this is the guarantee
+        # that stops the near-zero-length route loop, independent of
+        # exploration-planner internals.
+        if math.hypot(
+            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
+        ) <= observation.goal_tolerance:
+            return None
+
+        return candidate

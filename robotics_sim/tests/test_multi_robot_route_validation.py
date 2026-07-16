@@ -10,6 +10,7 @@ from robotics_sim.simulation import engine as engine_module
 from robotics_sim.simulation.coordination import select_runtime_path_source
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.plugin_loader import load_coordination_plugin
+from robotics_sim.simulation.telemetry import TelemetryLogger
 
 
 def test_direct_route_crossing_robot_safety_is_rejected_before_active():
@@ -167,6 +168,11 @@ def _build_fake_engine(*, planner_type: str = "A*", route_plan_responses):
     fake.multi_dynamic_target_margin = lambda: 0.25
     fake.safety_radius_for_robot = lambda robot: 0.35
     fake.log_console_message = lambda message, **kwargs: fake.console_logs.append(message)
+    # log_route_assignment() (bound for real below) reads self.telemetry;
+    # SimpleNamespace does not resolve @property descriptors from
+    # SimulationControllerMixin, so it is provided directly as a plain
+    # instance attribute wired to the same fake console sink.
+    fake.telemetry = TelemetryLogger(sink=fake.log_console_message)
     # None of these tests exercise a PATH_PLANNING-owning plugin; the Direct
     # ->A* fallback must still be reachable, so owns_path_planning is False.
     fake.coordinator_runtime_profile = lambda: SimpleNamespace(owns_path_planning=False)

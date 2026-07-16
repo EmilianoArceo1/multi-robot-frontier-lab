@@ -532,6 +532,32 @@ def _build_debug_reason(
     counters_text = "; ".join(f"{key}={counters.get(key, 0)}" for key in _DEBUG_COUNTER_KEYS)
     return f"{base_reason}; {counters_text}; selected_target={selected_text}"
 
+def detect_global_frontier_candidates(
+    *,
+    explored_points: Sequence[tuple[float, float]],
+    mapped_obstacle_points: Sequence[tuple[float, float]],
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    robot_radius: float,
+    sensor_range: float,
+) -> tuple[FrontierCandidate, ...]:
+    """Return raw shared-map frontier candidates without assigning robots.
+
+    This is the candidate-generation half of the coordinated frontier planner.
+    TeamFrontierProvider adapters should call this function, not
+    assign_frontier_viewpoints(), because providers expose candidate pools while
+    coordinator plugins perform task allocation.
+    """
+    return tuple(
+        _detect_global_frontier_viewpoints(
+            explored_points=explored_points,
+            mapped_obstacle_points=mapped_obstacle_points,
+            bounds=bounds,
+            resolution=resolution,
+            robot_radius=robot_radius,
+            sensor_range=sensor_range,
+        )
+    )
 
 def assign_frontier_viewpoints(
     *,

@@ -189,6 +189,53 @@ class HazardBelief:
             newly_attributed_cells=newly_attributed_cells,
         )
 
+    def read_cells(self, rows, cols) -> tuple[np.ndarray, np.ndarray]:
+        """Read values/observed at specific cells -- O(len(rows)) work, not
+        O(height*width) like snapshot(). Never calls snapshot() and never
+        returns a view into internal state (fancy indexing already
+        allocates a new array; .copy() below makes that independence
+        explicit rather than relying on it as an implementation detail).
+
+        Use this instead of snapshot() on a hot path that only needs a
+        handful of cells -- e.g. checking a batch of cells' prior state
+        before observe_cells() writes new values into them.
+        """
+        rows_arr = np.asarray(rows, dtype=np.int64).reshape(-1)
+        cols_arr = np.asarray(cols, dtype=np.int64).reshape(-1)
+
+        if rows_arr.shape != cols_arr.shape:
+            raise ValueError(
+                "rows and cols must have matching shapes: "
+                f"{np.asarray(rows).shape}, {np.asarray(cols).shape}."
+            )
+
+        if rows_arr.size and (
+            rows_arr.min() < 0
+            or rows_arr.max() >= self.height
+            or cols_arr.min() < 0
+            or cols_arr.max() >= self.width
+        ):
+            raise ValueError(
+                f"Cell indices out of bounds for HazardBelief shape {self.shape}."
+            )
+
+        values = self._values[rows_arr, cols_arr].copy()
+        observed = self._observed[rows_arr, cols_arr].copy()
+        return values, observed
+
+    def blocked_cells(self, threshold: float) -> tuple[np.ndarray, np.ndarray]:
+        """Return (rows, cols) of cells with observed=True and values >=
+        threshold -- deterministic, never calls snapshot(), never returns a
+        view into internal state (np.where() always allocates fresh arrays).
+        """
+        threshold = float(threshold)
+        if not np.isfinite(threshold):
+            raise ValueError(f"threshold must be finite, got {threshold}.")
+
+        blocked_mask = self._observed & (self._values >= threshold)
+        rows, cols = np.where(blocked_mask)
+        return rows, cols
+
     def snapshot(self) -> HazardBeliefFrame:
         """Return an immutable, independently-owned copy of the current state."""
         values = self._values.copy()

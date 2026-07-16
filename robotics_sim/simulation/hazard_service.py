@@ -34,6 +34,15 @@ class HazardObservationResult:
     affected_bounds is (row_min, row_max, col_min, col_max) over the cells
     the polygon actually rasterized to -- None when the polygon covered no
     cell at all (degenerate, out of bounds, or fewer than 3 points).
+
+    newly_blocked_cells/newly_unblocked_cells/blocked_state_changed compare
+    each affected cell's blocked state (observed AND value >= block_
+    threshold) before vs. after this call -- independent of `changed`,
+    which is also True for e.g. a new robot merely attributing an
+    already-known, already-blocked cell. Route replanning should key off
+    newly_blocked_cells, not `changed`: creating/repeating/re-attributing an
+    observation must never look like "new hazard discovered" just because
+    something in the belief changed.
     """
 
     changed: bool
@@ -41,6 +50,9 @@ class HazardObservationResult:
     changed_value_cells: int
     newly_attributed_cells: int
     affected_bounds: tuple[int, int, int, int] | None = None
+    newly_blocked_cells: int = 0
+    newly_unblocked_cells: int = 0
+    blocked_state_changed: bool = False
 
 
 class RuntimeHazardService:
@@ -127,7 +139,26 @@ class RuntimeHazardService:
         return self.field.sources()
 
     def blocked_world_points(self) -> tuple[tuple[float, float], ...]:
+        """Ground-truth blocked points. Kept for its own legacy contract/
+        tests -- route validation must use observed_blocked_world_points()
+        instead; this is omniscient and must not drive planning/replanning."""
         return self.field.blocked_world_points(self.block_threshold)
+
+    def observed_blocked_world_points(
+        self,
+        block_threshold: float | None = None,
+    ) -> tuple[tuple[float, float], ...]:
+        """Discovered-hazard counterpart to blocked_world_points(): only
+        cells the team has actually observed (observed=True) with a value
+        at or above threshold. Never reads FireSource/HazardField --
+        deterministic given the current belief state alone."""
+        threshold = self.block_threshold if block_threshold is None else float(block_threshold)
+        rows, cols = self._belief.blocked_cells(threshold)
+        geometry = self._belief.geometry
+        return tuple(
+            geometry.grid_to_world(GridCell(row=int(row), col=int(col)))
+            for row, col in zip(rows, cols)
+        )
 
     def observe_visible_polygon(
         self,
@@ -189,7 +220,26 @@ class RuntimeHazardService:
         ground_truth = self.field.values(copy=False)
         values = ground_truth[rows_arr, cols_arr]
 
+        # Blocked state BEFORE this observation, for exactly the affected
+        # cells -- captured before observe_cells() mutates the belief, so
+        # replanning can be gated on an actual threshold CROSSING rather
+        # than on `changed` (which is also True for e.g. a new robot merely
+        # attributing an already-known, already-blocked cell). read_cells()
+        # is O(len(rows_arr)), not a full-grid O(H*W) snapshot() copy -- this
+        # runs once per robot per sensor update, so that difference matters.
+        previous_values, previous_observed = self._belief.read_cells(rows_arr, cols_arr)
+        before_blocked = previous_observed & (previous_values >= self.block_threshold)
+
         update = self._belief.observe_cells(rows_arr, cols_arr, values, robot_index=int(robot_index))
+
+        # After this call, every affected cell is observed=True with
+        # exactly `values` (already clamped to [0, 1] by HazardField) --
+        # no second snapshot needed to know the "after" blocked state.
+        after_blocked = values >= self.block_threshold
+        newly_blocked = after_blocked & ~before_blocked
+        newly_unblocked = before_blocked & ~after_blocked
+        newly_blocked_cells = int(np.count_nonzero(newly_blocked))
+        newly_unblocked_cells = int(np.count_nonzero(newly_unblocked))
 
         return HazardObservationResult(
             changed=update.changed,
@@ -199,6 +249,9 @@ class RuntimeHazardService:
             affected_bounds=(
                 int(rows_arr.min()), int(rows_arr.max()), int(cols_arr.min()), int(cols_arr.max())
             ),
+            newly_blocked_cells=newly_blocked_cells,
+            newly_unblocked_cells=newly_unblocked_cells,
+            blocked_state_changed=bool(newly_blocked_cells or newly_unblocked_cells),
         )
 
     def snapshot(self) -> dict:

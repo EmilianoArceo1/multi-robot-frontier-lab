@@ -53,7 +53,7 @@ from robotics_sim.diagnostics.snapshot_export import (
     SnapshotExportError,
     export_navigation_snapshots_xlsx,
 )
-from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
+from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
 from robotics_sim.simulation.perf_monitor import PerfMonitor
@@ -1277,13 +1277,14 @@ class SimulationControllerMixin:
         if obstacle_points:
             planning_grid.add_obstacle_points(obstacle_points, padding=max(0.0, radius))
 
-        # Project the independent continuous hazard layer into this derived
-        # binary planning grid. BeliefMap.grid is never modified.
+        # Project the team's DISCOVERED hazard belief into this derived
+        # binary planning grid -- never the omniscient ground-truth
+        # HazardField. BeliefMap.grid is never modified either way.
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            apply_hazard_to_planning_grid(
+            apply_hazard_belief_to_planning_grid(
                 planning_grid,
-                hazard_service.field,
+                hazard_service.belief,
                 block_threshold=hazard_service.block_threshold,
                 inflate_radius=max(0.0, radius),
             )
@@ -2227,7 +2228,7 @@ class SimulationControllerMixin:
         points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            points_for_clearance.extend(hazard_service.blocked_world_points())
+            points_for_clearance.extend(hazard_service.observed_blocked_world_points())
 
         # Runtime invariant: if the final target is directly safe from the
         # robot's CURRENT pose, never execute an older/grid-artifact detour.
@@ -2324,7 +2325,9 @@ class SimulationControllerMixin:
         This is intentionally checked against mapped_obstacle_points, not the
         ground-truth rectangles. The robot should be allowed to plan through
         unknown space; if a hidden obstacle is discovered later, the safety
-        layer will trigger replanning.
+        layer will trigger replanning. Hazard is held to the same rule: only
+        observed_blocked_world_points() (discovered), never the omniscient
+        ground-truth HazardField.
         """
         if self.collision_checker is None:
             return True
@@ -2332,7 +2335,7 @@ class SimulationControllerMixin:
         obstacle_points = list(self.mapped_obstacle_points)
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            obstacle_points.extend(hazard_service.blocked_world_points())
+            obstacle_points.extend(hazard_service.observed_blocked_world_points())
 
         report = self.collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
@@ -4264,10 +4267,13 @@ class SimulationControllerMixin:
 
         # 4b. Hazards -- a layer fully separate from occupancy (see
         # HazardField's module docstring); this never touches belief.grid
-        # above. apply_hazard_to_planning_grid() recomputes fresh from
-        # hazard_service.field on every planning call (no separate costmap
-        # cache to invalidate), and the canvas's heatmap pixmap is keyed on
-        # HazardField.version, so push_hazard_snapshot() below is sufficient
+        # above. Only ground-truth FireSources are restored here; the team
+        # HazardBelief is a separate later-phase concern (Phase 5 snapshot
+        # restore). apply_hazard_belief_to_planning_grid() recomputes fresh
+        # from hazard_service.belief on every planning call (no separate
+        # costmap cache to invalidate), and the canvas's heatmap pixmap is
+        # keyed on HazardField.version, so push_hazard_snapshot() below is
+        # sufficient
         # to invalidate the render cache too.
         if not snapshot.hazard.unavailable and snapshot.hazard.value is not None:
             hazard_frame = snapshot.hazard.value
@@ -5429,12 +5435,13 @@ class SimulationControllerMixin:
         return False
 
     def _replan_routes_affected_by_hazard(self) -> None:
-        """Replan only active routes that now cross blocked thermal cells."""
+        """Replan only active routes that now cross a blocked, OBSERVED
+        thermal cell -- never the omniscient ground-truth HazardField."""
         if not getattr(self, "running", False):
             return
 
         service = self.ensure_hazard_service()
-        hazard_points = service.blocked_world_points()
+        hazard_points = service.observed_blocked_world_points()
         if not hazard_points:
             return
 
@@ -5511,7 +5518,11 @@ class SimulationControllerMixin:
             f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
             f"radius={source.radius:.2f}m."
         )
-        self._replan_routes_affected_by_hazard()
+        # No replan here: creating a FireSource only changes ground truth.
+        # Route repair is driven by _replan_routes_affected_by_hazard() being
+        # called after a sensor update actually OBSERVES a newly-blocked
+        # cell (see update_explored_free_points_from_polygon()) -- never by
+        # the omniscient act of a fire existing somewhere on the map.
         return True
 
     def remove_fire_near(self, x: float, y: float) -> bool:
@@ -5549,7 +5560,7 @@ class SimulationControllerMixin:
                 f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
                 f"radius={source.radius:.2f}m."
             )
-            self._replan_routes_affected_by_hazard()
+            # No replan here either -- see add_fire()'s comment.
 
     def body_radius_for_robot(self, robot=None) -> float:
         """Return physical body radius for a runtime robot or the global config."""
@@ -5897,7 +5908,15 @@ class SimulationControllerMixin:
         # above for single-robot).
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None and belief_robot_index is not None:
-            hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
+            observation = hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
+            # Route repair is gated on a real threshold CROSSING newly
+            # discovered by this observation -- never on `changed` alone,
+            # which is also True for e.g. a new robot merely attributing an
+            # already-known, already-blocked cell, or a newly observed but
+            # safe cell. Creating/removing a FireSource never reaches here
+            # at all (see add_fire()/on_fire_toggle_requested()).
+            if observation.newly_blocked_cells > 0:
+                self._replan_routes_affected_by_hazard()
 
     def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
         """

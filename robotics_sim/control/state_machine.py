@@ -3,6 +3,18 @@ import numpy as np
 from robotics_sim.control.modes import RobotMode
 
 
+def _coerce_robot_mode(value) -> RobotMode | None:
+    """Resolve *value* to a RobotMode, or None if it is not a recognized one."""
+    if isinstance(value, RobotMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return RobotMode(value)
+        except ValueError:
+            return None
+    return None
+
+
 class TrackingStateMachine:
     """
     State machine for local waypoint tracking.
@@ -43,6 +55,22 @@ class TrackingStateMachine:
         Reset the FSM to IDLE.
         """
         self.set_mode(RobotMode.IDLE)
+
+    def restore_mode(self, mode: "RobotMode | str | None") -> None:
+        """
+        Force the FSM directly into *mode*, bypassing update()'s transition
+        rules -- used by navigation-debug snapshot restore to put the FSM
+        back exactly where it was at capture time. Robot.set_waypoints()
+        calls reset() as a side effect of installing the restored route, so
+        this must run AFTER that to actually take effect.
+
+        Falls back to IDLE for an unrecognized value (unknown string, None)
+        instead of raising: a restore must never crash the simulation over
+        a stale/foreign mode label.
+        """
+        resolved = _coerce_robot_mode(mode)
+        self.previous_mode = self.mode
+        self.mode = resolved if resolved is not None else RobotMode.IDLE
 
     def update(
         self,

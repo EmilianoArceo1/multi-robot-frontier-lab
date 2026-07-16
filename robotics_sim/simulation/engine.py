@@ -1008,6 +1008,39 @@ class SimulationControllerMixin:
     def final_goal_xy(self) -> tuple[float, float]:
         return (float(self.config.goal_x), float(self.config.goal_y))
 
+    def _restore_final_goal_into_config_and_widgets(self, goal_xy: tuple[float, float]) -> None:
+        """Sync config.goal_x/goal_y and the Goal X/Y widgets to *goal_xy*.
+
+        Used by restore_navigation_debug_snapshot(): final_goal_xy() (read by
+        select_navigation_goal()/every subsequent replan) returns config.
+        goal_x/goal_y directly, never agent.final_goal_xy -- restoring only
+        the agent field leaves config, and the GUI showing it, pointed at
+        whatever goal the live run had since moved on to.
+
+        Widgets are updated with signals blocked, same pattern as
+        MainWindow.load_selected_robot_into_panel()/refresh_same_position_
+        rows() -- a restore must not trigger update_preview()-style edit
+        callbacks, replans, or additional navigation-debug snapshots.
+        """
+        gx, gy = float(goal_xy[0]), float(goal_xy[1])
+        self.config.goal_x = gx
+        self.config.goal_y = gy
+
+        widgets = [
+            widget
+            for widget in (getattr(self, "goal_x_input", None), getattr(self, "goal_y_input", None))
+            if widget is not None
+        ]
+        blocked = [widget.blockSignals(True) for widget in widgets]
+        try:
+            if hasattr(self, "goal_x_input"):
+                self.goal_x_input.setValue(gx)
+            if hasattr(self, "goal_y_input"):
+                self.goal_y_input.setValue(gy)
+        finally:
+            for widget, was_blocked in zip(widgets, blocked):
+                widget.blockSignals(was_blocked)
+
     def select_navigation_goal(self, start_xy: tuple[float, float]) -> tuple[tuple[float, float] | None, str]:
         """
         Select the current navigation target.
@@ -2570,6 +2603,7 @@ class SimulationControllerMixin:
                         if agent_check is not None:
                             agent_check.exploration_target_xy = None
                             agent_check.invalidate_route(reason="planner returned completed target; forcing re-search")
+                            self._invalidate_prefetch_request(0, reason="planner returned completed target; forcing re-search")
                         self.current_exploration_target = None
                         self.canvas.set_exploration_target(None)
                         return
@@ -2631,6 +2665,7 @@ class SimulationControllerMixin:
                     current_time=float(self.simulation_time),
                     map_signature=len(self.mapped_obstacle_points),
                 )
+                self._invalidate_prefetch_request(0, reason=f"planner failed: {reason}")
 
             self.current_exploration_target = None
             self.canvas.set_exploration_target(None)
@@ -2708,12 +2743,20 @@ class SimulationControllerMixin:
         return NavigationDebugEventKind.TICK
 
     def _navigation_debug_belief_frame(self) -> Maybe[BeliefMapDebug]:
-        """Return a compact immutable map frame, reusing it until the belief changes.
+        """Return a compact immutable map frame.
 
         Navigation history records every simulation tick. Copying a full grid on
-        every tick would make the replay prohibitively large, so BeliefMap exposes
-        a monotonic visual revision and all snapshots for the same revision share
-        one compressed BeliefMapDebug object.
+        every tick would make the replay prohibitively large, so the expensive
+        grid/explored_by_robot compression is cached and reused across ticks
+        that share the same BeliefMap.revision.
+
+        visit_count/last_seen are compressed fresh on every call instead:
+        BeliefMap.revision explicitly does NOT bump for visit-count/last-seen-
+        only changes (see its own docstring), so reusing the revision-keyed
+        cache for them would silently restore an earlier tick's visit history
+        under a later tick's snapshot. These two arrays are small (uint16/
+        float32, one grid-sized array each), so compressing them every call
+        is cheap relative to the grid/explored cache this preserves.
         """
         belief = getattr(self, "belief_map", None)
         if belief is None:
@@ -2722,33 +2765,45 @@ class SimulationControllerMixin:
         revision = int(getattr(belief, "revision", 0))
         cache_key = (id(belief), revision, int(getattr(belief, "robot_count", 1)))
         cached_key = getattr(self, "_nav_debug_belief_frame_key", None)
-        cached_frame = getattr(self, "_nav_debug_belief_frame_cache", None)
-        if cached_key == cache_key and cached_frame is not None:
-            return Maybe.of(cached_frame)
-
-        grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
-        explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
-        if explored.shape[0] == 1 and not np.any(explored):
-            known_cells = grid != UNKNOWN
-            if np.any(known_cells):
-                explored = explored.copy()
-                explored[0] = known_cells.astype(np.uint8, copy=False)
-        packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
-        frame = BeliefMapDebug(
-            revision=revision,
-            resolution=float(belief.resolution),
-            bounds=tuple(float(v) for v in belief.bounds),
-            grid_shape=(int(grid.shape[0]), int(grid.shape[1])),
-            grid_zlib=zlib.compress(grid.tobytes(order="C"), level=1),
-            explored_shape=(
+        cached_parts = getattr(self, "_nav_debug_belief_frame_cache", None)
+        if cached_key == cache_key and cached_parts is not None:
+            resolution, bounds, grid_shape, grid_zlib, explored_shape, explored_packbits_zlib = cached_parts
+        else:
+            grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
+            explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
+            if explored.shape[0] == 1 and not np.any(explored):
+                known_cells = grid != UNKNOWN
+                if np.any(known_cells):
+                    explored = explored.copy()
+                    explored[0] = known_cells.astype(np.uint8, copy=False)
+            packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
+            resolution = float(belief.resolution)
+            bounds = tuple(float(v) for v in belief.bounds)
+            grid_shape = (int(grid.shape[0]), int(grid.shape[1]))
+            grid_zlib = zlib.compress(grid.tobytes(order="C"), level=1)
+            explored_shape = (
                 int(explored.shape[0]),
                 int(explored.shape[1]),
                 int(explored.shape[2]),
-            ),
-            explored_packbits_zlib=zlib.compress(packed_explored.tobytes(), level=1),
+            )
+            explored_packbits_zlib = zlib.compress(packed_explored.tobytes(), level=1)
+            cached_parts = (resolution, bounds, grid_shape, grid_zlib, explored_shape, explored_packbits_zlib)
+            self._nav_debug_belief_frame_key = cache_key
+            self._nav_debug_belief_frame_cache = cached_parts
+
+        visit_count = np.ascontiguousarray(belief.visit_count, dtype=np.uint16)
+        last_seen = np.ascontiguousarray(belief.last_seen, dtype=np.float32)
+        frame = BeliefMapDebug(
+            revision=revision,
+            resolution=resolution,
+            bounds=bounds,
+            grid_shape=grid_shape,
+            grid_zlib=grid_zlib,
+            explored_shape=explored_shape,
+            explored_packbits_zlib=explored_packbits_zlib,
+            visit_count_zlib=zlib.compress(visit_count.tobytes(order="C"), level=1),
+            last_seen_zlib=zlib.compress(last_seen.tobytes(order="C"), level=1),
         )
-        self._nav_debug_belief_frame_key = cache_key
-        self._nav_debug_belief_frame_cache = frame
         return Maybe.of(frame)
 
     def _navigation_debug_hazard_frame(self) -> Maybe[HazardDebug]:
@@ -4233,7 +4288,34 @@ class SimulationControllerMixin:
                 explored = explored.copy()
                 explored[0] = known_cells
 
-        if grid.shape != belief.grid.shape or explored.shape != belief.explored_by_robot.shape:
+        # visit_count/last_seen -- restored exactly, never reconstructed from
+        # grid/explored (a cell can be FREE with any visit count >= 1; only
+        # the exact captured count is correct). Empty bytes means this frame
+        # predates the field existing -- fall back to BeliefMap's own
+        # zero-state defaults for that case rather than crashing.
+        if frame.visit_count_zlib:
+            visit_count = (
+                np.frombuffer(zlib.decompress(frame.visit_count_zlib), dtype=np.uint16)
+                .reshape(frame.grid_shape)
+                .copy()
+            )
+        else:
+            visit_count = np.zeros(frame.grid_shape, dtype=np.uint16)
+        if frame.last_seen_zlib:
+            last_seen = (
+                np.frombuffer(zlib.decompress(frame.last_seen_zlib), dtype=np.float32)
+                .reshape(frame.grid_shape)
+                .copy()
+            )
+        else:
+            last_seen = np.full(frame.grid_shape, -1.0, dtype=np.float32)
+
+        if (
+            grid.shape != belief.grid.shape
+            or explored.shape != belief.explored_by_robot.shape
+            or visit_count.shape != belief.visit_count.shape
+            or last_seen.shape != belief.last_seen.shape
+        ):
             # Geometry changed since capture (resolution/bounds/robot_count) --
             # cannot restore safely.
             return False
@@ -4252,8 +4334,14 @@ class SimulationControllerMixin:
         self.robot.v = float(snapshot.robot_pose.v)
 
         # 4. Belief map + explored area (authoritative -- see docstring).
+        # visit_count/last_seen are restored alongside grid/explored_by_robot
+        # so average_seen_penalty()/stats() (revisit_ratio, etc.) read the
+        # exact historical values instead of whatever the live run had
+        # accumulated past this point.
         belief.grid = grid
         belief.explored_by_robot = explored
+        belief.visit_count = visit_count
+        belief.last_seen = last_seen
         belief.revision += 1
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
@@ -4324,6 +4412,14 @@ class SimulationControllerMixin:
             if agent is not None:
                 agent.waypoints.clear()
 
+        # 7a. Tracking FSM mode -- both branches above reset it to IDLE
+        # (set_waypoints() does this as a side effect; the else branch does
+        # it explicitly), so this must run AFTER them to actually restore
+        # the captured ROTATE/TRACK/etc. mode instead of losing it. Uses
+        # the state machine's own public restore API rather than writing
+        # robot.state_machine.mode directly from here.
+        self.robot.state_machine.restore_mode(snapshot.tracking_mode)
+
         if agent is not None:
             # Pending/prefetch route state and route-repair bookkeeping are
             # always cleared regardless of branch above -- a path prefetched
@@ -4338,6 +4434,17 @@ class SimulationControllerMixin:
             if not agent_state.unavailable and agent_state.value is not None:
                 state = agent_state.value
                 agent.final_goal_xy = state.final_goal_xy
+                if state.final_goal_xy is not None:
+                    # final_goal_xy() (the authoritative source select_
+                    # navigation_goal()/replans read) returns config.goal_x/
+                    # goal_y directly, NOT agent.final_goal_xy -- restoring
+                    # only the agent field above left config/the GUI still
+                    # showing whatever goal the live run had moved on to. No
+                    # coordinate to restore config/widgets to when the
+                    # snapshot itself had no final goal (state.final_goal_xy
+                    # is None) -- config.goal_x/y has no "unset" state, so it
+                    # is left as-is rather than forced to some placeholder.
+                    self._restore_final_goal_into_config_and_widgets(state.final_goal_xy)
                 agent.exploration_target_xy = state.exploration_target_xy
                 agent.active_path_goal_xy = state.active_path_goal_xy
                 agent.active_path_mode = state.active_path_mode
@@ -4383,8 +4490,7 @@ class SimulationControllerMixin:
         self.planning_in_progress = False
         self.route_request_id += 1
         self.active_planner_workers.clear()
-        getattr(self, "prefetch_workers", {}).clear()
-        getattr(self, "prefetch_request_ids", {}).clear()
+        self._invalidate_all_prefetch_requests(reason="simulation reset/restore")
         self._nav_debug_pending_plan_capture_by_robot = {}
         self._nav_debug_last_plan_capture = None
         self._nav_debug_last_accepted_plan = None
@@ -5036,8 +5142,7 @@ class SimulationControllerMixin:
         self.planning_in_progress = False
         self.route_request_id += 1
         self.active_planner_workers.clear()
-        getattr(self, "prefetch_workers", {}).clear()
-        getattr(self, "prefetch_request_ids", {}).clear()
+        self._invalidate_all_prefetch_requests(reason="simulation reset/restore")
 
         self.ensure_multi_robot_configs()
         robot_starts = normalized_robot_start_configs(self.config)
@@ -5176,8 +5281,7 @@ class SimulationControllerMixin:
         self.planning_in_progress = False
         self.route_request_id += 1
         self.active_planner_workers.clear()
-        getattr(self, "prefetch_workers", {}).clear()
-        getattr(self, "prefetch_request_ids", {}).clear()
+        self._invalidate_all_prefetch_requests(reason="simulation reset/restore")
 
         initial_goal = (
             (float(self.config.x), float(self.config.y))
@@ -5320,8 +5424,7 @@ class SimulationControllerMixin:
         self.planning_in_progress = False
         self.route_request_id += 1
         self.active_planner_workers.clear()
-        getattr(self, "prefetch_workers", {}).clear()
-        getattr(self, "prefetch_request_ids", {}).clear()
+        self._invalidate_all_prefetch_requests(reason="simulation reset/restore")
 
         self.path_points = []
         self.robots = []
@@ -5390,8 +5493,9 @@ class SimulationControllerMixin:
         # Goal seeking is the only mode where G is executable. Changing G must
         # immediately invalidate old routes and assign fresh routes.
         if self.robots:
-            for agent in getattr(self, "robot_agents", []) or []:
+            for robot_index, agent in enumerate(getattr(self, "robot_agents", []) or []):
                 agent.invalidate_route(reason="manual goal changed in Goal seeking")
+                self._invalidate_prefetch_request(robot_index, reason="manual goal changed in Goal seeking")
             for robot_index in range(len(self.robots)):
                 self.assign_route_to_multi_robot(robot_index, reason="Shared final goal updated")
             self.canvas.set_status("Goal updated and routes reassigned for all robots.")
@@ -5401,6 +5505,7 @@ class SimulationControllerMixin:
             agent = self.runtime_agent(None)
             if agent is not None:
                 agent.invalidate_route(reason="manual goal changed in Goal seeking")
+                self._invalidate_prefetch_request(0, reason="manual goal changed in Goal seeking")
             self.assign_route_to_robot()
             self.canvas.set_status("Goal updated by canvas click and route reassigned.")
 
@@ -5456,6 +5561,9 @@ class SimulationControllerMixin:
                             agent.invalidate_route(
                                 reason="dynamic fire hazard blocks direct route"
                             )
+                        self._invalidate_prefetch_request(
+                            robot_index, reason="dynamic fire hazard blocks direct route"
+                        )
                         continue
                     self.assign_route_to_multi_robot(
                         robot_index,
@@ -5478,6 +5586,7 @@ class SimulationControllerMixin:
                 agent.invalidate_pending_path(
                     reason="dynamic fire hazard affects current route"
                 )
+                self._invalidate_prefetch_request(0, reason="dynamic fire hazard affects current route")
             if str(getattr(self.config, "planner_type", "")) == "Direct":
                 if hasattr(self.robot, "force_stop"):
                     self.robot.force_stop(reason="dynamic fire hazard blocks direct route")
@@ -6784,6 +6893,9 @@ class SimulationControllerMixin:
                         route_affected_agent.invalidate_pending_path(
                             reason="route_affected: new obstacle affects current route"
                         )
+                        self._invalidate_prefetch_request(
+                            0, reason="route_affected: new obstacle affects current route"
+                        )
                     # Belief-trace artifact completeness: this is the
                     # previously-missing case -- route_affected=yes AND the
                     # repair is actually allowed to proceed (not throttled).
@@ -7431,6 +7543,10 @@ class SimulationControllerMixin:
             if hasattr(robot, "force_stop"):
                 robot.force_stop(reason=decision.reason or "hold")
             agent.invalidate_route(reason=decision.reason or "hold")
+            hold_robot_index = 0
+            if getattr(self, "robots", None):
+                hold_robot_index = next((i for i, candidate in enumerate(self.robots) if candidate is robot), 0)
+            self._invalidate_prefetch_request(hold_robot_index, reason=decision.reason or "hold")
             return False
 
         if kind == "ACCEPT_PENDING_PATH":
@@ -7455,6 +7571,7 @@ class SimulationControllerMixin:
                 )
                 if not normalized_pending:
                     agent.reject_pending_path("pending path obsolete at handoff")
+                    self._invalidate_prefetch_request(robot_index, reason="pending path obsolete at handoff")
                     return False
                 agent.pending_path = normalized_pending
 
@@ -7559,6 +7676,7 @@ class SimulationControllerMixin:
                 # elif/invalidate_failed_exploration_route() branch further
                 # down decide what happens to that.
                 agent.invalidate_pending_path(reason=f"safety replan: {decision.reason}")
+                self._invalidate_prefetch_request(0, reason=f"safety replan: {decision.reason}")
 
                 # Mirror multi_safety_replan_allowed(): throttle identical
                 # (reason, target) safety replans instead of launching a new
@@ -7634,6 +7752,75 @@ class SimulationControllerMixin:
 
         return False
 
+    def _invalidate_prefetch_request(self, robot_id: int, reason: str = "") -> None:
+        """Retire whatever prefetch request is in flight for one robot slot.
+
+        Every caller that discards pending state (route-affected repair,
+        safety replan, a target/goal change, HOLD, ACCEPT_PENDING_PATH
+        handoff, reset, snapshot restore, ...) must also call this -- pending
+        state lives on the agent (pending_path/pending_target_xy), but the
+        *request* backing it lives here in prefetch_workers/prefetch_
+        request_ids/prefetch_targets, and nothing previously kept those two
+        in sync. Without this, a still-running worker survives past the
+        pending state it was computing, blocks request_prefetch_route_async()
+        from launching a replacement for the same slot (see its "already
+        running" guard), and its eventual on_prefetch_route_ready() callback
+        can validate a stale route against whatever *new* request has since
+        taken the slot.
+
+        Safe to call with nothing in flight for robot_id -- a pure no-op.
+        """
+        idx = int(robot_id)
+
+        if not hasattr(self, "prefetch_workers"):
+            self.prefetch_workers = {}
+        if not hasattr(self, "prefetch_request_ids"):
+            self.prefetch_request_ids = {}
+        if not hasattr(self, "prefetch_targets"):
+            self.prefetch_targets = {}
+
+        had_request = idx in self.prefetch_workers or idx in self.prefetch_request_ids
+
+        # 1. Invalidate the current request id FIRST. This is what actually
+        # makes a late callback harmless: on_prefetch_route_ready() ignores
+        # any request_id that no longer matches prefetch_request_ids[idx],
+        # regardless of whether step 3's cancel() below has any real effect.
+        self.prefetch_request_ids.pop(idx, None)
+
+        # 2. Retire the worker from its slot -- this also frees
+        # request_prefetch_route_async()'s "already running" guard so a
+        # replacement can be launched for this robot immediately.
+        worker = self.prefetch_workers.pop(idx, None)
+
+        # 3. Best-effort cancel. PlannerWorker (QRunnable) has no
+        # cooperative-cancellation hook today, so this is a courtesy for a
+        # future worker type, not something step 1 depends on.
+        cancel = getattr(worker, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
+        # 4. Clean exclusively the pending state this request captured --
+        # never agent.pending_path/pending_target_xy, which is the caller's
+        # own responsibility (invalidate_route()/invalidate_pending_path()/
+        # reject_pending_path()/direct assignment during restore).
+        self.prefetch_targets.pop(idx, None)
+
+        if had_request and reason:
+            self.log_console_message(f"[PREFETCH] invalidated for robot {idx}: {reason}")
+
+    def _invalidate_all_prefetch_requests(self, reason: str = "") -> None:
+        """Invalidate every in-flight prefetch request -- reset/restore."""
+        idxs = (
+            set(getattr(self, "prefetch_workers", {}))
+            | set(getattr(self, "prefetch_request_ids", {}))
+            | set(getattr(self, "prefetch_targets", {}))
+        )
+        for idx in idxs:
+            self._invalidate_prefetch_request(idx, reason=reason)
+
     def request_prefetch_route_async(
         self,
         robot,
@@ -7692,6 +7879,15 @@ class SimulationControllerMixin:
             self.prefetch_request_ids = {}
         self.prefetch_request_ids[idx] = request_id
 
+        # Capture the target THIS request was launched for, independent of
+        # agent.pending_target_xy -- on_prefetch_route_ready() validates
+        # against this, never against the agent's live (possibly since-
+        # changed) pending_target_xy. See _invalidate_prefetch_request()'s
+        # docstring for why the two can otherwise diverge.
+        if not hasattr(self, "prefetch_targets"):
+            self.prefetch_targets = {}
+        self.prefetch_targets[idx] = target
+
         worker = PlannerWorker(
             request_id=request_id,
             planner_kwargs=planner_kwargs,
@@ -7741,15 +7937,23 @@ class SimulationControllerMixin:
         """
         idx = int(robot_index)
 
-        if not hasattr(self, "prefetch_workers"):
-            return
-        prefetch_worker = self.prefetch_workers.pop(idx, None)
-        pending_plan_capture = getattr(prefetch_worker, "debug_capture", None)
-
-        # Stale result: a newer prefetch was started for this robot slot.
+        # Stale result: a newer prefetch (or an explicit _invalidate_
+        # prefetch_request() call) already replaced this request's slot.
+        # Checked BEFORE touching prefetch_workers/prefetch_targets below --
+        # popping first would rip out whatever CURRENTLY-live request has
+        # since taken this slot instead of the stale one that just landed.
         stored_id = getattr(self, "prefetch_request_ids", {}).get(idx)
         if stored_id != int(request_id):
             return
+
+        prefetch_worker = getattr(self, "prefetch_workers", {}).get(idx)
+        pending_plan_capture = getattr(prefetch_worker, "debug_capture", None)
+        # The target THIS request was launched for -- never agent.pending_
+        # target_xy, which is live agent state that could (in principle)
+        # belong to a different request by the time this callback runs. See
+        # _invalidate_prefetch_request()'s docstring.
+        captured_target = getattr(self, "prefetch_targets", {}).get(idx)
+        self._invalidate_prefetch_request(idx)  # this request is resolved either way
 
         self.planner_jobs_completed = getattr(self, "planner_jobs_completed", 0) + 1
 
@@ -7761,16 +7965,17 @@ class SimulationControllerMixin:
             clean_waypoints = [(float(p[0]), float(p[1])) for p in waypoints]
 
             # Reject a "successful" prefetch route whose final waypoint does
-            # not actually reach agent.pending_target_xy -- accept_pending_path()
-            # sets active_path_goal_xy from pending_target_xy directly, not
-            # from the route's own endpoint, so a mismatch here means the
-            # robot would follow the route to a different point and then
-            # sit stuck there forever (STATE showing a stale, unreached
-            # path_goal). This is exactly the bug this check exists for.
+            # not actually reach captured_target (the target THIS request
+            # was launched for) -- accept_pending_path() sets active_path_
+            # goal_xy from pending_target_xy directly, not from the route's
+            # own endpoint, so a mismatch here means the robot would follow
+            # the route to a different point and then sit stuck there
+            # forever (STATE showing a stale, unreached path_goal). This is
+            # exactly the bug this check exists for.
             if not route_reaches_goal(
-                clean_waypoints, agent.pending_target_xy, float(self.config.goal_tolerance)
+                clean_waypoints, captured_target, float(self.config.goal_tolerance)
             ):
-                rejected_target = agent.pending_target_xy
+                rejected_target = captured_target
                 agent.reject_pending_path(f"{reason}; final waypoint does not reach path goal")
                 # reject_pending_path() only clears pending_path/pending_target_xy
                 # -- it does not blacklist the target, so without this the exact
@@ -7825,7 +8030,7 @@ class SimulationControllerMixin:
                 else None
             )
             if first_segment_report is not None and first_segment_report.collision:
-                rejected_target = agent.pending_target_xy
+                rejected_target = captured_target
                 agent.first_segment_blocked_count += 1
                 agent.reject_pending_path(f"{reason}; first segment blocked on arrival")
                 if rejected_target is not None:

@@ -181,6 +181,7 @@ def _build_fake_engine(*, position=ROBOT_XY, goal_tolerance=GOAL_TOLERANCE) -> S
 
     fake.request_route_async = _spy_request_route_async
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 

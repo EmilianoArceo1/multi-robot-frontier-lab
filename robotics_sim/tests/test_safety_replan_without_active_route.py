@@ -204,7 +204,11 @@ def _build_fake_engine() -> SimpleNamespace:
     fake.replan_calls = []
     fake.replan_after_new_information = lambda reason: fake.replan_calls.append(reason) or False
 
-    for name in ("set_robot_goal_or_waypoints", "safety_replan_cooldown_seconds"):
+    for name in (
+        "set_robot_goal_or_waypoints",
+        "safety_replan_cooldown_seconds",
+        "_invalidate_prefetch_request",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     return fake

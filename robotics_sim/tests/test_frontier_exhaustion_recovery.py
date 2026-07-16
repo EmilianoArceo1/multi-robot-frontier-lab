@@ -291,6 +291,7 @@ def test_exhaustion_reports_diagnostic_counts():
         waypoints or [(robot_obj.x, robot_obj.y)]
     )
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
 
     decision = SimpleNamespace(
         kind="HOLD",
@@ -334,6 +335,7 @@ def test_exhaustion_diagnostic_not_logged_for_non_exhaustion_holds():
         waypoints or [(robot_obj.x, robot_obj.y)]
     )
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
 
     decision = SimpleNamespace(
         kind="HOLD",

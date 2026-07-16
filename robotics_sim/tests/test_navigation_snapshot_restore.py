@@ -16,6 +16,7 @@ against a hand-built fixture.
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import zlib
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ os.environ.setdefault("BELIEF_TRACE_ARTIFACTS", "0")
 from PySide6.QtWidgets import QApplication
 
 from robot import Robot
+from robotics_sim.control.modes import RobotMode
 from robotics_sim.core.robot_agent import RobotAgent
 from robotics_sim.diagnostics.event_log import NavigationDebugEventKind, NavigationDebugEventLog
 from robotics_sim.diagnostics.navigation_snapshot import (
@@ -62,10 +64,25 @@ from robotics_sim.simulation.hazard_service import RuntimeHazardService
 _app = QApplication.instance() or QApplication([])
 
 
-def _make_belief_frame(grid: np.ndarray, explored: np.ndarray, *, revision: int, resolution: float, bounds) -> BeliefMapDebug:
+def _make_belief_frame(
+    grid: np.ndarray,
+    explored: np.ndarray,
+    *,
+    revision: int,
+    resolution: float,
+    bounds,
+    visit_count: np.ndarray | None = None,
+    last_seen: np.ndarray | None = None,
+) -> BeliefMapDebug:
     grid = np.ascontiguousarray(grid, dtype=np.int8)
     explored_u8 = np.ascontiguousarray(explored, dtype=np.uint8)
     packed = np.packbits(explored_u8.reshape(-1), bitorder="little")
+    if visit_count is None:
+        visit_count = np.zeros(grid.shape, dtype=np.uint16)
+    if last_seen is None:
+        last_seen = np.full(grid.shape, -1.0, dtype=np.float32)
+    visit_count = np.ascontiguousarray(visit_count, dtype=np.uint16)
+    last_seen = np.ascontiguousarray(last_seen, dtype=np.float32)
     return BeliefMapDebug(
         revision=revision,
         resolution=resolution,
@@ -74,6 +91,8 @@ def _make_belief_frame(grid: np.ndarray, explored: np.ndarray, *, revision: int,
         grid_zlib=zlib.compress(grid.tobytes(order="C"), level=1),
         explored_shape=(int(explored_u8.shape[0]), int(explored_u8.shape[1]), int(explored_u8.shape[2])),
         explored_packbits_zlib=zlib.compress(packed.tobytes(), level=1),
+        visit_count_zlib=zlib.compress(visit_count.tobytes(order="C"), level=1),
+        last_seen_zlib=zlib.compress(last_seen.tobytes(order="C"), level=1),
     )
 
 
@@ -152,6 +171,7 @@ def _make_snapshot(
     hazard_frame: HazardDebug | None = None,
     agent_state: AgentStateDebug | None = None,
     metrics: RuntimeMetricsDebug | None = None,
+    tracking_mode: str = "",
 ) -> NavigationDebugSnapshot:
     x, y, theta, v = pose
     return NavigationDebugSnapshot(
@@ -162,6 +182,7 @@ def _make_snapshot(
         decision_kind="FOLLOW_PATH",
         decision_reason="",
         robot_pose=Pose(x=x, y=y, theta=theta, v=v),
+        tracking_mode=tracking_mode,
         path=PathDebug(
             raw_path=Maybe.missing(),
             simplified_path=Maybe.missing(),
@@ -255,6 +276,32 @@ class _FakeCanvas:
         self.exploration_target = target
 
 
+class _FakeGoalWidget:
+    """Stand-in for the real NumericStepper goal_x_input/goal_y_input.
+
+    Tracks setValue() calls made while NOT blocked, mirroring the real
+    widget's connected valueChanged -> update_preview() callback -- a
+    restore must produce zero of these.
+    """
+
+    def __init__(self):
+        self.value = None
+        self._blocked = False
+        self.unblocked_set_value_calls: list[float] = []
+        self.block_calls: list[bool] = []
+
+    def blockSignals(self, blocked: bool) -> bool:
+        previous = self._blocked
+        self._blocked = bool(blocked)
+        self.block_calls.append(bool(blocked))
+        return previous
+
+    def setValue(self, value: float) -> None:
+        self.value = value
+        if not self._blocked:
+            self.unblocked_set_value_calls.append(value)
+
+
 _BOUNDS = (-2.0, 2.0, -2.0, 2.0)
 _RESOLUTION = 1.0
 
@@ -327,6 +374,7 @@ def _build_fake_engine(
         runtime_agent=lambda robot_index=None: agent,
         is_exploration_mode=lambda: False,
         start_button=SimpleNamespace(setText=lambda *_a: None, setIcon=lambda *_a: None),
+        log_console_message=lambda message, **kwargs: None,
     )
     fake.mapped_obstacle_point_keys = {
         (round(p[0], 3), round(p[1], 3)) for p in fake.mapped_obstacle_points
@@ -341,6 +389,10 @@ def _build_fake_engine(
         "update_navigation_debug_step_buttons",
         "update_start_pause_button",
         "navigation_debug_history_length",
+        "_invalidate_prefetch_request",
+        "_invalidate_all_prefetch_requests",
+        "_restore_final_goal_into_config_and_widgets",
+        "final_goal_xy",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     fake.agent = agent
@@ -836,6 +888,206 @@ def test_restore_clears_pending_path_and_prefetch_bookkeeping():
     assert fake.agent.pending_path_route_generation is None
     assert fake.agent.pending_path_created_for_active_goal is None
     assert fake.agent.route_repair_in_progress_for_goal is None
+
+
+# ---------------------------------------------------------------------------
+# Tracking FSM mode (Codex review fix #3a). Robot.set_waypoints() resets the
+# FSM to IDLE as a side effect of installing the restored route -- restore
+# must put the captured mode back afterward via the FSM's own public
+# restore_mode() API, or the very next update() re-derives a mode from
+# IDLE's rotate_to_track_threshold instead of picking up TRACK's hysteresis
+# where it left off.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_preserves_tracking_fsm_mode_through_hysteresis():
+    snapshots = _make_ten_snapshots()
+    snapshots[2] = dataclasses.replace(snapshots[2], tracking_mode="TRACK")
+    fake = _build_fake_engine(snapshots=snapshots, history_index=2)
+    fake.robot.state_machine.mode = RobotMode.IDLE  # arrange: live FSM in an unrelated mode
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.robot.state_machine.mode == RobotMode.TRACK
+
+    # The hysteresis behavior itself: with heading error strictly between
+    # the two thresholds, TRACK holds. Had the FSM actually stayed at IDLE
+    # (set_waypoints()'s reset() never corrected), this same error would
+    # instead select ROTATE (error > rotate_to_track_threshold).
+    machine = fake.robot.state_machine
+    heading_between_thresholds = (machine.rotate_to_track_threshold + machine.track_to_rotate_threshold) / 2.0
+    next_mode = machine.update(
+        has_target=True,
+        distance_to_target=5.0,
+        error_theta=heading_between_thresholds,
+        goal_tolerance=0.25,
+    )
+    assert next_mode == RobotMode.TRACK
+
+
+def test_restore_falls_back_to_idle_for_an_unrecognized_tracking_mode():
+    snapshots = _make_ten_snapshots()
+    snapshots[2] = dataclasses.replace(snapshots[2], tracking_mode="")  # older/degenerate snapshot
+    fake = _build_fake_engine(snapshots=snapshots, history_index=2)
+    fake.robot.state_machine.mode = RobotMode.TRACK  # arrange: live FSM in an unrelated mode
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.robot.state_machine.mode == RobotMode.IDLE
+
+
+# ---------------------------------------------------------------------------
+# Belief visit history (Codex review fix #3b). visit_count/last_seen must be
+# restored exactly, never reconstructed from grid/explored_by_robot -- a
+# FREE cell can carry any visit count >= 1, and BeliefMap.revision does not
+# bump for visit-only changes, so a naive revision-keyed cache would leak a
+# later tick's visit history into an earlier tick's snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_restores_visit_count_and_last_seen_exactly():
+    belief_shape = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1).grid.shape
+    grid = np.full(belief_shape, UNKNOWN, dtype=np.int8)
+    grid[0, 0] = FREE
+    grid[1, 1] = FREE
+    explored = np.zeros((1,) + belief_shape, dtype=bool)
+    explored[0, 0, 0] = True
+    explored[0, 1, 1] = True
+    visit_count = np.zeros(belief_shape, dtype=np.uint16)
+    visit_count[0, 0] = 7
+    visit_count[1, 1] = 3
+    last_seen = np.full(belief_shape, -1.0, dtype=np.float32)
+    last_seen[0, 0] = 0.75
+    last_seen[1, 1] = 0.5
+    frame = _make_belief_frame(
+        grid, explored, revision=1, resolution=_RESOLUTION, bounds=_BOUNDS,
+        visit_count=visit_count, last_seen=last_seen,
+    )
+    snapshot = _make_snapshot(snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=frame)
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    # Seed the LIVE belief with a distinct "future" visit history the
+    # restore must overwrite, not merge with or ignore.
+    fake.belief_map.visit_count[:] = 99
+    fake.belief_map.last_seen[:] = 999.0
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert np.array_equal(fake.belief_map.visit_count, visit_count)
+    assert np.array_equal(fake.belief_map.last_seen, last_seen)
+
+
+def test_restore_makes_average_seen_penalty_match_the_snapshot():
+    belief_shape = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1).grid.shape
+    grid = np.full(belief_shape, UNKNOWN, dtype=np.int8)
+    grid[0, 0] = FREE
+    explored = np.zeros((1,) + belief_shape, dtype=bool)
+    explored[0, 0, 0] = True
+    visit_count = np.zeros(belief_shape, dtype=np.uint16)
+    visit_count[0, 0] = 5  # default saturation=5.0 -> average_seen_penalty == 1.0 exactly
+    frame = _make_belief_frame(
+        grid, explored, revision=1, resolution=_RESOLUTION, bounds=_BOUNDS, visit_count=visit_count,
+    )
+    snapshot = _make_snapshot(snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=frame)
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.belief_map.visit_count[:] = 0  # live: no visits recorded yet
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.belief_map.average_seen_penalty([(0, 0)]) == 1.0
+
+
+def test_restore_revisit_metrics_do_not_leak_future_visits():
+    """A cell visited many times in the LIVE ("future") run, but only once
+    in the snapshot being restored to, must report as not-revisited after
+    restore -- stats()/revisited_cells reads visit_count directly, so this
+    is really a visit_count-restore-exactness check from the metrics side."""
+    belief_shape = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1).grid.shape
+    grid = np.full(belief_shape, UNKNOWN, dtype=np.int8)
+    grid[0, 0] = FREE
+    explored = np.zeros((1,) + belief_shape, dtype=bool)
+    explored[0, 0, 0] = True
+    visit_count = np.zeros(belief_shape, dtype=np.uint16)
+    visit_count[0, 0] = 1  # visited exactly once at snapshot time -- not a revisit
+    frame = _make_belief_frame(
+        grid, explored, revision=1, resolution=_RESOLUTION, bounds=_BOUNDS, visit_count=visit_count,
+    )
+    snapshot = _make_snapshot(snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=frame)
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.belief_map.grid[0, 0] = FREE
+    fake.belief_map.visit_count[0, 0] = 12  # the live run revisited this cell 12 times
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.belief_map.seen_count_at_cell((0, 0)) == 1
+    assert fake.belief_map.stats().revisited_cells == 0
+
+
+# ---------------------------------------------------------------------------
+# Final goal (Codex review fix #3c). final_goal_xy() -- the source every
+# subsequent select_navigation_goal()/replan actually reads -- returns
+# config.goal_x/goal_y directly, never agent.final_goal_xy. Restoring only
+# the agent field left config, and the GUI showing it, pointed at whatever
+# goal the live run had since moved on to.
+# ---------------------------------------------------------------------------
+
+
+def test_restore_syncs_final_goal_into_config_and_widgets():
+    snapshots = _make_ten_snapshots()
+    expected = snapshots[2].agent_state.value.final_goal_xy  # (72.0, 72.0), see _make_ten_snapshots()
+    fake = _build_fake_engine(snapshots=snapshots, history_index=2)
+    fake.config.goal_x = 999.0  # arrange: config left on a "future" goal B
+    fake.config.goal_y = 999.0
+    goal_x_widget = _FakeGoalWidget()
+    goal_y_widget = _FakeGoalWidget()
+    fake.goal_x_input = goal_x_widget
+    fake.goal_y_input = goal_y_widget
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.agent.final_goal_xy == expected
+    assert fake.config.goal_x == expected[0]
+    assert fake.config.goal_y == expected[1]
+    assert fake.final_goal_xy() == expected, "final_goal_xy() must reflect the restored goal, not just the agent field"
+    assert goal_x_widget.value == expected[0]
+    assert goal_y_widget.value == expected[1]
+    # Signals were blocked for the update -- zero edit-callback side effects
+    # (no accidental replan, no extra navigation-debug snapshot).
+    assert True in goal_x_widget.block_calls
+    assert True in goal_y_widget.block_calls
+    assert goal_x_widget.unblocked_set_value_calls == []
+    assert goal_y_widget.unblocked_set_value_calls == []
+
+
+def test_restore_leaves_config_goal_untouched_when_agent_state_is_unavailable():
+    snapshot_without_agent_state = _make_snapshot(
+        snapshot_id=1,
+        simulation_time=1.0,
+        pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_make_ten_snapshots()[0].belief_map.value,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot_without_agent_state], history_index=0)
+    fake.config.goal_x = 42.0
+    fake.config.goal_y = 43.0
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.config.goal_x == 42.0
+    assert fake.config.goal_y == 43.0
+
+
+def test_restore_leaves_config_goal_untouched_when_snapshot_had_no_final_goal():
+    snapshots = _make_ten_snapshots()
+    state_without_goal = dataclasses.replace(snapshots[2].agent_state.value, final_goal_xy=None)
+    snapshots[2] = dataclasses.replace(snapshots[2], agent_state=Maybe.of(state_without_goal))
+    fake = _build_fake_engine(snapshots=snapshots, history_index=2)
+    fake.config.goal_x = 42.0
+    fake.config.goal_y = 43.0
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.agent.final_goal_xy is None
+    assert fake.config.goal_x == 42.0  # untouched -- no coordinate to restore to
+    assert fake.config.goal_y == 43.0
 
 
 # ---------------------------------------------------------------------------

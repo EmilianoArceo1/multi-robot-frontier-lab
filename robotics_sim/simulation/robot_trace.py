@@ -46,13 +46,16 @@ this:
     ROBOT_TRACE_DIR=path   base directory for the timestamped run
                            directory (default "runs/debug").
 
-Construction note: the RobotTrace() constructor itself only creates the
-file sink automatically when `create_file_sink=True` is passed -- this is
-what engine.py's ensure_robot_trace() always does for real simulation
-runs. It defaults to False so that plain unit tests constructing
-RobotTrace(env={...}) to exercise formatting/throttling logic keep
-touching zero real files, with no behavior change from before this file-
-output feature existed.
+Construction note: the RobotTrace() constructor never creates the file
+sink itself -- only an explicit start_run() call does (see engine.py's
+start_belief_trace_run(), called at Start/Restart Simulation). Plain unit
+tests constructing RobotTrace(env={...}) without calling start_run() keep
+touching zero real files.
+
+File writes happen off the simulation thread: start_run() wraps the
+synchronous BeliefTraceWriter in an AsyncTraceWriter (async_trace_writer.py)
+-- a bounded queue.Queue serviced by one daemon worker thread, so a slow
+disk can never block simulation_step()/paintEvent().
 """
 from __future__ import annotations
 
@@ -61,6 +64,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from robotics_sim.simulation.async_trace_writer import AsyncTraceWriter
 from robotics_sim.simulation.belief_trace_writer import (
     DEFAULT_BASE_DIR,
     BeliefTraceWriter,
@@ -411,7 +415,7 @@ class RobotTrace:
             "0", "false", "no", "off",
         }
         self._base_dir = source.get("ROBOT_TRACE_DIR") or DEFAULT_BASE_DIR
-        self.writer: BeliefTraceWriter | None = None
+        self.writer: AsyncTraceWriter | None = None
         self.file_output_dir = None
         self._last_map_trace_time: float | None = None
         self._last_snapshot_time: float | None = None
@@ -442,16 +446,23 @@ class RobotTrace:
         (Start Simulation / Restart Simulation), never merely when
         RobotTrace is constructed or lazily on first use -- so loading a
         scenario alone does not create a directory, but each run does, and
-        repeated Restarts each get their own fresh one.
+        repeated Restarts each get their own fresh one. If a writer from a
+        previous run is still live, it is closed (best-effort flush) first.
 
         Independent of ROBOT_TRACE/self.categories: artifact files are
         generated whether or not terminal tracing is enabled.
         BELIEF_TRACE_ARTIFACTS is the only switch that disables this.
 
+        self.writer is an AsyncTraceWriter -- file I/O happens on a
+        background daemon thread, never on the simulation thread that
+        calls trace_*(). See async_trace_writer.py.
+
         Returns the new run directory (Path), or None if file artifacts
         are disabled or the directory could not be created (best-effort:
         a single warning is printed, never raised).
         """
+        if self.writer is not None:
+            self.writer.close()
         if not self.file_artifacts_enabled:
             self.writer = None
             self.file_output_dir = None
@@ -463,9 +474,16 @@ class RobotTrace:
             self.file_output_dir = None
             self._print(f"[BELIEF TRACE] could not create trace directory: {exc}")
             return None
-        self.writer = BeliefTraceWriter(run_dir, categories=tuple(sorted(self.categories)), warn=self._print)
+        sync_writer = BeliefTraceWriter(run_dir, categories=tuple(sorted(self.categories)), warn=self._print)
+        self.writer = AsyncTraceWriter(sync_writer, warn=self._print)
         self.file_output_dir = run_dir
         return run_dir
+
+    def close(self) -> None:
+        """Best-effort shutdown hook (e.g. app close): flush the
+        background writer, if any, without blocking indefinitely."""
+        if self.writer is not None:
+            self.writer.close()
 
     def print_line(self, message: str) -> None:
         """Public, Windows-safe, unconditional print for one-off

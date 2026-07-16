@@ -174,22 +174,26 @@ def _build_fake_engine_for_route_result(tmp_path, *, robot_xy=(0.0, 0.0)) -> Sim
 
 
 def _route_events_rows(trace: RobotTrace) -> list[dict]:
+    trace.writer.flush()  # AsyncTraceWriter: wait for the background queue to drain
     with open(trace.file_output_dir / "route_events.csv", newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
 def _route_affected_events_rows(trace: RobotTrace) -> list[dict]:
+    trace.writer.flush()
     with open(trace.file_output_dir / "route_affected_events.csv", newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
 
 def _jsonl_events(trace: RobotTrace) -> list[dict]:
+    trace.writer.flush()
     with open(trace.file_output_dir / "belief_events.jsonl", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
 def _run_summary(trace: RobotTrace) -> dict:
-    trace.writer.flush_summary()
+    trace.writer.flush_summary()  # enqueues a forced run_summary.json rewrite
+    trace.writer.flush()  # wait for the background queue (including the above) to drain
     with open(trace.file_output_dir / "run_summary.json", encoding="utf-8") as f:
         return json.load(f)
 
@@ -267,7 +271,7 @@ def test_safety_replan_decision_updates_summary_counter(tmp_path):
     )
     SimulationControllerMixin.apply_navigation_decision(fake, fake.robot, fake.agent, decision)
 
-    summary = _run_summary(fake.robot_trace)
+    summary = _run_summary(fake.robot_trace)  # also flushes the background queue
     assert summary["total_safety_replans"] == 1
 
     decision_rows_path = fake.robot_trace.file_output_dir / "decision_events.csv"

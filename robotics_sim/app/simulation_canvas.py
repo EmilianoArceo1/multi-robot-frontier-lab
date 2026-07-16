@@ -31,6 +31,17 @@ from robotics_sim.app.map_editor import (
     find_obstacle_group_at,
     remove_obstacle_at,
 )
+from robotics_sim.app.render_perf import (
+    PerfGuiWarningGate,
+    RenderPerfMonitor,
+    format_gui_perf_warning,
+)
+
+# Soft cap on how many occupancy cells the grid overlay will color-fill in a
+# single cache rebuild. Above this, per-cell coloring is skipped for that
+# rebuild (grid lines are still drawn) so a small grid_resolution over a
+# large visible area can never freeze the UI trying to draw every cell.
+MAX_GRID_OVERLAY_CELLS = 20000
 
 class SimulationCanvas(QWidget):
     goalClicked = Signal(float, float)
@@ -118,6 +129,69 @@ class SimulationCanvas(QWidget):
         self.simulation_time = 0.0
         self.simulation_speed = 1.0
         self.metrics_visible = True
+
+        # Temporary red grid-resolution preview shown while the user adjusts
+        # SimulationConfig.grid_resolution in the config panel. Purely visual
+        # -- it never touches self.config or any simulation-facing state, and
+        # auto-hides itself shortly after the last change so it never becomes
+        # a permanent, easy-to-forget overlay.
+        self._grid_resolution_preview_active = False
+        self._grid_resolution_preview_resolution: float | None = None
+        self._grid_resolution_preview_timer = QTimer(self)
+        self._grid_resolution_preview_timer.setSingleShot(True)
+        self._grid_resolution_preview_timer.timeout.connect(self.hide_grid_resolution_preview)
+
+        # Persistent "Show Grid" overlay ("Grid Overlay" toggle). Unlike the
+        # temporary preview above, this does not auto-hide -- it stays on
+        # until the user turns it off, including while the simulation is
+        # running. Purely visual/debug: it never touches self.config and
+        # never rebuilds any occupancy/planning grid. _grid_overlay_snapshot
+        # is an optional read-only copy of the current belief/occupancy
+        # grid (resolution/bounds/grid array) pushed in from outside, used
+        # to color occupied/free/unknown cells while running; when absent
+        # (not running, or no belief map yet) only resolution grid lines
+        # are drawn.
+        self.grid_overlay_enabled = False
+        self._grid_overlay_resolution = 0.50
+        self._grid_overlay_snapshot: dict | None = None
+        self._grid_overlay_snapshot_version = 0
+        self._grid_overlay_snapshot_pushed_at: float | None = None
+
+        # Rendered-overlay cache. Rebuilding requires looping over every
+        # visible occupancy cell and issuing a QPainter.drawRect() call per
+        # cell -- fine once, ruinous if repeated every frame at a fine
+        # grid_resolution. The cache is reused as long as resolution, canvas
+        # size, view bounds, and the occupancy snapshot are all unchanged;
+        # otherwise it is rebuilt once and reused again.
+        self._grid_overlay_cache: QPixmap | None = None
+        self._grid_overlay_cache_key: tuple | None = None
+        self._grid_overlay_last_cache_status = "off"
+        self._grid_overlay_last_visible_cells = 0
+        self._grid_overlay_degraded = False
+
+        # Render-only FPS/frame-time telemetry. Independent of the engine --
+        # this only ever measures how fast paintEvent itself is running.
+        # Routine samples are NEVER printed to stdout/terminal and NEVER
+        # appended to the GUI console (that would just trade one spam
+        # problem for another) -- they are only kept in-memory as
+        # latest_perf_status, inspectable by an optional in-app "Show FPS"
+        # display without any terminal or GUI console output. Only a
+        # genuinely severe, much less frequent FPS drop reaches the GUI
+        # console, via _perf_gui_warning_gate.
+        self._render_perf_monitor = RenderPerfMonitor()
+        self._perf_gui_warning_gate = PerfGuiWarningGate()
+        self.latest_perf_status: dict | None = None
+        # Gates GUI-console perf warnings only (see
+        # _maybe_emit_perf_gui_warning/draw_grid_overlay's degraded notice)
+        # -- a low paint_fps during setup/load/reset, or with the overlay
+        # off, is not meaningful and must not be reported as if Show Grid
+        # were the cause. Set via set_simulation_running_for_perf().
+        self._simulation_running_for_perf = False
+        # Tracks whether the one-time "grid overlay degraded" console line
+        # has already been shown for the CURRENT run + degraded streak --
+        # separate from _grid_overlay_degraded (which also gates cache-key/
+        # snapshot-throttle logic and must stay accurate even while idle).
+        self._grid_overlay_degraded_notice_shown = False
 
         # Dragging support for pre-simulation multi-robot placement.
         self.dragging_robot_index: int | None = None
@@ -1103,6 +1177,7 @@ class SimulationCanvas(QWidget):
 
     def paintEvent(self, event):
         self.record_render_frame()
+        frame_start = time.perf_counter()
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -1111,6 +1186,75 @@ class SimulationCanvas(QWidget):
         self.draw_title(painter)
         self.draw_plot(painter)
         self.draw_telemetry(painter)
+
+        self._report_render_perf(frame_start)
+
+    def _report_render_perf(self, frame_start: float) -> None:
+        """Update in-app perf diagnostics from this frame's measured paint
+        time. Purely observational -- never touches self.config or any
+        simulation state.
+
+        Routine samples are NEVER printed to stdout/terminal and NEVER
+        appended to the GUI console: they are only stored in
+        latest_perf_status, so an optional "Show FPS" display can read the
+        current numbers without any terminal or GUI console output. Only a
+        genuinely severe, heavily throttled FPS drop reaches the GUI
+        console, via _maybe_emit_perf_gui_warning().
+        """
+        paint_ms = (time.perf_counter() - frame_start) * 1000.0
+
+        snapshot_age_ms = None
+        if self.grid_overlay_enabled and self._grid_overlay_snapshot_pushed_at is not None:
+            snapshot_age_ms = (time.perf_counter() - self._grid_overlay_snapshot_pushed_at) * 1000.0
+
+        # record_frame() still throttles its returned formatted line (kept
+        # for callers/tests that want the exact [PERF] text), but nothing
+        # here prints or GUI-console-appends it -- only the always-current
+        # rolling paint_fps/paint_ms values are kept, in latest_perf_status.
+        self._render_perf_monitor.record_frame(
+            paint_ms=paint_ms,
+            overlay_enabled=self.grid_overlay_enabled,
+            grid_resolution=self._grid_overlay_resolution,
+            visible_cells=self._grid_overlay_last_visible_cells if self.grid_overlay_enabled else None,
+            cache_status=self._grid_overlay_last_cache_status,
+            snapshot_age_ms=snapshot_age_ms,
+        )
+
+        self.latest_perf_status = {
+            "paint_fps": self._render_perf_monitor.paint_fps,
+            "paint_ms": self._render_perf_monitor.paint_ms,
+            "overlay_enabled": self.grid_overlay_enabled,
+            "grid_resolution": self._grid_overlay_resolution,
+            "visible_cells": self._grid_overlay_last_visible_cells if self.grid_overlay_enabled else None,
+            "cache_status": self._grid_overlay_last_cache_status,
+            "snapshot_age_ms": snapshot_age_ms,
+        }
+
+        self._maybe_emit_perf_gui_warning()
+
+    def _maybe_emit_perf_gui_warning(self) -> None:
+        """Append a rare, heavily throttled GUI-console line when paint_fps
+        is severely low -- the only case where perf diagnostics reach the
+        GUI console at all, since routine samples never do (see
+        _report_render_perf's latest_perf_status).
+
+        Gated on simulation_running AND grid_overlay_enabled: a low
+        paint_fps during setup/load/reset is not meaningful (nothing is
+        actually rendering the overlay yet), and with the overlay off,
+        Show Grid cannot be the cause -- reporting it as an "overlay is
+        low fps" warning in either case would be a false lead.
+        """
+        if not self._simulation_running_for_perf or not self.grid_overlay_enabled:
+            return
+
+        if self._perf_gui_warning_gate.should_warn(self._render_perf_monitor.paint_fps):
+            self.append_console_message(
+                format_gui_perf_warning(
+                    paint_fps=self._render_perf_monitor.paint_fps,
+                    overlay_enabled=self.grid_overlay_enabled,
+                    grid_resolution=self._grid_overlay_resolution,
+                )
+            )
 
     def draw_card(self, painter: QPainter):
         rect = QRectF(self.rect().adjusted(0, 0, -1, -1))
@@ -1410,6 +1554,11 @@ class SimulationCanvas(QWidget):
             painter.fillRect(rect, QColor("#F9FBFD"))
             self.draw_grid(painter, rect)
 
+        # Persistent "Show Grid" overlay, drawn just above the background so
+        # every other layer below (obstacles, mapped points, routes, robot,
+        # safety radius, FoV, labels) stays clearly visible on top of it.
+        self.draw_grid_overlay(painter, rect)
+
         # Always-visible physical world layers.
         # These are not "robot orders"; they are what the simulation world
         # actually contains or what the robot has already sensed.
@@ -1441,6 +1590,10 @@ class SimulationCanvas(QWidget):
                 self.draw_executed_path(painter)
 
         self.draw_goal_and_robot(painter)
+
+        # Drawn last so the temporary red preview is clearly visible over
+        # every other layer while the user is comparing grid resolutions.
+        self.draw_grid_resolution_preview(painter, rect)
 
         painter.restore()
 
@@ -1557,6 +1710,333 @@ class SimulationCanvas(QWidget):
             y += step
 
         painter.restore()
+
+    # ------------------------------------------------------------------
+    # Grid resolution preview (temporary red overlay).
+    #
+    # Shown while the user adjusts SimulationConfig.grid_resolution in the
+    # config panel, so 0.50 vs 0.25 m/cell can be compared visually before
+    # running the simulation. Purely a rendering overlay: it never mutates
+    # self.config or any simulation/runtime state, and it does not rebuild
+    # any occupancy/planning grid. It auto-hides itself shortly after the
+    # last change via a single-shot QTimer, so it is never left on
+    # permanently.
+    # ------------------------------------------------------------------
+
+    def show_grid_resolution_preview(self, resolution: float, duration_ms: int = 800) -> None:
+        """Show the red grid preview at *resolution*, auto-hiding after
+        *duration_ms* (default within the requested 700-1000ms range).
+
+        Safe to call repeatedly while the user is still adjusting the
+        control -- each call restarts the auto-hide timer, so the preview
+        only disappears after the user stops changing the value. If the
+        persistent "Show Grid" overlay is enabled, the overlay already
+        keeps a grid visible permanently, so the auto-hide timer is not
+        armed -- there is nothing for it to hide.
+        """
+        self._grid_resolution_preview_active = True
+        self._grid_resolution_preview_resolution = max(0.01, float(resolution))
+        if self.grid_overlay_enabled:
+            self._grid_resolution_preview_timer.stop()
+        else:
+            self._grid_resolution_preview_timer.start(int(duration_ms))
+        self.update()
+
+    def hide_grid_resolution_preview(self) -> None:
+        """Hide the red grid preview immediately."""
+        self._grid_resolution_preview_active = False
+        self._grid_resolution_preview_timer.stop()
+        self.update()
+
+    def is_grid_resolution_preview_active(self) -> bool:
+        return bool(self._grid_resolution_preview_active)
+
+    def grid_resolution_preview_value(self) -> float | None:
+        return self._grid_resolution_preview_resolution
+
+    def draw_grid_resolution_preview(self, painter: QPainter, rect) -> None:
+        """Draw a lightweight red grid at the previewed resolution.
+
+        Only within the visible world bounds, only while the preview is
+        active. Deliberately simpler than draw_grid(): no minor/major
+        distinction, no coordinate labels -- this is a quick visual
+        comparison aid, not a permanent map layer.
+        """
+        if not self._grid_resolution_preview_active or not self._grid_resolution_preview_resolution:
+            return
+
+        resolution = self._grid_resolution_preview_resolution
+        left, right, bottom, top = self.active_view_bounds_world()
+
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setPen(QPen(QColor(220, 40, 40, 190), 1))
+
+        x = math.floor(left / resolution) * resolution
+        while x <= right + resolution * 0.5:
+            sx, _ = self.world_to_screen(x, 0.0)
+            painter.drawLine(QPointF(sx, rect.top()), QPointF(sx, rect.bottom()))
+            x += resolution
+
+        y = math.floor(bottom / resolution) * resolution
+        while y <= top + resolution * 0.5:
+            _, sy = self.world_to_screen(0.0, y)
+            painter.drawLine(QPointF(rect.left(), sy), QPointF(rect.right(), sy))
+            y += resolution
+
+        painter.restore()
+
+    # ------------------------------------------------------------------
+    # Persistent grid overlay ("Show Grid" toggle).
+    #
+    # Unlike the temporary preview above, this stays visible until the user
+    # turns it off -- including while the simulation is running -- so it
+    # uses its own state instead of the preview's auto-hide timer. Purely a
+    # rendering overlay: it never mutates self.config, never rebuilds any
+    # occupancy/planning grid, and the occupancy snapshot it colors is a
+    # read-only copy pushed in from outside (see engine.py's
+    # occupancy_grid_snapshot()), never a live reference.
+    # ------------------------------------------------------------------
+
+    def set_grid_overlay_enabled(self, enabled: bool) -> None:
+        self.grid_overlay_enabled = bool(enabled)
+        self.update()
+
+    def is_grid_overlay_enabled(self) -> bool:
+        return bool(self.grid_overlay_enabled)
+
+    def set_simulation_running_for_perf(self, running: bool) -> None:
+        """Tell the canvas whether the simulation is actively running, for
+        perf-diagnostic gating only (see _maybe_emit_perf_gui_warning and
+        the grid-overlay-degraded console notice) -- does not affect
+        rendering or any simulation state. A low paint_fps while idle
+        (before Start, or after Reset) is not a meaningful signal and must
+        not produce a console warning."""
+        running = bool(running)
+        if running and not self._simulation_running_for_perf:
+            # Fresh run starting: if the overlay was already degraded before
+            # Start was pressed, give it a fresh chance to notify now that
+            # the simulation is actually running, instead of staying
+            # permanently suppressed because the degrade happened while idle.
+            self._grid_overlay_degraded_notice_shown = False
+        self._simulation_running_for_perf = running
+
+    def set_grid_overlay_resolution(self, resolution: float) -> None:
+        self._grid_overlay_resolution = max(0.01, float(resolution))
+        self.update()
+
+    def set_grid_overlay_snapshot(self, snapshot: dict | None) -> None:
+        """Store a read-only occupancy snapshot (resolution/bounds/grid) for
+        cell coloring. Pass None to fall back to resolution-only grid lines
+        (e.g. before the simulation has started, or no belief map yet).
+
+        Each call bumps a version counter (rather than diffing the grid
+        array's contents, which would be as expensive as the render work
+        it's meant to avoid) -- draw_grid_overlay()'s cache key includes
+        this version, so a genuinely new snapshot always invalidates the
+        cache, and repeated pushes of "no new data" never do.
+        """
+        self._grid_overlay_snapshot = snapshot
+        self._grid_overlay_snapshot_version += 1
+        self._grid_overlay_snapshot_pushed_at = time.perf_counter()
+        self.update()
+
+    def is_grid_overlay_degraded(self) -> bool:
+        return bool(self._grid_overlay_degraded)
+
+    def grid_overlay_cache_status(self) -> str:
+        return self._grid_overlay_last_cache_status
+
+    def grid_overlay_visible_cell_count(self) -> int:
+        return int(self._grid_overlay_last_visible_cells)
+
+    def _grid_overlay_cell_bounds(
+        self, resolution: float, snapshot: dict | None
+    ) -> tuple[int, int, int, int] | None:
+        """(col_start, col_end, row_start, row_end) of snapshot cells inside
+        the current view, or None if there is no snapshot/nothing visible."""
+        if snapshot is None:
+            return None
+
+        grid = snapshot.get("grid")
+        bounds = snapshot.get("bounds")
+        snapshot_resolution = float(snapshot.get("resolution") or resolution)
+        if grid is None or bounds is None or snapshot_resolution <= 0.0:
+            return None
+
+        x_min, x_max, y_min, y_max = bounds
+        left, right, bottom, top = self.active_view_bounds_world()
+
+        col_start = max(0, int(math.floor((left - x_min) / snapshot_resolution)))
+        col_end = min(grid.shape[1] - 1, int(math.ceil((right - x_min) / snapshot_resolution)))
+        row_start = max(0, int(math.floor((bottom - y_min) / snapshot_resolution)))
+        row_end = min(grid.shape[0] - 1, int(math.ceil((top - y_min) / snapshot_resolution)))
+
+        if col_start > col_end or row_start > row_end:
+            return None
+
+        return col_start, col_end, row_start, row_end
+
+    def draw_grid_overlay(self, painter: QPainter, rect) -> None:
+        """Draw the persistent grid overlay: resolution grid lines, plus
+        translucent occupied/free/unknown cell colors when a snapshot is
+        available. Deliberately drawn just above the background/base map
+        and below obstacles, mapped points, routes, and the robot, so it
+        never hides them.
+
+        Rebuilding the overlay means looping over every visible occupancy
+        cell (one QPainter.drawRect() call each), which is only affordable
+        once, not every frame -- so the result is cached into a QPixmap and
+        reused as long as resolution/canvas size/view bounds/snapshot are
+        unchanged (see _grid_overlay_cache_key below). If the number of
+        visible cells exceeds MAX_GRID_OVERLAY_CELLS (e.g. a fine
+        grid_resolution zoomed far out), cell coloring is skipped for that
+        rebuild -- grid lines are still drawn -- so this can never freeze
+        the UI trying to draw every cell.
+        """
+        if not self.grid_overlay_enabled:
+            self._grid_overlay_last_cache_status = "off"
+            self._grid_overlay_last_visible_cells = 0
+            self._grid_overlay_degraded = False
+            return
+
+        resolution = self._grid_overlay_resolution
+        snapshot = self._grid_overlay_snapshot
+
+        cell_bounds = self._grid_overlay_cell_bounds(resolution, snapshot)
+        if cell_bounds is not None:
+            col_start, col_end, row_start, row_end = cell_bounds
+            visible_cells = (col_end - col_start + 1) * (row_end - row_start + 1)
+        else:
+            visible_cells = 0
+
+        degraded = visible_cells > MAX_GRID_OVERLAY_CELLS
+        if degraded and not self._grid_overlay_degraded_notice_shown and self._simulation_running_for_perf:
+            # Only surfaced to the console while the simulation is actually
+            # running -- during setup/load/reset this would just be console
+            # noise about a state the user isn't looking at yet. Still
+            # tracked in latest_perf_status's cache_status field either way.
+            self.append_console_message(
+                f"[PERF] grid overlay degraded due visible_cells={visible_cells}"
+            )
+            self._grid_overlay_degraded_notice_shown = True
+        if not degraded:
+            self._grid_overlay_degraded_notice_shown = False
+        if degraded:
+            cell_bounds = None  # skip per-cell coloring; grid lines only.
+
+        self._grid_overlay_degraded = degraded
+        self._grid_overlay_last_visible_cells = visible_cells
+
+        cache_key = (
+            round(float(resolution), 3),
+            self.width(),
+            self.height(),
+            tuple(round(float(bound), 2) for bound in self.active_view_bounds_world()),
+            self._grid_overlay_snapshot_version if cell_bounds is not None else -1,
+        )
+
+        if self._grid_overlay_cache is not None and self._grid_overlay_cache_key == cache_key:
+            painter.drawPixmap(0, 0, self._grid_overlay_cache)
+            self._grid_overlay_last_cache_status = "hit"
+            return
+
+        self._grid_overlay_cache_key = cache_key
+        self._grid_overlay_cache = self._rebuild_grid_overlay_cache(
+            rect, resolution, snapshot, cell_bounds
+        )
+        self._grid_overlay_last_cache_status = "degraded" if degraded else "rebuild"
+        painter.drawPixmap(0, 0, self._grid_overlay_cache)
+
+    def _rebuild_grid_overlay_cache(
+        self,
+        rect,
+        resolution: float,
+        snapshot: dict | None,
+        cell_bounds: tuple[int, int, int, int] | None,
+    ) -> QPixmap:
+        cache = QPixmap(self.size())
+        cache.fill(Qt.transparent)
+
+        cache_painter = QPainter(cache)
+        cache_painter.save()
+        cache_painter.setClipRect(rect)
+
+        if snapshot is not None and cell_bounds is not None:
+            self._draw_grid_overlay_cells(cache_painter, snapshot, cell_bounds)
+
+        self._draw_grid_overlay_lines(cache_painter, rect, resolution)
+
+        cache_painter.restore()
+        cache_painter.end()
+        return cache
+
+    def _draw_grid_overlay_lines(self, painter: QPainter, rect, resolution: float) -> None:
+        left, right, bottom, top = self.active_view_bounds_world()
+
+        painter.setPen(QPen(QColor(90, 90, 90, 70), 1))
+
+        x = math.floor(left / resolution) * resolution
+        while x <= right + resolution * 0.5:
+            sx, _ = self.world_to_screen(x, 0.0)
+            painter.drawLine(QPointF(sx, rect.top()), QPointF(sx, rect.bottom()))
+            x += resolution
+
+        y = math.floor(bottom / resolution) * resolution
+        while y <= top + resolution * 0.5:
+            _, sy = self.world_to_screen(0.0, y)
+            painter.drawLine(QPointF(rect.left(), sy), QPointF(rect.right(), sy))
+            y += resolution
+
+    def _draw_grid_overlay_cells(
+        self,
+        painter: QPainter,
+        snapshot: dict,
+        cell_bounds: tuple[int, int, int, int],
+    ) -> None:
+        """Fill each visible cell with a translucent color based on its
+        occupancy state (unknown/free/occupied). All colors are low-alpha
+        so obstacles, routes, and the robot underneath/above remain
+        readable -- this is a debug aid, not an opaque map layer. Only
+        called during a cache rebuild, never every frame.
+        """
+        grid = snapshot.get("grid")
+        resolution = float(snapshot.get("resolution") or 0.0)
+        bounds = snapshot.get("bounds")
+        if grid is None or resolution <= 0.0 or bounds is None:
+            return
+
+        x_min, _x_max, y_min, _y_max = bounds
+        col_start, col_end, row_start, row_end = cell_bounds
+
+        unknown_brush = QBrush(QColor(120, 120, 120, 35))
+        free_brush = QBrush(QColor(60, 140, 220, 45))
+        occupied_brush = QBrush(QColor(220, 40, 40, 80))
+
+        painter.setPen(Qt.NoPen)
+
+        for row in range(row_start, row_end + 1):
+            for col in range(col_start, col_end + 1):
+                state = int(grid[row, col])
+                if state == 1:
+                    painter.setBrush(occupied_brush)
+                elif state == 0:
+                    painter.setBrush(free_brush)
+                else:
+                    painter.setBrush(unknown_brush)
+
+                cx0 = x_min + col * resolution
+                cy0 = y_min + row * resolution
+                sxA, syA = self.world_to_screen(cx0, cy0)
+                sxB, syB = self.world_to_screen(cx0 + resolution, cy0 + resolution)
+                painter.drawRect(
+                    QRectF(
+                        min(sxA, sxB),
+                        min(syA, syB),
+                        abs(sxB - sxA),
+                        abs(syB - syA),
+                    )
+                )
 
     def current_robot_pose(self) -> tuple[float, float, float, float]:
         if self.robot is not None:

@@ -193,6 +193,7 @@ def _build_fake_engine() -> SimpleNamespace:
             path_simplifier="Direction changes",
             exploration_planner="FoV-aware directional frontier",
             exploration_replan_cooldown=1.0,
+            goal_tolerance=0.25,
         ),
         mapped_obstacle_points=[],
         simulation_time=10.0,

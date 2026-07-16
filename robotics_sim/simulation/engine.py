@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QObject, QRunnable
@@ -41,6 +42,7 @@ from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 from robotics_sim.simulation.telemetry import TelemetryLogger
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
+from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
 from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
 from robotics_sim.simulation.coordination import (
@@ -79,6 +81,42 @@ except ImportError:  # pragma: no cover
     RobotObservation = None  # type: ignore[assignment,misc]
     PlannerServices = None  # type: ignore[assignment]
 
+from robotics_sim.navigation.navigation_supervisor import NavigationSupervisor
+
+# Minimum wall-clock gap between pushing occupancy snapshots into the
+# canvas's grid overlay. The belief grid can be large, and copying it more
+# often than the overlay could ever visibly refresh just burns CPU for no
+# visual benefit -- 10 Hz is already faster than a human can perceive a
+# grid-color change, and well above typical GUI paint cadence.
+GRID_OVERLAY_SNAPSHOT_INTERVAL_S = 0.1
+# While the canvas has degraded the overlay to grid-lines-only (visible
+# cells over MAX_GRID_OVERLAY_CELLS), no cell coloring is ever drawn from
+# the snapshot -- pushing one at 10 Hz would just be copying the belief
+# grid for nothing. Falls back to a much slower cadence instead of
+# skipping entirely, so a snapshot is still available the moment the user
+# zooms in enough to leave degraded mode.
+GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S = 1.0
+
+
+def occupancy_grid_snapshot_from_belief(belief_map) -> dict | None:
+    """Build a read-only debug snapshot of *belief_map* for the canvas's
+    optional "Show Grid" overlay only.
+
+    Returns a plain dict (resolution, bounds, grid) rather than the
+    BeliefMap itself, and copies the grid array, so the canvas can never
+    hold a live reference to -- or accidentally mutate -- the real
+    belief/occupancy state that planning, routing, and exploration read.
+    """
+    if belief_map is None:
+        return None
+
+    return {
+        "resolution": float(belief_map.resolution),
+        "bounds": tuple(belief_map.bounds),
+        "grid": belief_map.grid.copy(),
+    }
+
+
 class PlannerWorkerSignals(QObject):
     route_ready = Signal(int, bool, str, list)
 
@@ -96,6 +134,10 @@ class PlannerWorker(QRunnable):
         self.setAutoDelete(False)
         self.request_id = int(request_id)
         self.planner_kwargs = dict(planner_kwargs)
+        # Sideband key for [PERF] logging only -- not a real planner
+        # parameter, so it is popped out here and never reaches
+        # compute_planned_waypoints(**self.planner_kwargs) below.
+        self.perf_reason = str(self.planner_kwargs.pop("__perf_reason__", "route_replan"))
         self.path_simplifier = str(path_simplifier)
         self.signals = PlannerWorkerSignals()
 
@@ -118,6 +160,15 @@ class PlannerWorker(QRunnable):
             )
             return
 
+        # Timed strictly around this existing call boundary -- never inside
+        # compute_planned_waypoints/A* itself. Stored as plain attributes,
+        # not printed and not appended to any GUI widget: this runs on a
+        # background QRunnable thread, and touching Qt widgets or the
+        # terminal from here is exactly what must not happen. The GUI
+        # thread's route_ready handler (on_async_route_ready) can read
+        # these attributes off the worker after the signal fires, once
+        # run() has already returned.
+        perf_start = time.perf_counter()
         try:
             supports_simplifier = False
             try:
@@ -137,6 +188,21 @@ class PlannerWorker(QRunnable):
             reason = f"planner worker failed: {exc}"
             waypoints = []
 
+        # Not printed and not emitted by default (see class docstring/task
+        # notes): route_plan_ms/route_plan_perf_line are stored for optional
+        # later inspection only. format_route_plan_perf_line is still the
+        # formatter used to build the stored text, so it stays exercised
+        # and testable even though nothing routes it to stdout or the GUI.
+        self.route_plan_ms = (time.perf_counter() - perf_start) * 1000.0
+        self.route_plan_result = "ok" if success else "fail"
+        self.route_plan_perf_line = format_route_plan_perf_line(
+            route_plan_ms=self.route_plan_ms,
+            reason=self.perf_reason,
+            grid_resolution=float(self.planner_kwargs.get("resolution", 0.0) or 0.0),
+            mapped_obs=len(self.planner_kwargs.get("obstacle_points") or []),
+            result=self.route_plan_result,
+        )
+
         self.signals.route_ready.emit(
             self.request_id,
             bool(success),
@@ -144,6 +210,26 @@ class PlannerWorker(QRunnable):
             [tuple(point) for point in waypoints],
         )
 
+
+
+def current_route_repair_goal(agent) -> tuple[float, float] | None:
+    """The goal a route-repair replan (route_affected / REPLAN_FOR_SAFETY)
+    must preserve, or None if there is nothing active to preserve.
+
+    route_affected and safety replans exist to fix the CURRENT route, not
+    to pick a new destination -- unlike REQUEST_PLAN ("frontier reached" /
+    initial plan) or PREFETCH_NEXT_TARGET, which legitimately choose a
+    fresh target. Preferring active_path_goal_xy (the route actually being
+    tracked) over exploration_target_xy (which can be set slightly ahead of
+    active_path_goal_xy, e.g. mid-prefetch) keeps repair replans targeting
+    exactly what the robot was already navigating to.
+
+    A module-level function (not a method) so it can be unit-tested
+    without instantiating the Qt-based simulation engine.
+    """
+    if agent is None:
+        return None
+    return agent.active_path_goal_xy or agent.exploration_target_xy
 
 
 def route_first_segment_blocked(
@@ -184,26 +270,34 @@ def route_reaches_goal(
 ) -> bool:
     """True when the route's final waypoint is within *tolerance* of *goal*.
 
-    A "successful" route (compute_planned_waypoints returning success=True,
-    e.g. after relocating an occupied goal cell to the nearest traversable
-    one) does not always actually terminate at the goal it was asked to
-    reach. Accepting such a route anyway means the robot follows it
-    faithfully to a DIFFERENT endpoint and then gets stuck there: whatever
-    tracks the route's intended destination (active_path_goal_xy /
-    pending_target_xy) keeps pointing at the original goal, so
-    distance-to-goal never drops below goal_tolerance and "frontier
-    reached" never fires -- the robot sits in STOP with the same stale
-    target/path_goal forever.
-
-    A module-level function (not a method) so it can be unit-tested without
-    instantiating the Qt-based simulation engine.
+    Thin backward-compatible delegate: the actual invariant now lives in
+    NavigationSupervisor.validate_route_endpoint(), the single place this
+    check is defined. Kept as a module-level function (rather than inlining
+    the supervisor call at each of this module's call sites) so existing
+    imports/tests referencing engine.route_reaches_goal keep working
+    unchanged.
     """
-    if not waypoints or goal is None:
-        return False
-    last = waypoints[-1]
-    return math.hypot(
-        float(last[0]) - float(goal[0]), float(last[1]) - float(goal[1])
-    ) <= float(tolerance)
+    return NavigationSupervisor.validate_route_endpoint(waypoints, goal, tolerance)
+
+
+def effective_planning_clearance(robot_radius: float, safety_radius: float) -> float:
+    """The clearance radius used to inflate obstacles for planning/reachability.
+
+    Semantics (confirmed against config.py's own clamp, main_window.py's
+    radius-consistency enforcement, simulation_canvas.py's safety-radius
+    circle rendering, and the GUI slider label itself, "Safety Radius r
+    (m)"): config.safety_radius is the TOTAL clearance radius from the
+    robot's center, not an extra margin layered on top of the robot's own
+    body -- it is clamped to never be smaller than robot_radius (the
+    physical body radius) so a misconfigured safety_radius can never shrink
+    the robot's effective footprint below its own physical size.
+
+    Deliberately max(...), not robot_radius + safety_radius -- adding them
+    would double-count the body radius safety_radius already includes,
+    over-inflating every obstacle and narrow corridor by an extra
+    robot_radius beyond what the configured "r" value calls for.
+    """
+    return max(float(robot_radius), float(safety_radius))
 
 
 def candidate_reachable_on_planning_grid(
@@ -215,9 +309,12 @@ def candidate_reachable_on_planning_grid(
     bounds: tuple[float, float, float, float],
     resolution: float,
     robot_radius: float,
+    goal_tolerance: float,
 ) -> bool:
     """True when compute_planned_waypoints() can find a route from start_xy
-    to candidate_xy on the given, already-built planning_grid.
+    to candidate_xy on the given, already-built planning_grid, AND that
+    route's final waypoint actually reaches candidate_xy within
+    goal_tolerance.
 
     Intended to be called with the SAME planning grid real single-robot
     navigation A* uses (see build_planning_grid_for_robot()), which --
@@ -225,6 +322,16 @@ def candidate_reachable_on_planning_grid(
     inflates around dense mapped-obstacle-point samples. Used to filter
     exploration candidates the real planner would immediately reject with
     "no path found", before one is ever requested.
+
+    The endpoint check matters just as much as "a path exists":
+    compute_planned_waypoints() can return success=True after silently
+    relocating an occupied goal cell to the nearest traversable one (see
+    planner_registry._nearest_traversable_cell()) -- a route to THAT cell,
+    not to candidate_xy. Without this check, a candidate could be accepted
+    as "reachable" here and then be rejected moments later by the exact
+    same endpoint rule apply_route_result()/on_prefetch_route_ready() apply
+    via NavigationSupervisor.validate_route_endpoint() -- wasting a
+    REQUEST_PLAN/PREFETCH cycle on a candidate that was never going to work.
 
     A module-level function (not a method) so it can be unit-tested with a
     plain OccupancyGrid, without instantiating the Qt-based simulation
@@ -243,7 +350,9 @@ def candidate_reachable_on_planning_grid(
         unknown_is_traversable=True,
         obstacle_points=[],
     )
-    return bool(success and waypoints)
+    if not success or not waypoints:
+        return False
+    return NavigationSupervisor.validate_route_endpoint(waypoints, candidate_xy, goal_tolerance)
 
 
 # ============================================================
@@ -339,6 +448,51 @@ class SimulationControllerMixin:
             self.reset_belief_map(robot_count=max(1, count))
         return self.belief_map
 
+    def occupancy_grid_snapshot(self) -> dict | None:
+        """Read-only snapshot of the current belief/occupancy grid, for the
+        canvas's optional "Show Grid" overlay only.
+
+        Purely visual/debug: never mutated, never fed back into planning,
+        routing, or exploration, and does not create or rebuild the belief
+        map -- returns None if none exists yet.
+        """
+        return occupancy_grid_snapshot_from_belief(getattr(self, "belief_map", None))
+
+    def push_grid_overlay_snapshot_if_due(self) -> None:
+        """Push a fresh occupancy snapshot into the canvas's grid overlay,
+        but only when the overlay is enabled, and at a rate that depends on
+        whether the overlay is currently degraded (grid-lines-only, no cell
+        coloring drawn -- see MAX_GRID_OVERLAY_CELLS in simulation_canvas.py):
+        GRID_OVERLAY_SNAPSHOT_INTERVAL_S (10 Hz) normally, or the much
+        slower GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S (1 Hz) while
+        degraded, since a degraded overlay never uses the snapshot's cell
+        colors anyway. Automatically returns to the fast rate as soon as
+        the canvas reports it is no longer degraded (e.g. the user zoomed
+        in below the visible-cell cap).
+
+        Purely visual/debug, read-only, and rate-limited: the overlay
+        cannot refresh visibly faster than this anyway, so throttling here
+        avoids copying the (potentially large) belief grid on every single
+        simulation tick for no visible benefit.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or not getattr(canvas, "grid_overlay_enabled", False):
+            return
+
+        is_degraded = getattr(canvas, "is_grid_overlay_degraded", None)
+        degraded = bool(is_degraded()) if callable(is_degraded) else False
+        interval = (
+            GRID_OVERLAY_SNAPSHOT_DEGRADED_INTERVAL_S if degraded else GRID_OVERLAY_SNAPSHOT_INTERVAL_S
+        )
+
+        now = time.perf_counter()
+        last_push = getattr(self, "_grid_overlay_snapshot_last_push_time", None)
+        if last_push is not None and (now - last_push) < interval:
+            return
+
+        self._grid_overlay_snapshot_last_push_time = now
+        canvas.set_grid_overlay_snapshot(self.occupancy_grid_snapshot())
+
     def sync_legacy_map_views_from_belief(self) -> None:
         """Update legacy views without destroying boundary obstacle samples.
 
@@ -388,7 +542,7 @@ class SimulationControllerMixin:
             ipp_distance_penalty=max(0.0, float(self.ipp_lambda_input.value())),
             vision_model=self.vision_combo.currentText(),
             agent_mode=self.top_bar.mode_selector.currentText(),
-            grid_resolution=self.config.grid_resolution,
+            grid_resolution=max(0.10, float(self.grid_resolution_input.value())),
             obstacles=list(self.config.obstacles),
             show_goal_preview=self.preview_switch.isChecked(),
             show_path=True,
@@ -459,6 +613,7 @@ class SimulationControllerMixin:
             self.coordinator_combo.setCurrentText(config.coordinator_type)
         self.exploration_cooldown_input.setValue(config.exploration_replan_cooldown)
         self.ipp_lambda_input.setValue(config.ipp_distance_penalty)
+        self.grid_resolution_input.setValue(config.grid_resolution)
         self.vision_combo.setCurrentText(config.vision_model)
         self.top_bar.mode_selector.setCurrentText(config.agent_mode)
 
@@ -2018,6 +2173,10 @@ class SimulationControllerMixin:
         else:
             planner_kwargs = self.build_planner_kwargs(start_xy)
 
+        # [PERF]-logging only (see PlannerWorker.__init__); popped before the
+        # real compute_planned_waypoints(**planner_kwargs) call.
+        planner_kwargs["__perf_reason__"] = str(reason)
+
         if bool(planner_kwargs.get("__hold__", False)):
             self.apply_route_result(False, str(planner_kwargs.get("__hold_reason__", "holding position")), [])
             return False
@@ -3169,6 +3328,7 @@ class SimulationControllerMixin:
 
         self.running = True
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(True)
         self.set_configuration_locked(True)
         self.update_start_pause_button()
         self.speed_button.setText(f"Speed {self.simulation_speed:.2f}x")
@@ -3278,6 +3438,7 @@ class SimulationControllerMixin:
 
         self.running = True
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(True)
         self.set_configuration_locked(True)
 
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -3313,6 +3474,7 @@ class SimulationControllerMixin:
         self.robot_agents = self.ensure_runtime_robot_registry().agents
         self.running = False
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(False)
         self.set_configuration_locked(False)
 
         self.collision_checker = CollisionChecker() if CollisionChecker is not None else None
@@ -3438,8 +3600,8 @@ class SimulationControllerMixin:
         target_robot = self.robot if robot is None else robot
         body = self.body_radius_for_robot(target_robot)
         if target_robot is not None and hasattr(target_robot, "_sim_safety_radius"):
-            return max(float(target_robot._sim_safety_radius), body)
-        return max(float(self.config.safety_radius), body)
+            return effective_planning_clearance(body, float(target_robot._sim_safety_radius))
+        return effective_planning_clearance(body, float(self.config.safety_radius))
 
     def body_radius(self) -> float:
         """Backward-compatible alias for the current robot body radius."""
@@ -3534,6 +3696,7 @@ class SimulationControllerMixin:
         """
         self.running = False
         self.paused = False
+        self.canvas.set_simulation_running_for_perf(False)
         self.last_control = self.brake_control_for_collision()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status(message)
@@ -3985,6 +4148,19 @@ class SimulationControllerMixin:
         The robot should not stop permanently when a local segment is blocked. It
         should update its map and ask the selected planner for a new route from
         its current state.
+
+        This is a REPAIR replan (route_affected / REPLAN_FOR_SAFETY), not a
+        fresh target selection: it must preserve the goal the robot was
+        already navigating to (current_route_repair_goal()) via
+        target_override, the same mechanism REQUEST_PLAN decisions already
+        use. Without this, request_route_async() would fall back to
+        select_navigation_goal() -- an independent frontier re-selection
+        that has no idea a route repair, not a new destination, was asked
+        for -- and could switch the robot to a completely different
+        frontier just because a newly-mapped obstacle grazed its current
+        route. Only when there is nothing active to repair
+        (current_route_repair_goal() returns None) does this fall back to
+        that normal target-selection behavior, unchanged.
         """
         if self.robot is None:
             return False
@@ -3993,8 +4169,10 @@ class SimulationControllerMixin:
             return False
 
         self.safety_replan_count += 1
+        repair_goal = current_route_repair_goal(self.runtime_agent(None))
         return self.request_route_async(
-            f"{reason} Replanning with {len(self.mapped_obstacle_points)} mapped boundary sample(s)."
+            f"{reason} Replanning with {len(self.mapped_obstacle_points)} mapped boundary sample(s).",
+            target_override=repair_goal,
         )
 
     def inter_robot_clearance_violation(self) -> tuple[bool, str]:
@@ -4531,6 +4709,8 @@ class SimulationControllerMixin:
             simulation_speed=self.simulation_speed,
         )
 
+        self.push_grid_overlay_snapshot_if_due()
+
     # ========================================================
     # NEW POO INTERFACE — gradual migration helpers
     #
@@ -4586,6 +4766,7 @@ class SimulationControllerMixin:
         )
         planner_type = str(self.config.planner_type)
         bounds = (WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX)
+        goal_tolerance = float(self.config.goal_tolerance)
 
         def _is_reachable(candidate_xy: tuple[float, float]) -> bool:
             return candidate_reachable_on_planning_grid(
@@ -4596,6 +4777,7 @@ class SimulationControllerMixin:
                 bounds=bounds,
                 resolution=resolution,
                 robot_radius=robot_radius,
+                goal_tolerance=goal_tolerance,
             )
 
         return _is_reachable
@@ -4729,30 +4911,41 @@ class SimulationControllerMixin:
         """
         kind = decision.kind
 
-        if kind == "REPLAN_FOR_SAFETY" and not self.robots:
-            # REPLAN_FOR_SAFETY only makes sense when there is an active
-            # route to replan. RobotAgent.step() emits this decision
-            # unconditionally whenever active_segment_blocked/
-            # predicted_collision is set -- including with no active route
-            # at all (e.g. right after exploration_exhausted() put the
-            # agent into a stable HOLD) -- because that check runs before
-            # ExplorationBehavior.update() (and its own has_active_route
-            # guard) is ever reached. Normalize the decision kind here, at
-            # the engine boundary, BEFORE telemetry logs it and before any
-            # route-request/failure-marking logic runs below -- otherwise a
-            # route-less "REPLAN_FOR_SAFETY" still gets reported to the
-            # console and can still trip the safety-replan throttle even
-            # though nothing is actually being replanned. Scoped to
-            # single-robot mode (not self.robots) -- multi-robot has its own
-            # multi_safety_replan_allowed()/per-index route state and is
-            # untouched here.
-            has_active_route = (
-                agent is not None
-                and agent.active_path_goal_xy is not None
-                and agent.active_target() is not None
+        # NavigationSupervisor centralizes the two decision-level invariants
+        # that used to be separate inline checks scattered through this
+        # method: (1) REPLAN_FOR_SAFETY only makes sense with an active
+        # route -- RobotAgent.step() emits it unconditionally whenever
+        # active_segment_blocked/predicted_collision is set, even with
+        # nothing to replan (e.g. right after exploration_exhausted() put
+        # the agent into a stable HOLD), because that check runs before
+        # ExplorationBehavior.update() is ever reached; (2) REQUEST_PLAN to
+        # a target already within goal_tolerance produces a near-zero-length
+        # route that gets "reached" again within a tick. Both normalize to
+        # HOLD here, at the engine boundary, before telemetry logs the
+        # decision and before any route-request/failure-marking logic runs
+        # below. Scoped to single-robot mode (not self.robots) -- multi-robot
+        # has its own multi_safety_replan_allowed()/per-index route state
+        # and assign_route_to_multi_robot() dedup, untouched here.
+        if not self.robots:
+            original_kind = kind
+            decision = NavigationSupervisor.normalize_decision(
+                agent,
+                SimpleNamespace(robot_xy=(float(robot.x), float(robot.y))) if robot is not None else None,
+                decision,
+                float(self.config.goal_tolerance),
+                map_signature=len(self.mapped_obstacle_points),
             )
-            if not has_active_route:
-                kind = "HOLD"
+            kind = decision.kind
+            if original_kind == "REQUEST_PLAN" and kind == "HOLD" and agent is not None:
+                # normalize_decision() is pure and never mutates agent/canvas
+                # state; this mirrors what the REQUEST_PLAN-specific inline
+                # guard it replaces used to do here: an already-reached
+                # target must not linger in exploration_target_xy, or
+                # ExplorationBehavior step 6 (no active path) would propose
+                # the exact same already-reached target again next tick.
+                agent.exploration_target_xy = None
+                self.current_exploration_target = None
+                self.canvas.set_exploration_target(None)
 
         if kind != "FOLLOW_PATH":
             self.telemetry.report_nav_decision(
@@ -4774,6 +4967,18 @@ class SimulationControllerMixin:
         if kind == "HOLD":
             hold_xy = (float(robot.x), float(robot.y))
             self.set_robot_goal_or_waypoints(robot, [hold_xy])
+            # Route invalidation alone does not stop the robot: brake_control()
+            # only decelerates gradually, and the dynamics model advances
+            # position using the velocity from BEFORE this tick's
+            # deceleration is applied -- so residual velocity can still
+            # carry the robot into a collision after navigation has already
+            # decided to hold (see Robot.force_stop()). Every HOLD is
+            # treated as a hard stop here: NavigationDecision draws no
+            # distinction between a "normal" HOLD (no valid next frontier)
+            # and a safety-driven one (predicted collision normalized by
+            # NavigationSupervisor) -- both reach this exact branch.
+            if hasattr(robot, "force_stop"):
+                robot.force_stop(reason=decision.reason or "hold")
             agent.invalidate_route(reason=decision.reason or "hold")
             return False
 
@@ -4805,29 +5010,11 @@ class SimulationControllerMixin:
                     force_new_exploration_target=True,
                 )
             else:
-                if self.is_exploration_mode() and decision.target is not None:
-                    robot_xy = (float(robot.x), float(robot.y))
-                    if math.hypot(
-                        decision.target[0] - robot_xy[0], decision.target[1] - robot_xy[1]
-                    ) <= float(self.config.goal_tolerance):
-                        # Final runtime boundary guard: never launch a route
-                        # request for a target the robot is already at/near,
-                        # regardless of which upstream code path produced it
-                        # (ExplorationBehavior, or engine.select_navigation_goal()'s
-                        # own independent re-derivation). Treat exactly like
-                        # "no valid next frontier" -- hold, let recovery pick
-                        # something else -- instead of a near-zero-length
-                        # ROUTE ok that gets "reached" again within a tick.
-                        self.set_robot_goal_or_waypoints(robot, [robot_xy])
-                        if agent is not None:
-                            agent.invalidate_route(
-                                reason="target already within goal_tolerance of robot position"
-                            )
-                            agent.exploration_target_xy = None
-                        self.current_exploration_target = None
-                        self.canvas.set_exploration_target(None)
-                        return False
-
+                # NavigationSupervisor.normalize_decision() above already
+                # guarantees that a REQUEST_PLAN reaching this point is not
+                # for an already-reached target (it would have been
+                # normalized to HOLD, which returns before this branch is
+                # ever entered) -- no redundant re-check needed here.
                 if decision.force_new_target and agent is not None:
                     # The frontier was just reached.  Clear exploration_target_xy
                     # so select_navigation_goal() inside request_route_async()
@@ -4852,10 +5039,10 @@ class SimulationControllerMixin:
                     )
             else:
                 # By this point kind can only still be "REPLAN_FOR_SAFETY"
-                # here if the route-less case was already normalized to
-                # "HOLD" above -- i.e. the agent is guaranteed to have an
-                # active route. (No redundant has_active_route check here;
-                # see the guard at the top of this method.)
+                # here if NavigationSupervisor.normalize_decision() above
+                # left it unchanged -- i.e. the agent is guaranteed to have
+                # an active route. (No redundant has_active_route check
+                # here; see the supervisor call at the top of this method.)
                 # Mirror multi_safety_replan_allowed(): throttle identical
                 # (reason, target) safety replans instead of launching a new
                 # planner request every single tick the segment stays
@@ -4884,6 +5071,14 @@ class SimulationControllerMixin:
                     hold_xy = (float(robot.x), float(robot.y))
                     attempted_target = agent.exploration_target_xy
                     self.set_robot_goal_or_waypoints(robot, [hold_xy])
+                    # Same hard-stop reasoning as the generic HOLD branch
+                    # above: this route is being invalidated specifically
+                    # because it kept ending up blocked/unsafe, so residual
+                    # velocity here is exactly the "coast into a collision
+                    # after safety logic already decided to stop" scenario
+                    # this fix exists for.
+                    if hasattr(robot, "force_stop"):
+                        robot.force_stop(reason=f"repeated safety replan: {decision.reason}")
                     agent.invalidate_failed_exploration_route(
                         reason=f"repeated safety replan: {decision.reason}",
                         current_time=float(self.simulation_time),
@@ -5032,7 +5227,20 @@ class SimulationControllerMixin:
             if not route_reaches_goal(
                 clean_waypoints, agent.pending_target_xy, float(self.config.goal_tolerance)
             ):
+                rejected_target = agent.pending_target_xy
                 agent.reject_pending_path(f"{reason}; final waypoint does not reach path goal")
+                # reject_pending_path() only clears pending_path/pending_target_xy
+                # -- it does not blacklist the target, so without this the exact
+                # same unreachable target could be immediately re-proposed by the
+                # very next prefetch/REQUEST_PLAN cycle. Use the same
+                # failed-target memory _pick_next_target()/select_navigation_goal()
+                # already consult, so the exclusion window applies here exactly
+                # like it does for a REQUEST_PLAN endpoint-mismatch failure (see
+                # apply_route_result() -> invalidate_failed_exploration_route()).
+                if rejected_target is not None:
+                    agent.mark_exploration_target_failed(
+                        rejected_target, current_time=float(self.simulation_time)
+                    )
                 self.log_console_message(
                     f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
                 )

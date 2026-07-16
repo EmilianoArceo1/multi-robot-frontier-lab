@@ -220,23 +220,6 @@ class NavigationReasoningWindow(QFrame):
                 font-size: 9px;
                 font-weight: 800;
             }}
-            QPushButton#historyStepButton {{
-                background: {CARD};
-                border: 1px solid {BORDER};
-                border-radius: 6px;
-                color: {TEXT};
-                font-size: 13px;
-                font-weight: 900;
-            }}
-            QPushButton#historyStepButton:hover:enabled {{
-                border-color: {BLUE};
-                background: {BLUE_LIGHT};
-                color: {BLUE};
-            }}
-            QPushButton#historyStepButton:disabled {{
-                color: rgba(90,100,110,0.30);
-                background: #F2F3F5;
-            }}
             QPushButton#panelCloseButton {{
                 border: none;
                 background: transparent;
@@ -427,6 +410,10 @@ class NavigationReasoningWindow(QFrame):
         content_layout.addWidget(self.details)
         self.scroll.setWidget(self.content)
 
+        # Passive readout only -- history *stepping* is owned exclusively by
+        # main_window's navigation_snapshot_bar (docked above the canvas) to
+        # avoid two independent controls driving the same engine state. This
+        # label still reflects whatever that bar selects.
         footer = QFrame(self)
         footer.setObjectName("reasoningFooter")
         footer_layout = QHBoxLayout(footer)
@@ -435,20 +422,6 @@ class NavigationReasoningWindow(QFrame):
         self._history_label = QLabel("No history")
         self._history_label.setObjectName("reasoningHistoryLabel")
         footer_layout.addWidget(self._history_label, 1)
-
-        self.step_back_button = QPushButton("‹")
-        self.step_forward_button = QPushButton("›")
-        for button in (self.step_back_button, self.step_forward_button):
-            button.setObjectName("historyStepButton")
-            button.setFixedSize(32, 28)
-            button.setVisible(False)
-            button.setEnabled(False)
-            # Repetition is owned by MainWindow so speed can ramp to 3x.
-            button.setAutoRepeat(False)
-        self.step_back_button.setToolTip("Previous snapshot (hold to accelerate)")
-        self.step_forward_button.setToolTip("Next snapshot (hold to accelerate)")
-        footer_layout.addWidget(self.step_back_button)
-        footer_layout.addWidget(self.step_forward_button)
         root.addWidget(footer)
 
         # Compatibility hook used by a few existing tests and external debug
@@ -465,20 +438,6 @@ class NavigationReasoningWindow(QFrame):
         self._history_label.setText("No history")
         self._decision_badge.setText("—")
         self._explanation_label.setText("No navigation decisions captured yet.")
-
-    def set_history_controls(
-        self,
-        *,
-        visible: bool,
-        back_enabled: bool,
-        forward_enabled: bool,
-    ) -> None:
-        """Reflect engine-owned history state without owning navigation logic."""
-        visible = bool(visible)
-        self.step_back_button.setVisible(visible)
-        self.step_forward_button.setVisible(visible)
-        self.step_back_button.setEnabled(visible and bool(back_enabled))
-        self.step_forward_button.setEnabled(visible and bool(forward_enabled))
 
     def _set_decision_accent(self, tracking_mode: str, decision_kind: str) -> None:
         text = f"{tracking_mode} {decision_kind}".upper()

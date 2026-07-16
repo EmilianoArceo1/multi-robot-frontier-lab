@@ -1,108 +1,217 @@
 """
-Tests for fire hazard placement: add/remove via engine methods (the canvas
-click-routing itself is a thin Qt signal, exercised only implicitly here),
-and the belief-map/mapped_obstacle_points effect.
+Tests for fire hazard placement through the engine's public entry points --
+add_fire()/remove_fire_near()/on_fire_toggle_requested() (SimulationController
+Mixin) -- against the current layered architecture:
+
+    BeliefMap.grid        logical UNKNOWN/FREE/OCCUPIED occupancy
+    HazardField            a separate continuous thermal layer, rasterized
+                            from FireSource objects, that never writes to
+                            BeliefMap.grid (see HazardField's module
+                            docstring)
+
+The previous version of this file tested an obsolete contract where adding a
+fire wrote OCCUPIED cells into the belief map via mapped_obstacle_points /
+_fire_obstacle_cluster_points -- that mechanism no longer exists. Do not
+reintroduce it: hazards are a rendering/planning-time overlay, not sensed
+occupancy.
+
+Pure-HazardField mechanics (sources()/values(), independent removal,
+restore_sources()) live in test_hazard_field.py. Hazard-vs-planning-grid
+projection lives in test_planning_costmap_hazard.py. Hazard state surviving
+navigation-debug snapshot restore lives in test_navigation_snapshot_restore.py.
+This file covers only the engine-level add/remove/toggle entry points and
+their side effects (or deliberate lack thereof) on occupancy, the canvas
+push, and frontier detection.
 """
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-from robotics_sim.environment.belief_map import BeliefMap
+from robotics_sim.environment.belief_map import BeliefMap, FREE, OCCUPIED, UNKNOWN
+from robotics_sim.planning.exploration_planners import _frontier_cells
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.navigation_modes import is_goal_seeking_planner
 
+_BOUNDS = (-10.0, 10.0, -10.0, 10.0)
+_RESOLUTION = 0.5
 
-def _build_fake_engine() -> SimpleNamespace:
-    belief = BeliefMap(bounds=(-10.0, 10.0, -10.0, 10.0), resolution=0.5, robot_count=1)
+
+def _build_fake_engine(*, running: bool = False) -> SimpleNamespace:
+    belief = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1)
     fake = SimpleNamespace(
-        config=SimpleNamespace(grid_resolution=0.5),
-        mapped_obstacle_points=[],
-        mapped_obstacle_point_keys=set(),
-        fires=[],
-        fire_points_by_fire=[],
-        simulation_time=1.0,
+        config=SimpleNamespace(
+            grid_resolution=_RESOLUTION,
+            agent_mode="Single Robot Mode",
+            planner_type="Direct",
+        ),
         belief_map=belief,
+        running=running,
+        robots=[],
+        robot=None,
         status_messages=[],
+        hazard_snapshots=[],
     )
-    fake.ensure_belief_map = lambda: belief
     fake.canvas = SimpleNamespace(
-        set_fires=lambda fires: fake.status_messages.append(("fires", list(fires))),
-        set_mapped_obstacle_points=lambda pts: None,
-        invalidate_mapped_points_cache=lambda: None,
-        set_status=lambda msg: fake.status_messages.append(("status", msg)),
+        set_status=lambda msg: fake.status_messages.append(msg),
+        set_hazard_snapshot=lambda snapshot: fake.hazard_snapshots.append(snapshot),
     )
     for name in (
-        "_fire_obstacle_cluster_points",
+        "ensure_belief_map",
+        "ensure_hazard_service",
+        "push_hazard_snapshot",
         "add_fire",
         "remove_fire_near",
         "on_fire_toggle_requested",
+        "_replan_routes_affected_by_hazard",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
-    fake.FIRE_HIT_RADIUS_M = SimulationControllerMixin.FIRE_HIT_RADIUS_M
     return fake
 
 
-def test_add_fire_marks_belief_map_occupied_and_records_center():
+# ---------------------------------------------------------------------------
+# 1-2. Occupancy is never touched by add/remove -- hazards are a separate
+# layer (see HazardField's module docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_add_fire_does_not_modify_belief_map_grid():
     fake = _build_fake_engine()
+    grid_before = fake.belief_map.grid.copy()
 
-    fake.add_fire(2.0, 3.0)
+    ok = fake.add_fire(2.0, 3.0)
 
-    assert fake.fires == [(2.0, 3.0)]
-    assert len(fake.mapped_obstacle_points) > 0
-    # The belief cell at the fire's own center must now read OCCUPIED --
-    # the same mechanism a real sensed obstacle uses.
-    assert fake.belief_map.cell_state((2.0, 3.0)) == fake.belief_map.grid[
-        fake.belief_map.world_to_cell((2.0, 3.0))
-    ]
+    assert ok is True
+    assert (fake.belief_map.grid == grid_before).all()
 
 
-def test_remove_fire_near_clears_points_and_frees_belief_cells():
+def test_remove_fire_does_not_modify_belief_map_grid():
     fake = _build_fake_engine()
     fake.add_fire(2.0, 3.0)
-    assert fake.mapped_obstacle_points
+    grid_before = fake.belief_map.grid.copy()
 
-    removed = fake.remove_fire_near(2.05, 2.97)  # close enough to hit it
+    removed = fake.remove_fire_near(2.0, 3.0)
 
     assert removed is True
-    assert fake.fires == []
-    assert fake.mapped_obstacle_points == []
-    assert fake.mapped_obstacle_point_keys == set()
+    assert (fake.belief_map.grid == grid_before).all()
 
 
-def test_remove_fire_near_returns_false_when_nothing_within_hit_radius():
+# ---------------------------------------------------------------------------
+# 3-4. A cell's occupancy state (whatever it already was) is unaffected by
+# a fire existing on top of it, before or after removal.
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_cell_stays_unknown_after_fire_add_and_remove():
     fake = _build_fake_engine()
-    fake.add_fire(2.0, 3.0)
+    point = (2.0, 3.0)
+    assert fake.belief_map.cell_state(point) == UNKNOWN
 
-    removed = fake.remove_fire_near(8.0, 8.0)
+    fake.add_fire(*point)
+    assert fake.belief_map.cell_state(point) == UNKNOWN
 
-    assert removed is False
-    assert len(fake.fires) == 1
+    fake.remove_fire_near(*point)
+    assert fake.belief_map.cell_state(point) == UNKNOWN
 
 
-def test_toggle_adds_then_removes_same_spot():
+def test_real_occupied_cell_stays_occupied_after_fire_add_and_remove():
     fake = _build_fake_engine()
+    point = (2.0, 3.0)
+    row, col = fake.belief_map.world_to_cell(point)
+    fake.belief_map.grid[row, col] = OCCUPIED
+    assert fake.belief_map.cell_state(point) == OCCUPIED
 
-    fake.on_fire_toggle_requested(1.0, 1.0)
-    assert len(fake.fires) == 1
+    fake.add_fire(*point)
+    assert fake.belief_map.cell_state(point) == OCCUPIED
 
-    fake.on_fire_toggle_requested(1.0, 1.0)
-    assert fake.fires == []
+    fake.remove_fire_near(*point)
+    assert fake.belief_map.cell_state(point) == OCCUPIED
 
 
-def test_two_fires_are_independently_removable():
+# ---------------------------------------------------------------------------
+# 9. Two fires are independently removable through the engine entry point
+# (see test_hazard_field.py for the equivalent pure-HazardField case).
+# ---------------------------------------------------------------------------
+
+
+def test_two_fires_are_independently_removable_through_the_engine():
     fake = _build_fake_engine()
     fake.add_fire(1.0, 1.0)
     fake.add_fire(5.0, 5.0)
+    service = fake.ensure_hazard_service()
+    assert len(service.field.sources()) == 2
 
     assert fake.remove_fire_near(1.0, 1.0) is True
-    assert fake.fires == [(5.0, 5.0)]
+    remaining = [s.position for s in service.field.sources()]
+    assert remaining == [(5.0, 5.0)]
+
     assert fake.remove_fire_near(5.0, 5.0) is True
-    assert fake.fires == []
+    assert service.field.sources() == ()
+
+
+def test_toggle_adds_then_removes_the_same_spot():
+    fake = _build_fake_engine()
+    service = fake.ensure_hazard_service()
+
+    fake.on_fire_toggle_requested(1.0, 1.0)
+    assert len(service.field.sources()) == 1
+
+    fake.on_fire_toggle_requested(1.0, 1.0)
+    assert service.field.sources() == ()
+
+
+# ---------------------------------------------------------------------------
+# 10. The canvas receives an updated thermal snapshot on every change.
+# ---------------------------------------------------------------------------
+
+
+def test_canvas_receives_the_updated_hazard_snapshot_on_add_and_remove():
+    fake = _build_fake_engine()
+
+    fake.add_fire(2.0, 3.0)
+    assert fake.hazard_snapshots, "push_hazard_snapshot() must run after add_fire()"
+    latest = fake.hazard_snapshots[-1]
+    assert len(latest["sources"]) == 1
+    assert latest["sources"][0].position == (2.0, 3.0)
+    version_after_add = latest["version"]
+
+    fake.remove_fire_near(2.0, 3.0)
+    latest = fake.hazard_snapshots[-1]
+    assert latest["sources"] == ()
+    assert latest["version"] > version_after_add
+
+
+# ---------------------------------------------------------------------------
+# 12. Frontier detection reads only BeliefMap -- a hazard change alone must
+# never change its result. _frontier_cells() is the real production
+# function (robotics_sim.planning.exploration_planners), imported read-only
+# here, not reimplemented.
+# ---------------------------------------------------------------------------
+
+
+def test_frontier_detection_is_unaffected_by_a_hazard_change():
+    fake = _build_fake_engine()
+    belief = fake.belief_map
+    # Build one FREE cell next to UNKNOWN neighbors -- a frontier cell.
+    free_point = (0.0, 0.0)
+    row, col = belief.world_to_cell(free_point)
+    belief.grid[row, col] = FREE
+
+    frontiers_before = _frontier_cells(belief)
+    assert (row, col) in frontiers_before
+
+    fake.add_fire(*free_point)
+    frontiers_with_fire = _frontier_cells(belief)
+    assert frontiers_with_fire == frontiers_before
+
+    fake.remove_fire_near(*free_point)
+    frontiers_after_remove = _frontier_cells(belief)
+    assert frontiers_after_remove == frontiers_before
 
 
 # ---------------------------------------------------------------------------
 # Click routing: exploration mode -> fire, goal seeking -> goal (pure logic
 # the canvas branches on -- see simulation_canvas.py's mousePressEvent).
+# Unrelated to the occupancy-vs-hazard contract, kept as-is.
 # ---------------------------------------------------------------------------
 
 

@@ -28,7 +28,10 @@ class _FakeRobot(SimpleNamespace):
 
 def _build_fake_engine() -> SimpleNamespace:
     position = (0.0, 0.0)
-    robot = _FakeRobot(x=position[0], y=position[1], theta=0.0, v=0.0)
+    # vision=... is required by _finalize_navigation_debug_snapshot()'s
+    # sensor-polygon capture (see NavigationDebugSnapshot.sensor); config.
+    # vision_model/obstacles feed the same call.
+    robot = _FakeRobot(x=position[0], y=position[1], theta=0.0, v=0.0, vision=5.0)
     agent = RobotAgent(robot_id=0, position=position, planner_mode="FoV-aware directional frontier")
 
     fake = SimpleNamespace(
@@ -41,6 +44,8 @@ def _build_fake_engine() -> SimpleNamespace:
             exploration_planner="FoV-aware directional frontier",
             goal_tolerance=0.25,
             grid_resolution=0.5,
+            vision_model="LiDAR",
+            obstacles=[],
         ),
         mapped_obstacle_points=[],
         current_exploration_target=None,
@@ -76,7 +81,15 @@ def _build_fake_engine() -> SimpleNamespace:
     fake.navigation_debug_log = NavigationDebugEventLog(max_size=10)
     fake._nav_debug_last_accepted_plan = None
 
-    for name in ("apply_route_result", "_finalize_navigation_debug_snapshot", "log_route_assignment"):
+    for name in (
+        "apply_route_result",
+        "_finalize_navigation_debug_snapshot",
+        "log_route_assignment",
+        "_navigation_debug_belief_frame",
+        "_navigation_debug_hazard_frame",
+        "_navigation_debug_agent_state_frame",
+        "_navigation_debug_metrics_frame",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     return fake
 

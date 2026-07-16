@@ -77,6 +77,10 @@ class HazardField:
     def version(self) -> int:
         return int(self._version)
 
+    @property
+    def next_fire_id(self) -> int:
+        return int(self._next_fire_id)
+
     def in_bounds_world(self, position: tuple[float, float]) -> bool:
         return self.geometry.in_bounds_world(float(position[0]), float(position[1]))
 
@@ -158,6 +162,25 @@ class HazardField:
         if source is None:
             return None
         return self.remove_fire(source.fire_id)
+
+    def restore_sources(self, sources: Iterable[FireSource], *, next_fire_id: int) -> None:
+        """Replace every source with an exact prior set and rebuild the
+        continuous field from them -- used by navigation-debug snapshot
+        restore (see engine.restore_navigation_debug_snapshot()) to roll
+        hazards back to what they were at a past tick.
+
+        Bounds/resolution are unchanged (a run never resizes them mid-way);
+        only which fires exist and their footprint changes. `next_fire_id`
+        is restored too so a fire added immediately after gets the id it
+        would have received at that point in time, not one collided with /
+        skipped ahead by fires that existed only in the discarded future.
+        Bumps `version` via `_rebuild()`, same as add_fire()/remove_fire()
+        -- callers relying on version-keyed caches (e.g. the canvas's hazard
+        heatmap pixmap) invalidate automatically.
+        """
+        self._sources = {int(source.fire_id): source for source in sources}
+        self._next_fire_id = max(1, int(next_fire_id))
+        self._rebuild()
 
     def clear(self) -> bool:
         if not self._sources and not np.any(self._values):

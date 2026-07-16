@@ -52,3 +52,17 @@ class NavigationDebugEventLog:
         if 0 <= index < len(self._events):
             return self._events[index]
         return None
+
+    def truncate_after(self, index: int) -> None:
+        """Drop every event after `index`, keeping [0, index] inclusive.
+
+        Used by engine.restore_navigation_debug_snapshot(): once the live
+        simulation is rewound to a past snapshot, the events recorded after
+        it describe a future that no longer happens, so they must not
+        remain scrubbable.
+        """
+        if index < 0:
+            self._events.clear()
+            return
+        kept = list(self._events)[: index + 1]
+        self._events = deque(kept, maxlen=self._events.maxlen)

@@ -112,9 +112,14 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self._nav_debug_pending_plan_capture_by_robot: dict[int, object] = {}
 
         # Press-and-hold history scrubbing. The first press moves one frame,
-        # then a single-shot timer repeats with a smooth 1x -> 3x ramp.
+        # then a single-shot timer repeats with a smooth 1x -> 20x ramp.
+        # _nav_history_scrub_current_multiplier is the ramp value the *last*
+        # step was taken at (1.0 while idle) -- read by update_navigation_
+        # debug_step_buttons() so the snapshot bar's counter can show "x4"
+        # etc. without a second timer/state machine of its own.
         self._nav_history_scrub_direction = 0
         self._nav_history_scrub_started_at = 0.0
+        self._nav_history_scrub_current_multiplier = 1.0
         self._nav_history_scrub_initial_delay_ms = 320
         self._nav_history_scrub_base_interval_ms = 180
         self._nav_history_scrub_ramp_seconds = 1.8
@@ -144,6 +149,14 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         # to be visible. That previously hid the whole side column and made the
         # gear-menu action unable to recover it.
         self._configuration_panel_visible = True
+        # Deliberately independent of navigation_debug_enabled (see
+        # on_navigation_reasoning_panel_visibility_toggled() /
+        # on_navigation_debug_toggled()): the Navigation switch controls
+        # capture, the gear-menu "Navigation Reasoning" action controls only
+        # whether the docked panel/tab is shown. Neither one drives the
+        # other -- closing the panel must not stop capture, and toggling
+        # capture off must not change which panel tab is selected.
+        self._navigation_reasoning_panel_visible = False
 
         # Simulation clock and speed multiplier. The GUI still targets 60 FPS;
         # this multiplier changes simulated dt, not the QTimer interval.
@@ -289,25 +302,17 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas.editor_obstacle_move_started.connect(self.push_editor_undo_state)
         self.canvas.editor_obstacle_moved.connect(self.on_editor_obstacle_moved)
         self.canvas.editor_view_changed.connect(self.refresh_editor_status_label)
-        self.canvas.navigationDebugToggleRequested.connect(self.on_navigation_debug_eye_clicked)
         self.canvas.fireToggleRequested.connect(self.on_fire_toggle_requested)
         self._build_canvas_action_bar()
+        self._build_navigation_snapshot_bar()
 
         self.navigation_reasoning_window = NavigationReasoningWindow(self)
+        # Closing the docked panel only hides it -- it must never disable
+        # capture (see on_navigation_reasoning_panel_visibility_toggled()).
+        # History stepping itself lives solely in navigation_snapshot_bar
+        # now; the panel no longer owns its own `‹`/`›` buttons.
         self.navigation_reasoning_window.closeRequested.connect(
-            lambda: self.on_navigation_debug_toggled(False)
-        )
-        self.navigation_reasoning_window.step_back_button.pressed.connect(
-            lambda: self.start_navigation_history_scrub(-1)
-        )
-        self.navigation_reasoning_window.step_back_button.released.connect(
-            self.stop_navigation_history_scrub
-        )
-        self.navigation_reasoning_window.step_forward_button.pressed.connect(
-            lambda: self.start_navigation_history_scrub(1)
-        )
-        self.navigation_reasoning_window.step_forward_button.released.connect(
-            self.stop_navigation_history_scrub
+            lambda: self.on_navigation_reasoning_panel_visibility_toggled(False)
         )
         self.canvas.set_navigation_reasoning_window(self.navigation_reasoning_window)
 
@@ -352,7 +357,15 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.config_panel_stack.setVisible(True)
         self.navigation_reasoning_window.hide()
 
-        body_layout.addWidget(self.canvas, 1)
+        canvas_column = QWidget()
+        canvas_column.setObjectName("canvasColumn")
+        canvas_column_layout = QVBoxLayout(canvas_column)
+        canvas_column_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_column_layout.setSpacing(8)
+        canvas_column_layout.addWidget(self.navigation_snapshot_bar)
+        canvas_column_layout.addWidget(self.canvas, 1)
+
+        body_layout.addWidget(canvas_column, 1)
         body_layout.addWidget(self.side_panel_container, 0)
 
         outer.addWidget(body, 1)
@@ -412,6 +425,177 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas_action_bar = bar
         self.canvas.set_action_bar(bar)
 
+    def _build_navigation_snapshot_bar(self) -> None:
+        """Primary Navigation Debug control, docked above the canvas header.
+
+        Replaces the old canvas-painted eye icon as the activator: a real
+        ToggleSwitch (navigation_snapshot_switch) is the single place that
+        turns capture on/off. `<`/`>` (navigation_snapshot_back/forward_
+        button) reuse the same press/hold acceleration timer as the docked
+        reasoning panel's legacy footer buttons -- start/stop_navigation_
+        history_scrub() -- so both controls always agree. update_navigation_
+        debug_step_buttons() (engine.py) owns all of this bar's enabled
+        state and counter text via update_state(); this method only builds
+        the widgets and wires the raw Qt signals.
+        """
+        bar = QFrame()
+        bar.setObjectName("navigationSnapshotBar")
+        bar.setFixedHeight(46)
+        bar.setStyleSheet(
+            f"""
+            QFrame#navigationSnapshotBar {{
+                background: {CARD};
+                border: 1px solid {BORDER};
+                border-radius: 10px;
+            }}
+            QLabel#navigationSnapshotLabel {{
+                color: {TEXT};
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QLabel#navigationSnapshotCounter {{
+                color: {TEXT};
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton#navigationSnapshotStepButton {{
+                background: {CARD};
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                color: {TEXT};
+                font-size: 13px;
+                font-weight: 900;
+            }}
+            QPushButton#navigationSnapshotStepButton:hover:enabled {{
+                border-color: {BLUE};
+                background: {BLUE_LIGHT};
+                color: {BLUE};
+            }}
+            QPushButton#navigationSnapshotStepButton:disabled {{
+                color: rgba(90,100,110,0.30);
+                background: #F2F3F5;
+            }}
+            QPushButton#navigationSnapshotResumeButton {{
+                background: {MAROON};
+                border: none;
+                border-radius: 7px;
+                color: white;
+                font-size: 11px;
+                font-weight: 800;
+                padding: 0 12px;
+            }}
+            QPushButton#navigationSnapshotResumeButton:hover:enabled {{
+                background: {MAROON_DARK};
+            }}
+            QPushButton#navigationSnapshotResumeButton:disabled {{
+                background: #E5E7EB;
+                color: rgba(90,100,110,0.55);
+            }}
+            """
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(8)
+
+        label = QLabel("Navigation")
+        label.setObjectName("navigationSnapshotLabel")
+        layout.addWidget(label)
+
+        self.navigation_snapshot_switch = ToggleSwitch(checked=False)
+        self.navigation_snapshot_switch.setToolTip("Enable Navigation Debug capture")
+        self.navigation_snapshot_switch.toggled.connect(self.on_navigation_debug_toggled)
+        layout.addWidget(self.navigation_snapshot_switch)
+
+        layout.addSpacing(10)
+
+        self.navigation_snapshot_back_button = QPushButton("<")
+        self.navigation_snapshot_forward_button = QPushButton(">")
+        for button in (self.navigation_snapshot_back_button, self.navigation_snapshot_forward_button):
+            button.setObjectName("navigationSnapshotStepButton")
+            button.setFixedSize(30, 30)
+            button.setEnabled(False)
+            # MainWindow owns press-and-hold acceleration (1x -> 20x) with a
+            # single timer -- see start/_continue/stop_navigation_history_
+            # scrub(). Qt's own fixed-rate autoRepeat is left off so one
+            # press cannot trigger two independent repeat loops.
+            button.setAutoRepeat(False)
+        self.navigation_snapshot_back_button.setToolTip("Previous snapshot (hold to accelerate)")
+        self.navigation_snapshot_forward_button.setToolTip("Next snapshot (hold to accelerate)")
+        self.navigation_snapshot_back_button.pressed.connect(lambda: self.start_navigation_history_scrub(-1))
+        self.navigation_snapshot_back_button.released.connect(self.stop_navigation_history_scrub)
+        self.navigation_snapshot_forward_button.pressed.connect(lambda: self.start_navigation_history_scrub(1))
+        self.navigation_snapshot_forward_button.released.connect(self.stop_navigation_history_scrub)
+        layout.addWidget(self.navigation_snapshot_back_button)
+
+        self.navigation_snapshot_counter_label = QLabel("OFF")
+        self.navigation_snapshot_counter_label.setObjectName("navigationSnapshotCounter")
+        self.navigation_snapshot_counter_label.setAlignment(Qt.AlignCenter)
+        self.navigation_snapshot_counter_label.setFixedWidth(88)
+        layout.addWidget(self.navigation_snapshot_counter_label)
+
+        layout.addWidget(self.navigation_snapshot_forward_button)
+
+        layout.addSpacing(10)
+
+        self.navigation_snapshot_resume_button = QPushButton("Resume from snapshot")
+        self.navigation_snapshot_resume_button.setObjectName("navigationSnapshotResumeButton")
+        self.navigation_snapshot_resume_button.setEnabled(False)
+        self.navigation_snapshot_resume_button.clicked.connect(self.on_resume_from_snapshot_clicked)
+        layout.addWidget(self.navigation_snapshot_resume_button)
+
+        layout.addStretch(1)
+
+        self.navigation_snapshot_bar = bar
+        self.navigation_snapshot_bar.update_state = self._update_navigation_snapshot_bar_state
+
+    def _update_navigation_snapshot_bar_state(
+        self,
+        *,
+        navigation_enabled: bool,
+        position: int | None,
+        total: int,
+        back_enabled: bool,
+        forward_enabled: bool,
+        multiplier: float,
+        resume_enabled: bool,
+        resume_reason: str,
+    ) -> None:
+        """The single place that turns engine-owned history state into the
+        bar's text/enabled state -- called from engine.update_navigation_
+        debug_step_buttons() so this widget never has to poll."""
+        self._set_action_checked_ish(self.navigation_snapshot_switch, navigation_enabled)
+
+        if not navigation_enabled:
+            counter_text = "OFF"
+        elif position is None:
+            counter_text = "LIVE"
+        else:
+            counter_text = f"{position + 1}/{total}"
+            if multiplier >= 2.0:
+                counter_text += f" · x{multiplier:.0f}"
+        self.navigation_snapshot_counter_label.setText(counter_text)
+
+        self.navigation_snapshot_back_button.setEnabled(bool(back_enabled))
+        self.navigation_snapshot_forward_button.setEnabled(bool(forward_enabled))
+
+        self.navigation_snapshot_resume_button.setEnabled(bool(resume_enabled))
+        self.navigation_snapshot_resume_button.setToolTip(
+            resume_reason or "Restore the simulation to this snapshot."
+        )
+
+    @staticmethod
+    def _set_action_checked_ish(switch, checked: bool) -> None:
+        if switch.isChecked() == bool(checked):
+            return
+        switch.blockSignals(True)
+        switch.setChecked(bool(checked))
+        switch.blockSignals(False)
+        switch.update()
+
+    def on_resume_from_snapshot_clicked(self) -> None:
+        self.restore_navigation_debug_snapshot()
+
     def build_config_panel(self):
         """Build the right-side simulation configuration panel."""
         return build_right_config_panel(self)
@@ -436,34 +620,86 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         button.raise_()
 
     def _build_panel_visibility_menu(self) -> None:
-        """Use the previously-unused top-bar gear as the panel selector."""
+        """Use the top-bar gear as the panel and file-action menu.
+
+        Snapshot export is deliberately placed before the scenario actions and
+        revalidated immediately before every popup.  This avoids a stale native
+        menu geometry hiding the last action after actions are appended during
+        window construction.
+        """
         self.panel_visibility_menu = QMenu(self)
+        self.panel_visibility_menu.setSeparatorsCollapsible(False)
 
         self.configuration_panel_action = QAction("Configuration", self)
+        self.configuration_panel_action.setObjectName("configurationPanelAction")
         self.configuration_panel_action.setCheckable(True)
         self.configuration_panel_action.setChecked(True)
         self.configuration_panel_action.toggled.connect(self.set_configuration_panel_visible)
         self.panel_visibility_menu.addAction(self.configuration_panel_action)
 
         self.navigation_reasoning_panel_action = QAction("Navigation Reasoning", self)
+        self.navigation_reasoning_panel_action.setObjectName("navigationReasoningPanelAction")
         self.navigation_reasoning_panel_action.setCheckable(True)
         self.navigation_reasoning_panel_action.setChecked(False)
-        self.navigation_reasoning_panel_action.toggled.connect(self.on_navigation_debug_toggled)
+        # Visibility only -- see on_navigation_reasoning_panel_visibility_
+        # toggled()'s docstring. Capture is the Navigation switch's job.
+        self.navigation_reasoning_panel_action.toggled.connect(
+            self.on_navigation_reasoning_panel_visibility_toggled
+        )
         self.panel_visibility_menu.addAction(self.navigation_reasoning_panel_action)
 
         self.panel_visibility_menu.addSeparator()
+
+        # Keep export visible even with an empty log.  The handler already shows
+        # a useful "No snapshots" message, which is better UX than silently
+        # hiding the feature the user is trying to discover.
+        self.export_snapshots_action = QAction(
+            make_icon("save", TEXT), "Export snapshots to Excel…", self
+        )
+        self.export_snapshots_action.setObjectName("exportSnapshotsExcelAction")
+        self.export_snapshots_action.triggered.connect(self.export_navigation_snapshots)
+        self.panel_visibility_menu.addAction(self.export_snapshots_action)
+
+        self.panel_visibility_menu.addSeparator()
         self.load_sim_action = QAction(make_icon("reset", TEXT), "Load .sim…", self)
+        self.load_sim_action.setObjectName("loadSimulationAction")
         self.load_sim_action.triggered.connect(self.load_simulation_config)
         self.panel_visibility_menu.addAction(self.load_sim_action)
 
         self.save_sim_action = QAction(make_icon("save", TEXT), "Save .sim…", self)
+        self.save_sim_action.setObjectName("saveSimulationAction")
         self.save_sim_action.triggered.connect(self.save_simulation_config)
         self.panel_visibility_menu.addAction(self.save_sim_action)
 
-        self.top_bar.gear_button.setToolTip("Panels and simulation files")
+        self.panel_visibility_menu.aboutToShow.connect(
+            self._prepare_panel_visibility_menu
+        )
+        self.top_bar.gear_button.setToolTip("Panels and file actions")
         self.top_bar.gear_button.clicked.connect(self._show_panel_visibility_menu)
 
+    def _prepare_panel_visibility_menu(self) -> None:
+        """Guarantee that the export action is present and the popup is resized.
+
+        QMenu can cache native popup geometry.  Explicitly refreshing the action
+        and size before showing prevents a late-added final action from being
+        clipped or omitted by the platform menu implementation.
+        """
+        menu = self.panel_visibility_menu
+        actions = menu.actions()
+        if self.export_snapshots_action not in actions:
+            before = self.load_sim_action if self.load_sim_action in actions else None
+            if before is None:
+                menu.addAction(self.export_snapshots_action)
+            else:
+                menu.insertAction(before, self.export_snapshots_action)
+
+        self.export_snapshots_action.setVisible(True)
+        self.export_snapshots_action.setEnabled(True)
+        menu.ensurePolished()
+        menu.adjustSize()
+
     def _show_panel_visibility_menu(self) -> None:
+        self._prepare_panel_visibility_menu()
         button = self.top_bar.gear_button
         position = button.mapToGlobal(button.rect().bottomLeft())
         self.panel_visibility_menu.exec(position)
@@ -535,7 +771,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             and config_stack is not None
         )
         reasoning_visible = bool(
-            getattr(self, "navigation_debug_enabled", False)
+            getattr(self, "_navigation_reasoning_panel_visible", False)
             and reasoning is not None
         )
 
@@ -563,10 +799,10 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
     @staticmethod
     def navigation_history_scrub_multiplier(elapsed_seconds: float, ramp_seconds: float = 1.8) -> float:
-        """Smoothly ramp hold-to-scrub speed from 1x to a hard 3x cap."""
+        """Smoothly ramp hold-to-scrub speed from 1x to a hard 20x cap."""
         elapsed = max(0.0, float(elapsed_seconds))
         ramp = max(1e-6, float(ramp_seconds))
-        return min(3.0, 1.0 + 2.0 * min(1.0, elapsed / ramp))
+        return min(20.0, 1.0 + 19.0 * min(1.0, elapsed / ramp))
 
     def start_navigation_history_scrub(self, direction: int) -> None:
         direction = -1 if int(direction) < 0 else 1
@@ -575,6 +811,9 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.stop_navigation_history_scrub()
         self._nav_history_scrub_direction = direction
         self._nav_history_scrub_started_at = time.perf_counter()
+        # The first press always moves exactly one frame at 1x -- the ramp
+        # only applies to the repeats a sustained hold triggers below.
+        self._nav_history_scrub_current_multiplier = 1.0
         self.step_navigation_debug_history(direction)
         self._nav_history_scrub_timer.start(self._nav_history_scrub_initial_delay_ms)
 
@@ -584,11 +823,17 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             self.stop_navigation_history_scrub()
             return
 
-        self.step_navigation_debug_history(direction)
         elapsed = time.perf_counter() - float(self._nav_history_scrub_started_at)
         multiplier = self.navigation_history_scrub_multiplier(
             elapsed, self._nav_history_scrub_ramp_seconds
         )
+        # Stored before stepping (not a fixed interval) so update_navigation_
+        # debug_step_buttons() -- called from inside step_navigation_debug_
+        # history() below -- picks up the multiplier this exact step is
+        # taken at, and the snapshot bar's "current/total · xN" counter
+        # reflects the real ramped speed rather than a guessed one.
+        self._nav_history_scrub_current_multiplier = multiplier
+        self.step_navigation_debug_history(direction)
         interval_ms = max(20, int(round(self._nav_history_scrub_base_interval_ms / multiplier)))
         self._nav_history_scrub_timer.start(interval_ms)
 
@@ -597,6 +842,10 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         if timer is not None:
             timer.stop()
         self._nav_history_scrub_direction = 0
+        self._nav_history_scrub_current_multiplier = 1.0
+        updater = getattr(self, "update_navigation_debug_step_buttons", None)
+        if callable(updater):
+            updater()
 
     def read_config(self) -> SimulationConfig:
         """Read GUI configuration and preserve editor camera settings."""
@@ -881,41 +1130,44 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         exclusion from locked_during_run_widgets in config_panel.py)."""
         self.canvas.set_grid_overlay_enabled(bool(enabled))
 
-    def on_navigation_debug_eye_clicked(self) -> None:
-        """The canvas eye icon only emits navigationDebugToggleRequested
-        (never decides state itself, same as goalClicked) -- this reads the
-        current state and flips it, so there is exactly one control (the
-        eye icon) and exactly one place that decides the new value."""
-        self.on_navigation_debug_toggled(not self.navigation_debug_enabled)
-
     def on_navigation_debug_toggled(self, enabled: bool) -> None:
-        """Enable capture and show/hide the embedded reasoning panel."""
+        """Enable/disable navigation-debug capture -- and *only* capture.
+
+        Driven exclusively by navigation_snapshot_switch now. Deliberately
+        does not touch panel/tab visibility in either direction: turning
+        capture off must not change which side-panel tab is selected (see
+        on_navigation_reasoning_panel_visibility_toggled(), the menu
+        action's handler, which owns that independently).
+        """
         enabled = bool(enabled)
         self.navigation_debug_enabled = enabled
         self.canvas.set_navigation_debug_enabled(enabled)
-        self._set_action_checked(
-            getattr(self, "navigation_reasoning_panel_action", None), enabled
-        )
-
-        panel = getattr(self, "navigation_reasoning_window", None)
 
         if not enabled:
             self.stop_navigation_history_scrub()
             self.resume_navigation_debug_live_view()
 
         self.update_navigation_debug_step_buttons()
+
+    def on_navigation_reasoning_panel_visibility_toggled(self, visible: bool) -> None:
+        """Show/hide the docked Navigation Reasoning tab -- and *only*
+        visibility. Driven by the gear-menu "Navigation Reasoning" action
+        and the panel's own close button. Never touches navigation_debug_
+        enabled: closing this panel must not stop capture (see
+        on_navigation_debug_toggled(), the switch's handler, which owns
+        capture independently)."""
+        visible = bool(visible)
+        self._navigation_reasoning_panel_visible = visible
+        self._set_action_checked(
+            getattr(self, "navigation_reasoning_panel_action", None), visible
+        )
         self._sync_side_panel_layout()
-        if enabled:
+        if visible:
             tabs = getattr(self, "side_panel_tabs", None)
+            panel = getattr(self, "navigation_reasoning_window", None)
             if tabs is not None and panel is not None and tabs.indexOf(panel) >= 0:
                 tabs.setCurrentWidget(panel)
         QTimer.singleShot(0, self._sync_side_panel_layout)
-
-    def on_navigation_debug_step_back(self) -> None:
-        self.step_navigation_debug_history(-1)
-
-    def on_navigation_debug_step_forward(self) -> None:
-        self.step_navigation_debug_history(1)
 
     def move_robot_from_canvas(self, index: int, x: float, y: float) -> None:
         if self.running or self.robot is not None or bool(getattr(self, "robots", [])):
@@ -1988,4 +2240,3 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             height: 0px;
         }}
         """
-

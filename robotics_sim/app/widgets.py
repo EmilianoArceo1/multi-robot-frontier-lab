@@ -420,11 +420,6 @@ class HeroHeader(QWidget):
         self.image_path = image_path
         self.pixmap = QPixmap(image_path) if image_path else QPixmap()
 
-        if image_path:
-            print(
-                f"HEADER IMAGE LOAD: {image_path} | isNull={self.pixmap.isNull()}",
-                flush=True,
-            )
 
     def paintEvent(self, event):
         painter = QPainter(self)

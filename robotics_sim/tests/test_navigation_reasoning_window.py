@@ -6,7 +6,9 @@ Tests for:
   calling apply_route_result(), so planner/simplifier stay available after
   the first (synchronous) route once replanning-during-motion (always
   async for a non-Direct planner) takes over;
-- the </> buttons' hold-to-repeat (Qt autoRepeat) configuration.
+- the panel no longer owning its own `<`/`>` history-step buttons -- that
+  control now lives solely in main_window's navigation_snapshot_bar (see
+  test_navigation_panel_controls.py for its hold-to-repeat behavior).
 """
 from __future__ import annotations
 
@@ -50,14 +52,68 @@ def test_reasoning_window_shows_placeholder_with_no_snapshot():
 
 
 # ---------------------------------------------------------------------------
-# Hold-to-repeat.
+# No duplicate step controls: the panel keeps only the passive history
+# label (still driven by update_snapshot()'s history_position argument);
+# stepping itself belongs exclusively to navigation_snapshot_bar.
 # ---------------------------------------------------------------------------
 
 
-def test_step_buttons_have_auto_repeat_enabled():
+def test_reasoning_window_has_no_step_buttons_of_its_own():
+    window = NavigationReasoningWindow()
+    assert not hasattr(window, "step_back_button")
+    assert not hasattr(window, "step_forward_button")
+    assert not hasattr(window, "set_history_controls")
+
+
+def test_canvas_has_no_history_step_buttons_of_its_own():
     canvas = SimulationCanvas()
-    assert canvas.navigation_debug_step_back_button.autoRepeat() is True
-    assert canvas.navigation_debug_step_forward_button.autoRepeat() is True
+    assert not hasattr(canvas, "navigation_debug_step_back_button")
+    assert not hasattr(canvas, "navigation_debug_step_forward_button")
+
+
+def test_reasoning_window_history_label_still_reflects_history_position():
+    window = NavigationReasoningWindow()
+    snapshot = SimpleNamespace(
+        controller=SimpleNamespace(
+            desired_heading=SimpleNamespace(unavailable=True, value=None),
+            heading_error=SimpleNamespace(unavailable=True, value=None),
+            nominal_control=SimpleNamespace(unavailable=True, value=None),
+            applied_control=SimpleNamespace(unavailable=True, value=None),
+            distance_to_goal=SimpleNamespace(unavailable=True, value=None),
+            v=0.0,
+            acceleration=0.0,
+            omega=0.0,
+        ),
+        tracking_mode="TRACK",
+        decision_kind="FOLLOW_PATH",
+        robot_id="R1",
+        simulation_time=1.0,
+        snapshot_id=3,
+        explanation="",
+        decision_reason="",
+        robot_pose=SimpleNamespace(x=0.0, y=0.0, theta=0.0),
+        rotate_threshold=SimpleNamespace(unavailable=True, value=None),
+        path=SimpleNamespace(
+            active_waypoint_index=None,
+            planner_name=SimpleNamespace(unavailable=True, value=None),
+            simplifier_name=SimpleNamespace(unavailable=True, value=None),
+        ),
+        route=SimpleNamespace(first_segment=SimpleNamespace(unavailable=True, value=None)),
+        safety=SimpleNamespace(
+            active_segment=SimpleNamespace(unavailable=True, value=None),
+            robot_radius=0.2,
+            safety_radius=0.3,
+        ),
+        predicted_motion=SimpleNamespace(collision=SimpleNamespace(unavailable=True, value=None)),
+        mapped_obstacle_points_count=0,
+        navigation_state="moving",
+    )
+
+    # history_position's first element is already 1-based (see
+    # engine._push_navigation_debug_history_view()'s index + 1).
+    window.update_snapshot(snapshot, None, (3, 10))
+
+    assert "3 of 10" in window._history_label.text()
 
 
 # ---------------------------------------------------------------------------

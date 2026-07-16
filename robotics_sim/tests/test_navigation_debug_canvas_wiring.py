@@ -196,36 +196,20 @@ def test_full_paint_event_with_navigation_debug_enabled_does_not_crash():
 
 
 # ---------------------------------------------------------------------------
-# History step buttons: real Qt child widgets of the canvas, always visible
-# (not scrolled away in the side panel), disabled until both the layer is
-# on and the simulation is paused (engine.py's update_navigation_debug_step_
-# buttons() owns the enabling; this only covers placement/existence).
+# History stepping has exactly one control now: main_window's
+# navigation_snapshot_bar, docked above the canvas (see
+# _build_navigation_snapshot_bar() / test_navigation_panel_controls.py).
+# The canvas itself no longer owns any `<`/`>` step buttons -- there used to
+# be a second, redundant pair of real Qt child widgets here, which meant two
+# independent controls could drive the same engine history state.
 # ---------------------------------------------------------------------------
 
 
-def test_history_step_buttons_exist_and_are_disabled_by_default():
+def test_canvas_has_no_history_step_buttons_of_its_own():
     canvas = _make_canvas()
 
-    assert canvas.navigation_debug_step_back_button.parent() is canvas
-    assert canvas.navigation_debug_step_forward_button.parent() is canvas
-    # isVisible() reflects the whole ancestor chain (false here since the
-    # test never .show()s the canvas itself, by convention); isHidden()
-    # reflects only this widget's own explicit visibility flag.
-    assert canvas.navigation_debug_step_back_button.isHidden() is False
-    assert canvas.navigation_debug_step_forward_button.isHidden() is False
-    assert canvas.navigation_debug_step_back_button.isEnabled() is False
-    assert canvas.navigation_debug_step_forward_button.isEnabled() is False
-
-
-def test_history_step_buttons_stay_within_canvas_bounds_after_resize():
-    canvas = _make_canvas(width=500, height=400)
-    canvas.resize(300, 250)
-
-    back = canvas.navigation_debug_step_back_button
-    forward = canvas.navigation_debug_step_forward_button
-    assert 0 <= back.x() < canvas.width()
-    assert 0 <= forward.x() < canvas.width()
-    assert forward.x() > back.x(), "forward (>) stays to the right of back (<)"
+    assert not hasattr(canvas, "navigation_debug_step_back_button")
+    assert not hasattr(canvas, "navigation_debug_step_forward_button")
 
 
 def test_simulation_canvas_imports_no_concrete_algorithms():

@@ -49,6 +49,10 @@ from robotics_sim.simulation.robot_trace import (
     slug_route_failure_reason,
 )
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
+from robotics_sim.diagnostics.snapshot_export import (
+    SnapshotExportError,
+    export_navigation_snapshots_xlsx,
+)
 from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
@@ -107,9 +111,12 @@ from robotics_sim.diagnostics.event_log import (
     NavigationDebugEventLog,
 )
 from robotics_sim.diagnostics.navigation_snapshot import (
+    AgentStateDebug,
     BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
+    HazardDebug,
+    HazardSourceDebug,
     Maybe,
     NavigationDebugSnapshot,
     PathDebug,
@@ -117,9 +124,11 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     Pose,
     PredictedMotionDebug,
     RouteValidationDebug,
+    RuntimeMetricsDebug,
     SafetyDebug,
     SensorDebug,
 )
+from robotics_sim.environment.hazard_field import FireSource
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
 # canvas's grid overlay. The belief grid can be large, and copying it more
@@ -957,6 +966,44 @@ class SimulationControllerMixin:
         self.reset_simulation()
         self.apply_config_to_widgets(config)
         self.canvas.set_status(f"Loaded scenario: {os.path.basename(path)}")
+
+    def export_navigation_snapshots(self) -> None:
+        """Export the immutable in-memory navigation history to one XLSX row per snapshot.
+
+        The exporter is dependency-free and copies the current ring-buffer contents
+        before writing, so the workbook is internally consistent even if a live run
+        continues producing new snapshots while the save dialog is open.
+        """
+        log = getattr(self, "navigation_debug_log", None)
+        events = tuple(log.events()) if log is not None else ()
+        if not events:
+            QMessageBox.information(
+                self,
+                "No snapshots",
+                "There are no navigation snapshots to export yet.",
+            )
+            return
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export navigation snapshots",
+            f"navigation_snapshots_{stamp}.xlsx",
+            "Excel workbooks (*.xlsx);;All files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            count = export_navigation_snapshots_xlsx(events, path)
+        except SnapshotExportError as exc:
+            QMessageBox.critical(self, "Snapshot export failed", str(exc))
+            return
+
+        final_path = path if path.lower().endswith(".xlsx") else f"{path}.xlsx"
+        self.canvas.set_status(
+            f"Exported {count} navigation snapshots: {os.path.basename(final_path)}"
+        )
 
     def final_goal_xy(self) -> tuple[float, float]:
         return (float(self.config.goal_x), float(self.config.goal_y))
@@ -2194,7 +2241,12 @@ class SimulationControllerMixin:
         # lambdas; apply_route_result() reads this back via getattr(). See
         # _finalize_navigation_debug_snapshot() docstring for the same
         # defensive getattr pattern.
-        debug_capture = PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None
+        #
+        # Always built now, regardless of navigation_debug_enabled: capture
+        # happens on every tick unconditionally, so history already has
+        # data by the time a user turns Navigation on mid-run (that switch
+        # now only gates the UI's browse/inspect/restore affordances).
+        debug_capture = PlanDebugCapture()
         result = self.call_compute_planned_waypoints(
             planner_kwargs,
             path_simplifier=self.config.path_simplifier,
@@ -2391,22 +2443,32 @@ class SimulationControllerMixin:
                     )
                     endpoint_reaches_goal_debug = not misses_intended_goal
 
-            # Navigation debug diagnostics only -- observational, never
-            # affects blocked_on_arrival/misses_intended_goal or any
-            # acceptance decision below. Off by default (see
-            # navigation_debug_enabled), and getattr-guarded so lightweight
-            # duck-typed engine fakes used elsewhere in the test suite (which
-            # do not set this attribute at all) are unaffected.
-            if getattr(self, "navigation_debug_enabled", False):
-                nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
-                if first_segment_report is not None:
-                    nav_capture.first_segment = clearance_terms_from_report(
-                        first_segment_report,
-                        checker="check_segment_points",
-                        required_clearance=self.safety_radius(),
-                    )
-                nav_capture.endpoint_reaches_goal = endpoint_reaches_goal_debug
-                self._finalize_navigation_debug_snapshot(
+            # Navigation debug diagnostics -- observational, never affects
+            # blocked_on_arrival/misses_intended_goal or any acceptance
+            # decision below. Captured unconditionally now (see
+            # _finalize_navigation_debug_snapshot()'s docstring): navigation_
+            # debug_enabled gates the UI's browse/inspect/restore
+            # affordances, not whether a tick gets recorded, so history is
+            # already populated by the time a user turns Navigation on.
+            nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
+            if first_segment_report is not None:
+                nav_capture.first_segment = clearance_terms_from_report(
+                    first_segment_report,
+                    checker="check_segment_points",
+                    required_clearance=self.safety_radius(),
+                )
+            nav_capture.endpoint_reaches_goal = endpoint_reaches_goal_debug
+            # getattr-guarded (not a direct self._finalize_navigation_debug_
+            # snapshot(...) call): many lightweight duck-typed engine fakes
+            # elsewhere in the test suite bind only the handful of
+            # SimulationControllerMixin methods relevant to what they
+            # actually test, not this one -- capture being unconditional
+            # now (see that method's docstring) means this call site is
+            # reached unconditionally too, so it must not assume the method
+            # is bound.
+            _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
+            if callable(_nav_debug_finalize):
+                _nav_debug_finalize(
                     agent=self.runtime_agent(None),
                     decision_kind="ROUTE_RESULT",
                     decision_reason=reason,
@@ -2417,15 +2479,15 @@ class SimulationControllerMixin:
                     ),
                     capture=nav_capture,
                 )
-                # Persisted so subsequent ticks' snapshots (which do not
-                # recompute a plan) can still show which planner/simplifier
-                # produced the route currently being executed, instead of
-                # reporting "unavailable" on every tick except the one the
-                # route was actually accepted on. Cleared on the next
-                # accepted/rejected plan, and by the same reset_simulation_
-                # state() points that clear navigation_debug_log.
-                if pending_plan_capture is not None and not (blocked_on_arrival or misses_intended_goal):
-                    self._nav_debug_last_accepted_plan = pending_plan_capture
+            # Persisted so subsequent ticks' snapshots (which do not
+            # recompute a plan) can still show which planner/simplifier
+            # produced the route currently being executed, instead of
+            # reporting "unavailable" on every tick except the one the
+            # route was actually accepted on. Cleared on the next
+            # accepted/rejected plan, and by the same reset_simulation_
+            # state() points that clear navigation_debug_log.
+            if pending_plan_capture is not None and not (blocked_on_arrival or misses_intended_goal):
+                self._nav_debug_last_accepted_plan = pending_plan_capture
 
             if blocked_on_arrival:
                 reason = f"{reason}; rejected: first segment blocked on arrival"
@@ -2618,6 +2680,11 @@ class SimulationControllerMixin:
 
         grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
         explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
+        if explored.shape[0] == 1 and not np.any(explored):
+            known_cells = grid != UNKNOWN
+            if np.any(known_cells):
+                explored = explored.copy()
+                explored[0] = known_cells.astype(np.uint8, copy=False)
         packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
         frame = BeliefMapDebug(
             revision=revision,
@@ -2636,6 +2703,84 @@ class SimulationControllerMixin:
         self._nav_debug_belief_frame_cache = frame
         return Maybe.of(frame)
 
+    def _navigation_debug_hazard_frame(self) -> Maybe[HazardDebug]:
+        """Freeze the current hazard-field state (FireSources + next_fire_id)
+        for restore. Unlike the belief grid, fire counts are small enough
+        that rebuilding this tuple fresh every tick is cheap -- no revision-
+        keyed cache needed here."""
+        service = getattr(self, "hazard_service", None)
+        if service is None:
+            return Maybe.missing()
+        field = service.field
+        sources = tuple(
+            HazardSourceDebug(
+                fire_id=int(source.fire_id),
+                position=(float(source.position[0]), float(source.position[1])),
+                intensity=float(source.intensity),
+                radius=float(source.radius),
+            )
+            for source in field.sources()
+        )
+        return Maybe.of(
+            HazardDebug(
+                version=int(field.version),
+                next_fire_id=int(field.next_fire_id),
+                sources=sources,
+            )
+        )
+
+    def _navigation_debug_agent_state_frame(self, agent) -> Maybe[AgentStateDebug]:
+        """Freeze the RobotAgent fields restore needs explicitly -- see
+        AgentStateDebug's docstring for exactly what is and is not included
+        and why."""
+        if agent is None:
+            return Maybe.missing()
+        final_goal = getattr(agent, "final_goal_xy", None)
+        exploration_target = getattr(agent, "exploration_target_xy", None)
+        active_path_goal = getattr(agent, "active_path_goal_xy", None)
+        return Maybe.of(
+            AgentStateDebug(
+                final_goal_xy=(float(final_goal[0]), float(final_goal[1])) if final_goal is not None else None,
+                exploration_target_xy=(
+                    (float(exploration_target[0]), float(exploration_target[1]))
+                    if exploration_target is not None
+                    else None
+                ),
+                active_path_goal_xy=(
+                    (float(active_path_goal[0]), float(active_path_goal[1]))
+                    if active_path_goal is not None
+                    else None
+                ),
+                active_path_mode=getattr(agent, "active_path_mode", None),
+                route_generation=int(getattr(agent, "route_generation", 0)),
+                route_affected_replan_count=int(getattr(agent, "route_affected_replan_count", 0)),
+                first_segment_blocked_count=int(getattr(agent, "first_segment_blocked_count", 0)),
+                last_frontier_candidate_count=int(getattr(agent, "last_frontier_candidate_count", 0)),
+                prefetch_success_count=int(getattr(agent, "prefetch_success_count", 0)),
+                prefetch_fail_count=int(getattr(agent, "prefetch_fail_count", 0)),
+                safety_replan_count=int(getattr(agent, "safety_replan_count", 0)),
+                target_switch_count=int(getattr(agent, "target_switch_count", 0)),
+            )
+        )
+
+    def _navigation_debug_metrics_frame(self) -> Maybe[RuntimeMetricsDebug]:
+        """Freeze engine-level cumulative counters -- see RuntimeMetricsDebug's
+        docstring for why these must travel with simulation_time."""
+        return Maybe.of(
+            RuntimeMetricsDebug(
+                total_distance_traveled=float(getattr(self, "total_distance_traveled", 0.0)),
+                route_request_count=int(getattr(self, "route_request_count", 0)),
+                route_result_count=int(getattr(self, "route_result_count", 0)),
+                route_failure_count=int(getattr(self, "route_failure_count", 0)),
+                sensor_update_count=int(getattr(self, "sensor_update_count", 0)),
+                mapping_update_count=int(getattr(self, "mapping_update_count", 0)),
+                safety_replan_count=int(getattr(self, "safety_replan_count", 0)),
+                exploration_replan_count=int(getattr(self, "exploration_replan_count", 0)),
+                planner_jobs_started=int(getattr(self, "planner_jobs_started", 0)),
+                planner_jobs_completed=int(getattr(self, "planner_jobs_completed", 0)),
+            )
+        )
+
     def _finalize_navigation_debug_snapshot(
         self,
         *,
@@ -2649,13 +2794,18 @@ class SimulationControllerMixin:
         already known on self/agent at call time -- never recomputed here --
         then push it to the bounded event log and (if present) the canvas.
 
-        Callers gate on self.navigation_debug_enabled themselves before
-        constructing a capture at all; this method re-checks defensively
-        (getattr-guarded so lightweight duck-typed engine fakes used
-        throughout the test suite, which do not set this attribute, are
-        unaffected) so it is always safe to call.
+        Runs unconditionally whenever a robot exists -- NOT gated on
+        navigation_debug_enabled. History must already be populated by the
+        time a user turns Navigation on mid-run, so every tick is recorded
+        regardless of that switch; navigation_debug_enabled only gates the
+        UI's browse/inspect/restore affordances (step_navigation_debug_
+        history(), can_restore_navigation_debug_snapshot(), the overlay
+        itself), never whether a tick gets recorded. Still safe to call from
+        lightweight duck-typed engine fakes that never set self.robot at all
+        (self.robot is None guards that, not getattr-guarded navigation_
+        debug_enabled).
         """
-        if not getattr(self, "navigation_debug_enabled", False) or self.robot is None:
+        if self.robot is None:
             return
 
         capture = capture or NavigationDebugCapture()
@@ -2822,6 +2972,9 @@ class SimulationControllerMixin:
             ),
         )
         belief_map_debug = self._navigation_debug_belief_frame()
+        hazard_debug = self._navigation_debug_hazard_frame()
+        agent_state_debug = self._navigation_debug_agent_state_frame(agent)
+        metrics_debug = self._navigation_debug_metrics_frame()
 
         self._nav_debug_seq = getattr(self, "_nav_debug_seq", 0) + 1
         snapshot = NavigationDebugSnapshot(
@@ -2845,6 +2998,9 @@ class SimulationControllerMixin:
             mapped_obstacle_points_count=len(getattr(self, "mapped_obstacle_points", ())),
             sensor=sensor,
             belief_map=belief_map_debug,
+            hazard=hazard_debug,
+            agent_state=agent_state_debug,
+            metrics=metrics_debug,
         )
 
         # The ring buffer records every tick (a full in-memory history for
@@ -2931,7 +3087,21 @@ class SimulationControllerMixin:
             canvas.set_navigation_debug_history_position(index + 1, len(log))
 
     def step_navigation_debug_history(self, delta: int) -> None:
-        """Navigate LIVE <-> latest <-> older frozen snapshots while paused."""
+        """Navigate LIVE -> frozen snapshots while paused, then browse strictly
+        within [0, length-1]. Both directions clamp at their border instead of
+        wrapping: `<` stops at the oldest snapshot, `>` stops at the newest one
+        and no longer auto-jumps back to LIVE. LIVE is only re-entered by
+        unpausing (resume_navigation_debug_live_view() is called from
+        toggle_pause()) or by restore_navigation_debug_snapshot() -- never by
+        this method -- so the UI's `>` button can simply disable itself at the
+        newest index instead of secretly behaving like a third "back to live"
+        action.
+
+        The first `<` press from LIVE skips straight to length-2 (not
+        length-1): index length-1 is the same tick LIVE is already showing,
+        so landing on it would look like a no-op click. With only one saved
+        snapshot (length == 1), that same index is the only one available.
+        """
         if not getattr(self, "navigation_debug_enabled", False) or not getattr(self, "paused", False):
             return
         length = self.navigation_debug_history_length()
@@ -2940,15 +3110,12 @@ class SimulationControllerMixin:
 
         current = getattr(self, "_nav_debug_history_index", None)
         if int(delta) < 0:
-            new_index = length - 1 if current is None else max(0, current - 1)
+            new_index = max(0, length - 2) if current is None else max(0, current - 1)
             self._push_navigation_debug_history_view(new_index)
         else:
             if current is None:
                 return
-            if current >= length - 1:
-                self.resume_navigation_debug_live_view()
-            else:
-                self._push_navigation_debug_history_view(current + 1)
+            self._push_navigation_debug_history_view(min(length - 1, current + 1))
         updater = getattr(self, "update_navigation_debug_step_buttons", None)
         if callable(updater):
             updater()
@@ -3053,7 +3220,10 @@ class SimulationControllerMixin:
             request_id=request_id,
             planner_kwargs=planner_kwargs,
             path_simplifier=self.config.path_simplifier,
-            debug_capture=PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None,
+            # Always built now -- see _finalize_navigation_debug_snapshot()'s
+            # docstring: capture is unconditional, not gated on navigation_
+            # debug_enabled.
+            debug_capture=PlanDebugCapture(),
         )
         worker.signals.route_ready.connect(self.on_async_route_ready)
         self.active_planner_workers[request_id] = worker
@@ -3180,16 +3350,15 @@ class SimulationControllerMixin:
         the only thing that can disable it, entirely independent of
         ROBOT_TRACE (which only controls terminal trace printing).
 
-        Best-effort: prints exactly one compact notification when a
-        directory is actually created, to both the GUI console and the
-        terminal -- never spams, never raises.
+        Best-effort: records one compact notification in the in-app console
+        when a directory is created. It never writes this operational message
+        to stdout; launching the GUI must keep the user's terminal clean.
         """
         trace = self.ensure_robot_trace()
         run_dir = trace.start_run()
         if run_dir is not None:
             message = f"[BELIEF TRACE] writing artifacts to {run_dir}"
             self.log_console_message(message)
-            trace.print_line(message)
 
     def ensure_perf_monitor(self) -> PerfMonitor:
         """Return the shared PerfMonitor, creating it if needed.
@@ -3895,37 +4064,306 @@ class SimulationControllerMixin:
             self.start_button.setIcon(make_icon("pause", "white"))
 
     def update_navigation_debug_step_buttons(self) -> None:
-        """Reflect history boundaries and hide controls when unusable."""
+        """Reflect history boundaries in the navigation_snapshot_bar -- the
+        single, sole control for stepping through navigation-debug history
+        (see main_window._build_navigation_snapshot_bar()). Called from
+        every place history state can change -- step/resume/restore/toggle/
+        reset -- so none of those call sites needs to know about the bar
+        directly.
+        """
         canvas = getattr(self, "canvas", None)
         if canvas is None:
             return
         length = self.navigation_debug_history_length()
-        active = (
-            bool(getattr(self, "navigation_debug_enabled", False))
-            and bool(getattr(self, "paused", False))
-            and length > 0
-        )
+        enabled = bool(getattr(self, "navigation_debug_enabled", False))
+        active = enabled and bool(getattr(self, "paused", False)) and length > 0
         current = getattr(self, "_nav_debug_history_index", None)
         back_enabled = active and (current is None or current > 0)
-        forward_enabled = active and current is not None
+        # Clamped at the newest snapshot -- stepping forward past it no
+        # longer auto-resumes LIVE (see step_navigation_debug_history()), so
+        # the button disables itself at that border just like `<` does at 0.
+        forward_enabled = active and current is not None and current < length - 1
 
-        # The visible controls belong to the docked Navigation Reasoning
-        # panel. Legacy canvas buttons remain hidden for compatibility with
-        # older tests/plugins, but no longer occupy map space.
-        reasoning_panel = getattr(self, "navigation_reasoning_window", None)
-        setter = getattr(reasoning_panel, "set_history_controls", None)
-        if callable(setter):
-            setter(
-                visible=active,
+        bar = getattr(self, "navigation_snapshot_bar", None)
+        updater = getattr(bar, "update_state", None)
+        if callable(updater):
+            can_restore, restore_reason = self.can_restore_navigation_debug_snapshot()
+            updater(
+                navigation_enabled=enabled,
+                position=current,
+                total=length,
                 back_enabled=back_enabled,
                 forward_enabled=forward_enabled,
+                multiplier=float(getattr(self, "_nav_history_scrub_current_multiplier", 1.0)),
+                resume_enabled=can_restore,
+                resume_reason=restore_reason,
             )
 
-        for name in ("navigation_debug_step_back_button", "navigation_debug_step_forward_button"):
-            legacy_button = getattr(canvas, name, None)
-            if legacy_button is not None:
-                legacy_button.setVisible(False)
-                legacy_button.setEnabled(False)
+    def can_restore_navigation_debug_snapshot(self) -> tuple[bool, str]:
+        """Whether 'Resume from snapshot' is actionable right now, and the
+        user-facing reason when it is not (surfaced as the button's tooltip).
+
+        Ordered so the most fundamental blocker wins: navigation off, then
+        multi-robot (v1 is single-robot only -- see restore_navigation_debug_
+        snapshot()'s docstring), then no robot, then LIVE (nothing selected
+        to restore from).
+        """
+        if not getattr(self, "navigation_debug_enabled", False):
+            return False, "Enable Navigation to use snapshot controls."
+        if "Multiple" in str(getattr(self.config, "agent_mode", "")):
+            return False, "Resume from snapshot supports single-robot mode only."
+        if getattr(self, "robot", None) is None:
+            return False, "Start the simulation to capture snapshots."
+        if getattr(self, "_nav_debug_history_index", None) is None:
+            return False, "Select a historical snapshot to resume from."
+        return True, ""
+
+    def restore_navigation_debug_snapshot(self, index: int | None = None) -> bool:
+        """Roll the live simulation back to the frozen state at history
+        `index` (defaults to the currently viewed HISTORY position), then
+        truncate everything recorded after it and return to LIVE.
+
+        This is a real restore, not a view change: simulation_time, robot
+        pose/kinematics, the active route/waypoint index, belief_map
+        (occupancy + explored-by-robot), hazards (FireSources + next_fire_
+        id), explicit RobotAgent state (goals/active-path-mode/route_
+        generation/counters -- see AgentStateDebug), engine-level cumulative
+        metrics (see RuntimeMetricsDebug), and the append-only mapped_
+        obstacle_points list are all overwritten from the snapshot.
+        In-flight async planner work is invalidated (route_request_id bump +
+        worker-dict clear, the same pattern start_simulation()/reset_
+        simulation() use) and pending/prefetch route state is cleared
+        unconditionally so a path computed in the discarded future can never
+        be promoted later. The event log is truncated so nothing from that
+        discarded future remains scrubbable.
+
+        Single-robot only for this version -- guarded by can_restore_
+        navigation_debug_snapshot(), which multi-robot mode fails. One piece
+        of runtime state is deliberately NOT rolled back (see the
+        NavigationDebugSnapshot / AgentStateDebug docstrings for why): the
+        executed-path trail (path_points) has no authoritative source to
+        rebuild from and resets to the single restored point. The visible
+        explored-area *coverage*, by contrast, does not regress even though
+        its bounded sensor-sweep polygon list (explored_area_polygons) is
+        cleared -- the canvas is reseeded directly from the just-restored
+        belief.explored_by_robot mask (see canvas.set_explored_area_seed()),
+        so what the user sees stays consistent with the authoritative belief
+        state instead of visually "forgetting" coverage that was never
+        actually un-explored.
+        """
+        can_restore, _reason = self.can_restore_navigation_debug_snapshot()
+        if not can_restore:
+            return False
+
+        if index is None:
+            index = self._nav_debug_history_index
+        log = self.navigation_debug_log
+        event = log.event_at(int(index))
+        if event is None:
+            return False
+        snapshot = event.snapshot
+        if snapshot.belief_map.unavailable or snapshot.belief_map.value is None:
+            return False
+        frame = snapshot.belief_map.value
+
+        belief = self.ensure_belief_map()
+        grid = np.frombuffer(zlib.decompress(frame.grid_zlib), dtype=np.int8).reshape(frame.grid_shape).copy()
+        explored_packed = np.frombuffer(zlib.decompress(frame.explored_packbits_zlib), dtype=np.uint8)
+        explored_count = int(np.prod(frame.explored_shape))
+        explored = np.unpackbits(
+            explored_packed, bitorder="little", count=explored_count
+        ).reshape(frame.explored_shape).astype(bool, copy=False)
+
+        # Compatibility for snapshots captured before single-robot sensor
+        # footprints were attributed to robot 0.  Those frames can contain a
+        # correct occupancy grid but an all-false explored_by_robot mask.  For
+        # one robot, every known cell necessarily came from that robot's sensor,
+        # so rebuild the missing ownership mask from the known belief cells.
+        if explored.shape[0] == 1 and not np.any(explored):
+            known_cells = grid != UNKNOWN
+            if np.any(known_cells):
+                explored = explored.copy()
+                explored[0] = known_cells
+
+        if grid.shape != belief.grid.shape or explored.shape != belief.explored_by_robot.shape:
+            # Geometry changed since capture (resolution/bounds/robot_count) --
+            # cannot restore safely.
+            return False
+
+        # 1. Pause.
+        self.paused = True
+
+        # 2. Simulation clock.
+        self.simulation_time = float(snapshot.simulation_time)
+        self.last_time = time.perf_counter()
+
+        # 3. Robot pose / kinematics.
+        self.robot.x = float(snapshot.robot_pose.x)
+        self.robot.y = float(snapshot.robot_pose.y)
+        self.robot.theta = float(snapshot.robot_pose.theta)
+        self.robot.v = float(snapshot.robot_pose.v)
+
+        # 4. Belief map + explored area (authoritative -- see docstring).
+        belief.grid = grid
+        belief.explored_by_robot = explored
+        belief.revision += 1
+        self._nav_debug_belief_frame_key = None
+        self._nav_debug_belief_frame_cache = None
+        self.sync_legacy_map_views_from_belief()
+
+        # 4b. Hazards -- a layer fully separate from occupancy (see
+        # HazardField's module docstring); this never touches belief.grid
+        # above. apply_hazard_to_planning_grid() recomputes fresh from
+        # hazard_service.field on every planning call (no separate costmap
+        # cache to invalidate), and the canvas's heatmap pixmap is keyed on
+        # HazardField.version, so push_hazard_snapshot() below is sufficient
+        # to invalidate the render cache too.
+        if not snapshot.hazard.unavailable and snapshot.hazard.value is not None:
+            hazard_frame = snapshot.hazard.value
+            hazard_service = self.ensure_hazard_service()
+            restored_sources = tuple(
+                FireSource(
+                    fire_id=source.fire_id,
+                    position=source.position,
+                    intensity=source.intensity,
+                    radius=source.radius,
+                )
+                for source in hazard_frame.sources
+            )
+            hazard_service.field.restore_sources(restored_sources, next_fire_id=hazard_frame.next_fire_id)
+            self.push_hazard_snapshot()
+
+        # 5. mapped_obstacle_points is append-only at runtime (see
+        # update_sensed_obstacles()), so truncating to the snapshot's own
+        # count reproduces the exact boundary-sample set known at capture
+        # time without needing to store the points themselves.
+        count = max(0, int(snapshot.mapped_obstacle_points_count))
+        self.mapped_obstacle_points = list(self.mapped_obstacle_points[:count])
+        self.mapped_obstacle_point_keys = {
+            (round(float(p[0]), 3), round(float(p[1]), 3)) for p in self.mapped_obstacle_points
+        }
+
+        # 6. Cosmetic trails. The bounded sensor-sweep polygon list itself
+        # (self.explored_area_polygons, capped to EXPLORED_POLYGON_HISTORY_
+        # LIMIT sweeps) is not part of the authoritative contract and is
+        # cleared -- but the visible explored-area *coverage* must not
+        # regress just because that list is gone: the canvas is seeded
+        # directly from the just-restored belief.explored_by_robot mask
+        # (the authoritative state, already rolled back above), using the
+        # same per-cell rasterization the historical-replay view uses. New
+        # sensor sweeps recorded after this point paint on top of the seed
+        # as usual. The executed-path trail has no equivalent authoritative
+        # source to reseed from, so it resets to the single restored point.
+        self.explored_area_polygons = []
+        self.canvas.set_explored_area_polygons(self.explored_area_polygons)
+        self.canvas.set_explored_area_seed(explored, float(frame.resolution), belief.bounds)
+        self.path_points = [(self.robot.x, self.robot.y)]
+
+        # 7. Route / active waypoint index, then explicit agent state on top
+        # -- never inferred from active_path[-1] (see AgentStateDebug).
+        active_path = list(snapshot.path.active_path)
+        agent = self.runtime_agent(None)
+        if active_path:
+            self.robot.set_waypoints(active_path)
+            clamped_index = max(0, min(int(snapshot.path.active_waypoint_index or 0), len(active_path) - 1))
+            self.robot.waypoints.current_index = clamped_index
+            if agent is not None:
+                agent.waypoints.set_waypoints(active_path)
+                agent.waypoints.current_index = clamped_index
+        else:
+            self.robot.waypoints.clear()
+            self.robot.state_machine.reset()
+            if agent is not None:
+                agent.waypoints.clear()
+
+        if agent is not None:
+            # Pending/prefetch route state and route-repair bookkeeping are
+            # always cleared regardless of branch above -- a path prefetched
+            # in the discarded future must never be promoted after restore.
+            agent.pending_path = None
+            agent.pending_target_xy = None
+            agent.pending_path_route_generation = None
+            agent.pending_path_created_for_active_goal = None
+            agent.route_repair_in_progress_for_goal = None
+
+            agent_state = snapshot.agent_state
+            if not agent_state.unavailable and agent_state.value is not None:
+                state = agent_state.value
+                agent.final_goal_xy = state.final_goal_xy
+                agent.exploration_target_xy = state.exploration_target_xy
+                agent.active_path_goal_xy = state.active_path_goal_xy
+                agent.active_path_mode = state.active_path_mode
+                agent.route_generation = state.route_generation
+                agent.route_affected_replan_count = state.route_affected_replan_count
+                agent.first_segment_blocked_count = state.first_segment_blocked_count
+                agent.last_frontier_candidate_count = state.last_frontier_candidate_count
+                agent.prefetch_success_count = state.prefetch_success_count
+                agent.prefetch_fail_count = state.prefetch_fail_count
+                agent.safety_replan_count = state.safety_replan_count
+                agent.target_switch_count = state.target_switch_count
+            else:
+                # Degraded/older snapshot without explicit agent state --
+                # fall back to inferring active_path_goal_xy from the route
+                # itself rather than leaving whatever the live agent had
+                # before this restore (a value from the discarded future).
+                agent.active_path_goal_xy = active_path[-1] if active_path else None
+
+            agent.status = snapshot.navigation_state or agent.status
+            self.current_exploration_target = agent.exploration_target_xy
+        else:
+            self.current_exploration_target = None
+        self.canvas.set_exploration_target(self.current_exploration_target)
+
+        # 7b. Engine-level cumulative metrics (see RuntimeMetricsDebug) --
+        # restored so none of them reads ahead of the rewound simulation_time.
+        metrics = snapshot.metrics
+        if not metrics.unavailable and metrics.value is not None:
+            m = metrics.value
+            self.total_distance_traveled = m.total_distance_traveled
+            self.route_request_count = m.route_request_count
+            self.route_result_count = m.route_result_count
+            self.route_failure_count = m.route_failure_count
+            self.sensor_update_count = m.sensor_update_count
+            self.mapping_update_count = m.mapping_update_count
+            self.safety_replan_count = m.safety_replan_count
+            self.exploration_replan_count = m.exploration_replan_count
+            self.planner_jobs_started = m.planner_jobs_started
+            self.planner_jobs_completed = m.planner_jobs_completed
+
+        # 8. Invalidate in-flight async planner work for the truncated
+        # future -- identical pattern to start_simulation()/reset_simulation().
+        self.planning_in_progress = False
+        self.route_request_id += 1
+        self.active_planner_workers.clear()
+        getattr(self, "prefetch_workers", {}).clear()
+        getattr(self, "prefetch_request_ids", {}).clear()
+        self._nav_debug_pending_plan_capture_by_robot = {}
+        self._nav_debug_last_plan_capture = None
+        self._nav_debug_last_accepted_plan = None
+
+        # 9. Truncate history at this point; continue numbering from here.
+        log.truncate_after(int(index))
+        self._nav_debug_seq = int(snapshot.snapshot_id)
+        self._nav_debug_live_snapshot = snapshot
+
+        # 10. Return the view to LIVE.
+        self._nav_debug_history_index = None
+
+        self.canvas.set_robot(self.robot)
+        self.canvas.set_path(self.path_points)
+        self.canvas.set_planned_path([(self.robot.x, self.robot.y)] + active_path)
+        self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
+        self.canvas.set_simulation_metrics(self.simulation_time, self.simulation_speed)
+        self.canvas.set_navigation_debug_snapshot(snapshot)
+        self.canvas.set_navigation_debug_last_event(log.latest())
+        self.canvas.set_navigation_debug_history_position(None, len(log))
+        self.canvas.set_status(
+            f"Resumed simulation from snapshot #{snapshot.snapshot_id} (t={snapshot.simulation_time:.2f}s)."
+        )
+
+        self.update_start_pause_button()
+        self.update_navigation_debug_step_buttons()
+        return True
 
     def handle_start_pause_button(self) -> None:
         has_runtime_robot = self.robot is not None or bool(getattr(self, "robots", []))
@@ -4612,6 +5050,9 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
+        # A previous run's restore must not leak its seeded explored-area
+        # coverage into this fresh one.
+        self.canvas.clear_explored_area_seed()
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
@@ -4752,6 +5193,9 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
+        # A previous run's restore must not leak its seeded explored-area
+        # coverage into this fresh one.
+        self.canvas.clear_explored_area_seed()
         self.record_explored_area(force=True)
         self.update_sensed_obstacles(force_status=False)
         self.force_robot_pose_free_in_belief(None)
@@ -4852,6 +5296,9 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
+        # A previous run's restore must not leak its seeded explored-area
+        # coverage into this fresh one.
+        self.canvas.clear_explored_area_seed()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
 
@@ -5180,9 +5627,9 @@ class SimulationControllerMixin:
 
         capture: optional NavigationDebugCapture, forwarded down to
         TrackingController.compute_control() so it can stash heading_error/
-        distance_to_goal when navigation_debug_enabled. Falls back to the
-        capture-less/blocked-less call shapes for older Robot
-        implementations that do not accept these kwargs yet.
+        distance_to_goal. Falls back to the capture-less/blocked-less call
+        shapes for older Robot implementations that do not accept these
+        kwargs yet.
         """
         try:
             return self.robot.nominal_control(blocked=blocked, capture=capture)
@@ -5367,11 +5814,27 @@ class SimulationControllerMixin:
         polygon: list[tuple[float, float]],
         robot_index: int | None = None,
     ) -> None:
-        """Backward-compatible wrapper around BeliefMap rasterization."""
+        """Rasterize one sensor footprint into the authoritative belief.
+
+        ``robot_index=None`` is the canvas convention for the single-robot
+        homogeneous blue layer.  It is *not* a valid ownership value for
+        ``BeliefMap.explored_by_robot``: passing None there updates occupancy
+        but leaves the per-robot explored mask empty.  Snapshots restore that
+        mask, so the visual explored area would disappear after a restore even
+        though ``belief.grid`` still contained the mapped FREE/OCCUPIED cells.
+
+        Keep the two concerns separate: single-robot rendering still uses
+        ``robot_index=None`` at the canvas call site, while the belief records
+        those observations under robot 0.
+        """
         belief = self.ensure_belief_map()
+        belief_robot_index = robot_index
+        if belief_robot_index is None and int(getattr(belief, "robot_count", 1)) == 1:
+            belief_robot_index = 0
+
         belief.mark_visible_polygon(
             polygon,
-            robot_index=robot_index,
+            robot_index=belief_robot_index,
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
         self.explored_free_points = belief.explored_points()
@@ -6326,12 +6789,13 @@ class SimulationControllerMixin:
             # ── New OOP flow ──────────────────────────────────────────────
             # build_observation pre-computes active_segment_blocked.
             #
-            # nav_debug_capture is None (the default, zero extra cost) unless
-            # navigation_debug_enabled -- see _finalize_navigation_debug_snapshot()
-            # for how it is frozen into a NavigationDebugSnapshot below.
-            nav_debug_capture = (
-                NavigationDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None
-            )
+            # nav_debug_capture is always built now (see _finalize_
+            # navigation_debug_snapshot()'s docstring): every tick is
+            # recorded unconditionally, so history is already populated by
+            # the time a user turns Navigation on mid-run -- navigation_
+            # debug_enabled only gates the UI's browse/inspect/restore
+            # affordances, not whether a tick gets captured.
+            nav_debug_capture = NavigationDebugCapture()
             _runtime_state_build_perf_start = time.perf_counter()
             obs = self.build_observation(self.robot, agent, None, capture=nav_debug_capture)
             _record_perf(self, "runtime_state_build", time.perf_counter() - _runtime_state_build_perf_start)
@@ -6365,13 +6829,17 @@ class SimulationControllerMixin:
             _record_perf(self, "apply_decision", time.perf_counter() - _apply_decision_perf_start)
 
             if nav_debug_capture is not None:
-                self._finalize_navigation_debug_snapshot(
-                    agent=agent,
-                    decision_kind=str(decision.kind),
-                    decision_reason=str(decision.reason),
-                    event_kind=self._navigation_debug_event_kind_for_decision(decision, predicted_report),
-                    capture=nav_debug_capture,
-                )
+                # getattr-guarded -- see the equivalent call site in
+                # apply_route_result() for why.
+                _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
+                if callable(_nav_debug_finalize):
+                    _nav_debug_finalize(
+                        agent=agent,
+                        decision_kind=str(decision.kind),
+                        decision_reason=str(decision.reason),
+                        event_kind=self._navigation_debug_event_kind_for_decision(decision, predicted_report),
+                        capture=nav_debug_capture,
+                    )
 
             if should_brake:
                 self.last_control = self.brake_control_for_collision()
@@ -7180,7 +7648,10 @@ class SimulationControllerMixin:
             request_id=request_id,
             planner_kwargs=planner_kwargs,
             path_simplifier=self.config.path_simplifier,
-            debug_capture=PlanDebugCapture() if getattr(self, "navigation_debug_enabled", False) else None,
+            # Always built now -- see _finalize_navigation_debug_snapshot()'s
+            # docstring: capture is unconditional, not gated on navigation_
+            # debug_enabled.
+            debug_capture=PlanDebugCapture(),
         )
         # Capture idx in the closure so stale callbacks go to the right robot.
         captured_idx = idx
@@ -7268,8 +7739,11 @@ class SimulationControllerMixin:
                 self.log_console_message(
                     f"[PREFETCH] rejected: final waypoint does not reach target; {reason}"
                 )
-                if getattr(self, "navigation_debug_enabled", False):
-                    self._finalize_navigation_debug_snapshot(
+                # Captured unconditionally now, getattr-guarded -- see the
+                # call site in apply_route_result() for why.
+                _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
+                if callable(_nav_debug_finalize):
+                    _nav_debug_finalize(
                         agent=agent,
                         decision_kind="ROUTE_RESULT",
                         decision_reason=f"{reason}; rejected: final waypoint does not reach path goal",
@@ -7313,14 +7787,17 @@ class SimulationControllerMixin:
                 self.log_console_message(
                     f"[PREFETCH] rejected: first segment blocked on arrival; {reason}"
                 )
-                if getattr(self, "navigation_debug_enabled", False):
-                    nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
-                    nav_capture.first_segment = clearance_terms_from_report(
-                        first_segment_report,
-                        checker="check_segment_points",
-                        required_clearance=self.safety_radius(),
-                    )
-                    self._finalize_navigation_debug_snapshot(
+                # Captured unconditionally now, getattr-guarded -- see the
+                # call site in apply_route_result() for why.
+                nav_capture = NavigationDebugCapture(plan=pending_plan_capture)
+                nav_capture.first_segment = clearance_terms_from_report(
+                    first_segment_report,
+                    checker="check_segment_points",
+                    required_clearance=self.safety_radius(),
+                )
+                _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
+                if callable(_nav_debug_finalize):
+                    _nav_debug_finalize(
                         agent=agent,
                         decision_kind="ROUTE_RESULT",
                         decision_reason=f"{reason}; rejected: first segment blocked on arrival",

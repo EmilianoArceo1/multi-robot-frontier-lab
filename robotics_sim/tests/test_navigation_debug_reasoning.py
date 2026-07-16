@@ -126,7 +126,11 @@ def test_replan_explanation_uses_real_decision_reason():
 # ---------------------------------------------------------------------------
 
 
-def test_eye_icon_toggle_changes_canvas_overlay_flag_only():
+def test_toggling_navigation_debug_changes_canvas_overlay_flag_only():
+    """The activator is main_window.py's Navigation switch now (see
+    _build_navigation_snapshot_bar()), not a canvas-painted eye icon --
+    set_navigation_debug_enabled() is still the single method that flips
+    the flag, and still mutates nothing else on the canvas."""
     canvas = SimulationCanvas()
     canvas.robot = None
     config_before = canvas.config
@@ -141,11 +145,11 @@ def test_eye_icon_toggle_changes_canvas_overlay_flag_only():
     assert canvas.robot is None
 
 
-def test_navigation_debug_eye_rect_is_always_present_next_to_metrics_eye():
+def test_canvas_no_longer_exposes_the_eye_icon_activator():
+    """Removed as the primary activator in favor of the Navigation switch
+    docked above the canvas -- neither the geometry nor the click signal
+    should exist anymore."""
     canvas = SimulationCanvas()
-    nav_eye = canvas.navigation_debug_eye_rect()
-    metrics_eye = canvas.metrics_eye_rect()
-    assert nav_eye.left() > metrics_eye.right()
-    canvas.metrics_visible = False
-    nav_eye_hidden_metrics = canvas.navigation_debug_eye_rect()
-    assert nav_eye_hidden_metrics.width() == nav_eye.width()
+    assert not hasattr(canvas, "navigation_debug_eye_rect")
+    assert not hasattr(canvas, "draw_navigation_debug_eye_button")
+    assert not hasattr(canvas, "navigationDebugToggleRequested")

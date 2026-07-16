@@ -33,7 +33,10 @@ class _FakeRobot(SimpleNamespace):
 
 def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamespace:
     position = (0.0, 0.0)
-    robot = _FakeRobot(x=position[0], y=position[1], theta=0.0, v=0.0)
+    # vision=... is required by _finalize_navigation_debug_snapshot()'s
+    # sensor-polygon capture (see NavigationDebugSnapshot.sensor); config.
+    # vision_model/obstacles feed the same call.
+    robot = _FakeRobot(x=position[0], y=position[1], theta=0.0, v=0.0, vision=5.0)
     agent = RobotAgent(robot_id=0, position=position, planner_mode="FoV-aware directional frontier")
 
     fake = SimpleNamespace(
@@ -46,6 +49,8 @@ def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamesp
             exploration_planner="FoV-aware directional frontier",
             goal_tolerance=0.25,
             grid_resolution=0.5,
+            vision_model="LiDAR",
+            obstacles=[],
         ),
         mapped_obstacle_points=[],
         current_exploration_target=None,
@@ -85,7 +90,15 @@ def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamesp
     fake.navigation_debug_enabled = navigation_debug_enabled
     fake.navigation_debug_log = NavigationDebugEventLog(max_size=10)
 
-    for name in ("apply_route_result", "_finalize_navigation_debug_snapshot", "log_route_assignment"):
+    for name in (
+        "apply_route_result",
+        "_finalize_navigation_debug_snapshot",
+        "log_route_assignment",
+        "_navigation_debug_belief_frame",
+        "_navigation_debug_hazard_frame",
+        "_navigation_debug_agent_state_frame",
+        "_navigation_debug_metrics_frame",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     return fake
@@ -151,12 +164,17 @@ def test_clear_first_segment_reports_not_blocked_and_distance_unavailable():
 
 # ---------------------------------------------------------------------------
 # Route validation event tagging never changes the accept/reject decision.
-# Running the identical scenario twice, once with the layer disabled, must
-# reach the exact same agent/robot outcome.
+# Running the identical scenario twice, once with the layer "disabled",
+# must reach the exact same agent/robot outcome AND record the same
+# history -- capture is unconditional now (see engine._finalize_navigation_
+# debug_snapshot()'s docstring): navigation_debug_enabled only gates the
+# UI's browse/inspect/restore affordances, never whether a tick is
+# recorded, so a user who turns Navigation on mid-run already has history
+# to look at instead of starting from an empty log.
 # ---------------------------------------------------------------------------
 
 
-def test_navigation_debug_disabled_reaches_identical_route_decision():
+def test_navigation_debug_disabled_still_records_and_reaches_identical_route_decision():
     fake_off = _build_fake_engine(navigation_debug_enabled=False)
     fake_off.mapped_obstacle_points = [(0.5, 0.0)]
     fake_off.apply_route_result(True, "path found with A*", [(1.0, 0.0)])
@@ -167,7 +185,7 @@ def test_navigation_debug_disabled_reaches_identical_route_decision():
 
     assert fake_off.agent.active_path_goal_xy == fake_on.agent.active_path_goal_xy
     assert fake_off.robot.waypoints == fake_on.robot.waypoints
-    assert len(fake_off.navigation_debug_log) == 0, "disabled layer must never populate the event log"
+    assert len(fake_off.navigation_debug_log) == 1, "capture happens regardless of navigation_debug_enabled"
     assert len(fake_on.navigation_debug_log) == 1
 
 

@@ -218,3 +218,71 @@ def test_toggle_pause_resumes_live_view_on_resume():
 
     assert fake.paused is False
     assert fake._nav_debug_history_index is None
+
+
+# ---------------------------------------------------------------------------
+# New snapshot-bar UX semantics: `<`/`>` browse strictly within [0, length-1]
+# and clamp at both borders. Returning to LIVE happens only via unpause
+# (see test_toggle_pause_resumes_live_view_on_resume above) or a restore --
+# never by pressing `>` past the newest snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_step_forward_from_newest_history_index_clamps_without_returning_to_live():
+    fake = _build_fake_engine(paused=True, event_count=5)
+    fake.step_navigation_debug_history(-1)  # LIVE -> 3
+    fake.step_navigation_debug_history(1)  # 3 -> 4 (the newest saved snapshot)
+
+    fake.step_navigation_debug_history(1)  # must clamp, not resume live
+
+    assert fake._nav_debug_history_index == 4
+    assert fake.canvas.pushed_snapshots[-1] == 4
+
+
+def test_step_back_from_live_with_a_single_snapshot_lands_on_it():
+    fake = _build_fake_engine(paused=True, event_count=1)
+
+    fake.step_navigation_debug_history(-1)
+
+    assert fake._nav_debug_history_index == 0
+    assert fake.canvas.pushed_snapshots[-1] == 0
+
+
+def test_forward_button_disables_at_the_newest_history_index():
+    """update_navigation_debug_step_buttons() clamps forward_enabled at the
+    border symmetrically with back_enabled at 0, instead of leaving it
+    permanently enabled while any history index is selected.
+
+    History stepping has exactly one control now -- main_window's
+    navigation_snapshot_bar (see test_navigation_panel_controls.py) -- so
+    this reads its update_state() call rather than the reasoning panel's
+    old (now-removed) set_history_controls()."""
+    log = NavigationDebugEventLog(max_size=10)
+    for i in range(3):
+        log.record(NavigationDebugEventKind.HOLD, _make_snapshot(i))
+
+    captured = {}
+
+    fake = SimpleNamespace(
+        navigation_debug_enabled=True,
+        navigation_debug_log=log,
+        paused=True,
+        _nav_debug_history_index=2,  # already at the newest index
+        robot=object(),
+        config=SimpleNamespace(agent_mode="Single Robot Mode"),
+        canvas=SimpleNamespace(),
+        navigation_snapshot_bar=SimpleNamespace(
+            update_state=lambda **kwargs: captured.update(kwargs)
+        ),
+    )
+    for name in (
+        "navigation_debug_history_length",
+        "can_restore_navigation_debug_snapshot",
+        "update_navigation_debug_step_buttons",
+    ):
+        setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
+
+    fake.update_navigation_debug_step_buttons()
+
+    assert captured["back_enabled"] is True
+    assert captured["forward_enabled"] is False

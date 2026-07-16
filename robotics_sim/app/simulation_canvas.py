@@ -125,11 +125,6 @@ class SimulationCanvas(QWidget):
     editor_obstacle_move_started = Signal()
     editor_obstacle_moved = Signal(tuple)
     editor_view_changed = Signal()
-    # Emitted on eye-icon click; the canvas never decides navigation_debug
-    # state itself (same pattern as goalClicked) -- main_window.py's
-    # on_navigation_debug_toggled() is the single place that flips both
-    # engine.navigation_debug_enabled and canvas.navigation_debug_enabled.
-    navigationDebugToggleRequested = Signal()
     # Emitted instead of goalClicked when in exploration mode -- the canvas
     # only reports "user clicked here", never decides whether that means
     # add or remove a fire (main_window.py checks proximity to existing
@@ -182,6 +177,19 @@ class SimulationCanvas(QWidget):
         self._explored_area_cached_count = 0
         self._explored_area_caches_by_robot: dict[int, QPixmap] = {}
         self._explored_area_cache_sizes_by_robot: dict[int, QSize] = {}
+        # A restored belief_map.explored_by_robot mask, replayed first
+        # whenever the live explored-area cache rebuilds (resize/pan/zoom/
+        # set_explored_area_polygons([])) -- see set_explored_area_seed() /
+        # engine.restore_navigation_debug_snapshot(). Without this, a
+        # restore's authoritative belief_map.explored_by_robot stays intact
+        # while the cosmetic explored-area trail (bounded to the last
+        # EXPLORED_POLYGON_HISTORY_LIMIT sensor sweeps) visibly resets to
+        # nothing, even though nothing was actually un-explored. None until
+        # a restore seeds it; cleared on a fresh run (start_simulation()/
+        # reset_simulation()/start_multi_robot_simulation()).
+        self._explored_area_seed_mask: np.ndarray | None = None
+        self._explored_area_seed_resolution: float | None = None
+        self._explored_area_seed_bounds: tuple[float, float, float, float] | None = None
 
         # Mapped obstacle points can become thousands of tiny ellipses. Drawing
         # each point every paintEvent is expensive, so they are rasterized into
@@ -300,32 +308,12 @@ class SimulationCanvas(QWidget):
         # footer previously used by the painted telemetry strip.
         self._action_bar = None
 
-        # History step buttons: real Qt widgets (not QPainter-drawn), so
-        # they are always crisp and reliably clickable regardless of the
-        # side panel's scroll position. Fixed in a corner of the canvas
-        # itself (not attached to the moving robot -- a control needs a
-        # predictable place to click, unlike the diagnostic readout, which
-        # should follow the robot). main_window.py connects their
-        # `clicked` signals; this widget only owns their placement/enabled
-        # state.
-        self.navigation_debug_step_back_button = QPushButton("<", self)
-        self.navigation_debug_step_forward_button = QPushButton(">", self)
-        for step_button in (self.navigation_debug_step_back_button, self.navigation_debug_step_forward_button):
-            step_button.setFixedSize(28, 24)
-            step_button.setEnabled(False)
-            step_button.setVisible(False)
-            step_button.raise_()
-            # MainWindow owns press-and-hold acceleration (1x -> 3x) with a
-            # single timer. Disable Qt's fixed-rate auto-repeat so one press
-            # cannot trigger two independent repeat loops.
-            step_button.setAutoRepeat(False)
-            step_button.setStyleSheet(
-                "QPushButton { background-color: rgba(255,255,255,215); border: 1px solid "
-                f"{BORDER}; border-radius: 4px; font-weight: 600; }}"
-                "QPushButton:disabled { color: rgba(120,120,120,150); }"
-                "QPushButton:enabled { color: #17212B; }"
-            )
-        self._position_navigation_debug_step_buttons()
+        # History stepping has exactly one control now: the navigation_
+        # snapshot_bar docked above the canvas (main_window.
+        # _build_navigation_snapshot_bar()). There used to be a second,
+        # redundant pair of `<`/`>` QPushButtons parented directly to the
+        # canvas -- removed to avoid two independent controls driving the
+        # same engine state.
 
         # Render-only FPS/frame-time telemetry. Independent of the engine --
         # this only ever measures how fast paintEvent itself is running.
@@ -343,6 +331,9 @@ class SimulationCanvas(QWidget):
         # Independent of _render_perf_monitor's own routine (never printed)
         # paint_fps/paint_ms tracking above.
         self._render_detail_logger = RenderDetailLogger()
+        # The optional detailed render line is retained in memory for
+        # diagnostics/export, never printed to the terminal by the GUI.
+        self._latest_render_detail_line: str | None = None
         self._last_background_cache_hit = False
         self._render_layer_ms: dict[str, float] = {
             "background": 0.0, "map_layer": 0.0, "robot_body": 0.0, "robot_fov": 0.0,
@@ -452,20 +443,8 @@ class SimulationCanvas(QWidget):
         self.invalidate_explored_area_cache()
         self.invalidate_mapped_points_cache()
         self.invalidate_obstacles_cache()
-        self._position_navigation_debug_step_buttons()
         self._position_action_bar()
         super().resizeEvent(event)
-
-    def _position_navigation_debug_step_buttons(self) -> None:
-        """Fixed top-right corner of the canvas widget -- a predictable
-        spot to click regardless of where the robot currently is, always
-        within the visible viewport (never inside a scrollable side panel)."""
-        margin = 14
-        gap = 4
-        back = self.navigation_debug_step_back_button
-        forward = self.navigation_debug_step_forward_button
-        forward.move(self.width() - margin - forward.width(), margin)
-        back.move(forward.x() - gap - back.width(), margin)
 
     def set_action_bar(self, action_bar: QWidget | None) -> None:
         """Register the real runtime-control footer owned by MainWindow."""
@@ -506,6 +485,36 @@ class SimulationCanvas(QWidget):
         self._explored_area_cached_count = 0
         self._explored_area_caches_by_robot = {}
         self._explored_area_cache_sizes_by_robot = {}
+
+    def set_explored_area_seed(
+        self,
+        mask: np.ndarray,
+        resolution: float,
+        bounds: tuple[float, float, float, float],
+    ) -> None:
+        """Seed the live explored-area cache from a restored belief_map.
+        explored_by_robot mask -- see engine.restore_navigation_debug_
+        snapshot()'s docstring.
+
+        Unlike painting a one-shot pixmap, this persists across cache
+        rebuilds (resize/pan/zoom/set_explored_area_polygons([])):
+        rebuild_explored_area_cache() replays this mask first, every time,
+        exactly like the historical-replay view already replays a frozen
+        mask (see _draw_historical_explored_area()). Live sensor sweeps
+        recorded after the restore are then painted on top of it as usual.
+        """
+        self._explored_area_seed_mask = mask
+        self._explored_area_seed_resolution = float(resolution)
+        self._explored_area_seed_bounds = tuple(float(v) for v in bounds)
+        self.invalidate_explored_area_cache()
+        self.update()
+
+    def clear_explored_area_seed(self) -> None:
+        """Drop the restored-mask seed -- called at the start of a fresh
+        run so a previous run's restore does not leak into it."""
+        self._explored_area_seed_mask = None
+        self._explored_area_seed_resolution = None
+        self._explored_area_seed_bounds = None
 
     def invalidate_mapped_points_cache(self):
         self._mapped_points_cache = None
@@ -985,21 +994,19 @@ class SimulationCanvas(QWidget):
         # can bring the counters back without searching elsewhere.
         return QRectF((self.width() - eye_width) / 2.0, y, eye_width, height)
 
-    def navigation_debug_eye_rect(self) -> QRectF:
-        """Clickable eye button that toggles the Navigation Debug overlay --
-        always visible next to the FPS/metrics eye button, regardless of
-        metrics_visible, so it never depends on another toggle's state."""
-        metrics_eye = self.metrics_eye_rect()
-        gap = 6.0
-        return QRectF(metrics_eye.right() + gap, metrics_eye.top(), metrics_eye.width(), metrics_eye.height())
-
     def metrics_reserved_rect(self) -> QRectF:
-        """Area reserved by the metric controls in the header row."""
-        nav_eye = self.navigation_debug_eye_rect()
+        """Area reserved by the metric controls in the header row.
+
+        Navigation Debug's activator is the navigation_snapshot_bar docked
+        above the canvas (main_window._build_navigation_snapshot_bar()), not
+        a painted header control, so this only needs to reserve space for
+        the FPS/metrics badge + its own eye button.
+        """
+        eye = self.metrics_eye_rect()
         if not self.metrics_visible:
-            return QRectF(self.metrics_eye_rect().left(), nav_eye.top(), nav_eye.right() - self.metrics_eye_rect().left(), nav_eye.height())
+            return eye
         metrics = self.metrics_rect()
-        return QRectF(metrics.left(), metrics.top(), nav_eye.right() - metrics.left(), metrics.height())
+        return QRectF(metrics.left(), metrics.top(), eye.right() - metrics.left(), metrics.height())
 
 
     def multi_robot_screen_positions(self) -> list[tuple[int, float, float, RobotStartConfig]]:
@@ -1299,14 +1306,6 @@ class SimulationCanvas(QWidget):
                 self.update()
                 return
 
-            if self.navigation_debug_eye_rect().contains(QPointF(pos.x(), pos.y())):
-                # Emits only -- main_window.py's on_navigation_debug_toggled()
-                # is the single place that flips engine + canvas state
-                # together (same "canvas emits, window decides" pattern as
-                # goalClicked). Never touches simulation/robot/agent state.
-                self.navigationDebugToggleRequested.emit()
-                return
-
             if self.plot_rect().contains(pos.toPoint()):
                 if self.editor_mode and not self.robot and not self.robots:
                     # Pan/Zoom mode is exclusive. It must never select, move,
@@ -1381,12 +1380,6 @@ class SimulationCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
-        if self.navigation_debug_eye_rect().contains(QPointF(pos.x(), pos.y())):
-            if self.toolTip() != "Show navigation reasoning":
-                self.setToolTip("Show navigation reasoning")
-        elif self.toolTip() == "Show navigation reasoning":
-            self.setToolTip("")
-
         if self.editor_mode and self.editor_pan_active and self.editor_last_pan_pos is not None:
             pos = event.position()
             dx = pos.x() - self.editor_last_pan_pos[0]
@@ -1617,7 +1610,12 @@ class SimulationCanvas(QWidget):
             title_ms=self._render_layer_ms.get("title", 0.0),
             telemetry_ms=self._render_layer_ms.get("telemetry", 0.0),
             cache_hit=self._last_background_cache_hit,
+            log=self._capture_render_detail_line,
         )
+
+    def _capture_render_detail_line(self, line: str) -> None:
+        """Retain optional render diagnostics without writing to stdout."""
+        self._latest_render_detail_line = str(line)
 
     def _maybe_emit_perf_gui_warning(self) -> None:
         """Append a rare, heavily throttled GUI-console line when paint_fps
@@ -1679,7 +1677,6 @@ class SimulationCanvas(QWidget):
         if self.metrics_visible:
             self.draw_metrics_badge(painter, self.metrics_rect())
         self.draw_metrics_eye_button(painter, self.metrics_eye_rect())
-        self.draw_navigation_debug_eye_button(painter, self.navigation_debug_eye_rect())
 
         # Right status. Long status messages are elided because the center
         # metrics controls have priority in this header row.
@@ -1768,41 +1765,6 @@ class SimulationCanvas(QWidget):
 
         painter.restore()
 
-    def draw_navigation_debug_eye_button(self, painter: QPainter, rect: QRectF):
-        """Same open/closed eye glyph as draw_metrics_eye_button(), but for
-        the Navigation Debug layer -- accented (not just dark/muted) when
-        active, so its on/off state reads at a glance without a tooltip."""
-        painter.save()
-
-        active = self.navigation_debug_enabled
-        path = QPainterPath()
-        path.addRoundedRect(rect, 12.5, 12.5)
-        painter.setPen(QPen(QColor(BLUE) if active else QColor(218, 223, 231, 190), 1.3 if active else 1.0))
-        painter.setBrush(QBrush(QColor(BLUE).lighter(185) if active else QColor(255, 255, 255, 230)))
-        painter.drawPath(path)
-
-        cx = rect.center().x()
-        cy = rect.center().y()
-        eye_color = QColor(BLUE) if active else QColor(TEXT_MUTED)
-        painter.setPen(QPen(eye_color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.setBrush(Qt.NoBrush)
-
-        eye_path = QPainterPath()
-        eye_path.moveTo(cx - 8.5, cy)
-        eye_path.cubicTo(cx - 5.5, cy - 5.0, cx + 5.5, cy - 5.0, cx + 8.5, cy)
-        eye_path.cubicTo(cx + 5.5, cy + 5.0, cx - 5.5, cy + 5.0, cx - 8.5, cy)
-        painter.drawPath(eye_path)
-
-        if active:
-            painter.setBrush(QBrush(eye_color))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(QRectF(cx - 2.3, cy - 2.3, 4.6, 4.6))
-        else:
-            painter.setPen(QPen(eye_color, 1.7, Qt.SolidLine, Qt.RoundCap))
-            painter.drawLine(QPointF(cx - 8.0, cy + 7.0), QPointF(cx + 8.0, cy - 7.0))
-
-        painter.restore()
-
     def ensure_static_plot_cache(self):
         if (
             self._static_plot_cache is not None
@@ -1851,12 +1813,66 @@ class SimulationCanvas(QWidget):
 
         self.rebuild_explored_area_cache()
 
+    def _paint_explored_mask_to_cache(
+        self,
+        cache_painter: QPainter,
+        mask: np.ndarray,
+        resolution: float,
+        bounds: tuple[float, float, float, float],
+        *,
+        alpha: int,
+    ) -> None:
+        """Per-cell rasterization of an explored_by_robot boolean mask into
+        screen space -- shared by _draw_historical_explored_area() (frozen
+        replay of a selected history snapshot) and rebuild_explored_area_
+        cache() (replaying a restored-run seed; see set_explored_area_seed()).
+        """
+        x_min, _x_max, y_min, _y_max = bounds
+        cell_bounds = self._grid_overlay_cell_bounds(
+            resolution, {"grid": mask[0], "bounds": bounds, "resolution": resolution}
+        )
+        if cell_bounds is None:
+            return
+        col_start, col_end, row_start, row_end = cell_bounds
+        cache_painter.setPen(Qt.NoPen)
+        for robot_index in range(mask.shape[0]):
+            color = QColor(BLUE) if mask.shape[0] == 1 else robot_color(robot_index)
+            color.setAlpha(alpha)
+            cache_painter.setBrush(QBrush(color))
+            robot_mask = mask[robot_index]
+            rows, cols = np.where(robot_mask[row_start:row_end + 1, col_start:col_end + 1])
+            for local_row, local_col in zip(rows, cols):
+                row = row_start + int(local_row)
+                col = col_start + int(local_col)
+                x0 = x_min + col * resolution
+                y0 = y_min + row * resolution
+                sx0, sy0 = self.world_to_screen(x0, y0)
+                sx1, sy1 = self.world_to_screen(x0 + resolution, y0 + resolution)
+                cache_painter.drawRect(QRectF(
+                    min(sx0, sx1), min(sy0, sy1),
+                    abs(sx1 - sx0), abs(sy1 - sy0),
+                ))
+
     def rebuild_explored_area_cache(self):
         cache = QPixmap(self.size())
         cache.fill(Qt.transparent)
         self._explored_area_cache = cache
         self._explored_area_cache_size = QSize(self.size())
         self._explored_area_cached_count = 0
+
+        if self._explored_area_seed_mask is not None:
+            cache_painter = QPainter(cache)
+            cache_painter.save()
+            cache_painter.setClipRect(self.plot_rect())
+            self._paint_explored_mask_to_cache(
+                cache_painter,
+                self._explored_area_seed_mask,
+                self._explored_area_seed_resolution,
+                self._explored_area_seed_bounds,
+                alpha=24,
+            )
+            cache_painter.restore()
+            cache_painter.end()
 
         for polygon in self.explored_area_polygons:
             self.paint_explored_polygon_to_cache(polygon)
@@ -2717,7 +2733,7 @@ class SimulationCanvas(QWidget):
             painter.restore()
             return
 
-        if not self.explored_area_polygons:
+        if not self.explored_area_polygons and self._explored_area_seed_mask is None:
             painter.restore()
             return
 
@@ -2741,32 +2757,13 @@ class SimulationCanvas(QWidget):
             cache_painter = QPainter(cache)
             cache_painter.save()
             cache_painter.setClipRect(self.plot_rect())
-            cache_painter.setPen(Qt.NoPen)
-
-            masks = environment["explored_by_robot"]
-            resolution = float(environment["resolution"])
-            x_min, _x_max, y_min, _y_max = environment["bounds"]
-            cell_bounds = self._grid_overlay_cell_bounds(resolution, environment)
-            if cell_bounds is not None:
-                col_start, col_end, row_start, row_end = cell_bounds
-                for robot_index in range(masks.shape[0]):
-                    color = QColor(BLUE) if masks.shape[0] == 1 else robot_color(robot_index)
-                    color.setAlpha(30)
-                    cache_painter.setBrush(QBrush(color))
-                    mask = masks[robot_index]
-                    rows, cols = np.where(mask[row_start:row_end + 1, col_start:col_end + 1])
-                    for local_row, local_col in zip(rows, cols):
-                        row = row_start + int(local_row)
-                        col = col_start + int(local_col)
-                        x0 = x_min + col * resolution
-                        y0 = y_min + row * resolution
-                        sx0, sy0 = self.world_to_screen(x0, y0)
-                        sx1, sy1 = self.world_to_screen(x0 + resolution, y0 + resolution)
-                        cache_painter.drawRect(QRectF(
-                            min(sx0, sx1), min(sy0, sy1),
-                            abs(sx1 - sx0), abs(sy1 - sy0),
-                        ))
-
+            self._paint_explored_mask_to_cache(
+                cache_painter,
+                environment["explored_by_robot"],
+                float(environment["resolution"]),
+                environment["bounds"],
+                alpha=30,
+            )
             cache_painter.restore()
             cache_painter.end()
             self._nav_debug_explored_cache = cache

@@ -93,6 +93,91 @@ class BeliefMapDebug:
 
 
 @dataclass(frozen=True)
+class HazardSourceDebug:
+    """One frozen FireSource, mirroring robotics_sim.environment.hazard_
+    field.FireSource without importing it (this package stays Qt/engine-
+    import-free; see the module docstring)."""
+
+    fire_id: int
+    position: Point2D
+    intensity: float
+    radius: float
+
+
+@dataclass(frozen=True)
+class HazardDebug:
+    """Frozen hazard-field state for restore.
+
+    Occupancy (BeliefMap) and the continuous hazard layer are deliberately
+    separate (see HazardField's module docstring) -- restoring hazards from
+    this never touches BeliefMapDebug/belief_map.grid, and vice versa.
+    `next_fire_id` is captured (not just the sources) so a fire added right
+    after a restore gets the id it would have received at that point in
+    time, rather than colliding with or skipping ahead of ids only the
+    discarded future ever saw. `version` is HazardField's own change
+    counter, carried through for parity with BeliefMapDebug.revision even
+    though restore does not currently dedupe on it (fire counts are small
+    enough that rebuilding every tick is cheap, unlike the belief grid).
+    """
+
+    version: int
+    next_fire_id: int
+    sources: tuple[HazardSourceDebug, ...]
+
+
+@dataclass(frozen=True)
+class AgentStateDebug:
+    """Explicit RobotAgent state for restore -- never inferred from
+    path.active_path[-1] (which is not always the same point: exploration
+    hysteresis can keep active_path_goal_xy pointing at a target the
+    simplified/active path does not literally end on).
+
+    Recovery-policy memory (recent_safe_positions, recent_recovery_targets,
+    failed_exploration_targets, exploration_exhausted_map_signature) and
+    replan-throttle timestamps (last_safety_replan_time/_signature,
+    last_replan_time, last_prefetch_time, narrow_passage_slowdown_until_
+    time) are deliberately NOT included: restoring a throttle timestamp
+    forward of the rewound simulation_time could suppress a legitimate
+    replan that "just happened" in a future which no longer exists. `status`
+    is not duplicated here either -- it is exactly
+    NavigationDebugSnapshot.navigation_state (str(agent.status) at capture
+    time); restore uses that field directly.
+    """
+
+    final_goal_xy: Point2D | None
+    exploration_target_xy: Point2D | None
+    active_path_goal_xy: Point2D | None
+    active_path_mode: str | None
+    route_generation: int
+    route_affected_replan_count: int
+    first_segment_blocked_count: int
+    last_frontier_candidate_count: int
+    prefetch_success_count: int
+    prefetch_fail_count: int
+    safety_replan_count: int
+    target_switch_count: int
+
+
+@dataclass(frozen=True)
+class RuntimeMetricsDebug:
+    """Engine-level cumulative counters, frozen alongside the rest of the
+    snapshot so restore never leaves simulation_time behind while these
+    keep reading a later run's totals (e.g. simulation_time=15s next to
+    route_result_count from a run that had already reached t=42s)."""
+
+    total_distance_traveled: float
+    route_request_count: int
+    route_result_count: int
+    route_failure_count: int
+    sensor_update_count: int
+    mapping_update_count: int
+    safety_replan_count: int
+    exploration_replan_count: int
+    planner_jobs_started: int
+    planner_jobs_completed: int
+
+
+@dataclass(frozen=True)
 class ClearanceTerms:
     """The exact boolean safety condition a checker evaluated, with the real
     terms it used -- not a generic distance-vs-radius formula invented for
@@ -204,7 +289,36 @@ class NavigationDebugSnapshot:
     """Everything the debug overlay needs to explain one navigation decision,
     assembled once by robotics_sim.simulation.engine from values already
     computed elsewhere this tick. The GUI must treat every field as final --
-    it never re-derives, re-plans, or re-checks anything from this object."""
+    it never re-derives, re-plans, or re-checks anything from this object.
+
+    Restore contract (single-robot only -- see engine.restore_navigation_
+    debug_snapshot()): a snapshot is sufficient to roll the live simulation
+    back to the moment it was captured using exactly these fields --
+    simulation_time, robot_pose (+ .v for kinematic state), navigation_state
+    (RobotAgent.status) and tracking_mode, path.active_path /
+    path.active_waypoint_index (the route + current target), belief_map
+    (occupancy grid + per-robot explored mask), hazard (FireSource set +
+    next_fire_id, a layer fully separate from occupancy), agent_state
+    (final/exploration/active-path goals, active_path_mode, route_
+    generation, and the agent's own cumulative counters -- explicit, never
+    inferred from path.active_path[-1]), and metrics (engine-level
+    cumulative counters, so they never read ahead of simulation_time after a
+    restore). mapped_obstacle_points_count is also load-bearing: the
+    engine's live mapped_obstacle_points list is append-only, so truncating
+    it to this count reproduces the exact set of boundary samples known at
+    capture time without storing the points themselves here.
+
+    Known gaps (not restorable from this contract, by design -- see the
+    restore method's docstring): the executed-path trail (path_points) has
+    no authoritative source to rebuild from and resets to the restored
+    point. The visible explored-area *coverage* does NOT regress despite
+    the bounded explored_area_polygons sweep-history list being cleared --
+    belief_map.explored_by_robot (restored exactly) is the authoritative
+    "explored" state, and the canvas is reseeded from it directly (see
+    canvas.set_explored_area_seed()). RobotAgent's recovery-policy memory
+    and replan-throttle timestamps are also excluded (see AgentStateDebug's
+    docstring for why that is deliberate, not an oversight).
+    """
 
     snapshot_id: int
     simulation_time: float
@@ -243,3 +357,8 @@ class NavigationDebugSnapshot:
     # Exact sensor footprint and compact map state for coherent history replay.
     sensor: SensorDebug = field(default_factory=SensorDebug)
     belief_map: Maybe[BeliefMapDebug] = field(default_factory=Maybe.missing)
+    # Restore-only fields -- see the class docstring's "Restore contract"
+    # paragraph and each dataclass's own docstring.
+    hazard: Maybe[HazardDebug] = field(default_factory=Maybe.missing)
+    agent_state: Maybe[AgentStateDebug] = field(default_factory=Maybe.missing)
+    metrics: Maybe[RuntimeMetricsDebug] = field(default_factory=Maybe.missing)

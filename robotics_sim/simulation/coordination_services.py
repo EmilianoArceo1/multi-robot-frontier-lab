@@ -104,23 +104,24 @@ class RuntimeTeamFrontierProvider:
                 if target is None:
                     continue
 
+                # Hard filter: a target this robot has blacklisted must never
+                # be handed back to it as a candidate. Raising safety_cost or
+                # attaching metadata is not enough -- that only works if
+                # every plugin consuming this pool happens to read and
+                # respect it, which is exactly the gap Codex review found.
+                # Uses the same spatial-tolerance helper/radius as the
+                # `reserved` check below rather than exact float equality.
+                if _point_near_any(target, blocked_targets, self.target_exclusion_radius):
+                    continue
+
                 distance = _distance(robot.xy, target)
-                blocked = _point_near_any(
-                    target,
-                    blocked_targets,
-                    self.target_exclusion_radius,
-                )
                 reserved = _point_near_any(
                     target,
                     existing_targets,
                     self.target_exclusion_radius,
                 )
 
-                safety_cost = 0.0
-                if blocked:
-                    safety_cost += 2.0
-                if reserved:
-                    safety_cost += 8.0
+                safety_cost = 8.0 if reserved else 0.0
 
                 metadata = {
                     "robot_id": robot_id,
@@ -132,7 +133,6 @@ class RuntimeTeamFrontierProvider:
                     "distance": distance,
                     "frontier_size": int(getattr(candidate, "size", 0)),
                     "raw_score": float(getattr(candidate, "score", 0.0)),
-                    "blocked_by_robot_blacklist": blocked,
                     "reserved_by_existing_target": reserved,
                 }
 

@@ -207,8 +207,6 @@ def build_config_panel(window):
     options_grid.setHorizontalSpacing(10)
     options_grid.setVerticalSpacing(9)
 
-    window.state_switch = ToggleSwitch(True)
-
     window.planner_combo = QComboBox()
     window.planner_combo.addItems([
         "Direct",
@@ -229,9 +227,6 @@ def build_config_panel(window):
     window.coordinator_combo.addItems(COORDINATOR_OPTIONS)
     window.coordinator_combo.setCurrentText(DEFAULT_COORDINATOR)
 
-    window.control_combo = QComboBox()
-    window.control_combo.addItems(["Nominal", "Adaptive"])
-
     window.vision_combo = QComboBox()
     window.vision_combo.addItems([
         "LiDAR",
@@ -239,46 +234,36 @@ def build_config_panel(window):
         "Omnidirectional",
     ])
 
-
-    window.orders_switch = ToggleSwitch(False)
     window.obstacles_switch = ToggleSwitch(True)
     window.explored_area_switch = ToggleSwitch(True)
 
     # Visual toggles go first because they are runtime-safe and apply to
     # all robots, independent of whether robots share configuration.
-    options_grid.addWidget(
-        labeled_toggle("Robot Orders", window.orders_switch),
-        0,
-        0,
-    )
+    # "Robot Orders"/"State Machine"/"Motion Control Service" were removed:
+    # the first two are superseded by the Navigation Debug eye icon on the
+    # canvas (see simulation_canvas.py), and Motion Control Service's
+    # Nominal/Adaptive choice was never read anywhere -- confirmed dead,
+    # decorative UI with zero effect on simulation behavior.
     options_grid.addWidget(
         labeled_toggle("Show Obstacles", window.obstacles_switch),
         0,
-        1,
-    )
-    options_grid.addWidget(
-        labeled_toggle("Explored Area", window.explored_area_switch),
-        1,
         0,
     )
     options_grid.addWidget(
-        labeled_toggle("State Machine", window.state_switch),
-        1,
+        labeled_toggle("Explored Area", window.explored_area_switch),
+        0,
         1,
     )
     options_grid.addWidget(
         labeled_combo("Path Planner Service", window.planner_combo),
-        3,
-        0,
-    )
-    options_grid.addWidget(
-        labeled_combo("Motion/Control Service", window.control_combo),
-        3,
         1,
+        0,
+        1,
+        2,
     )
     options_grid.addWidget(
         labeled_combo("Vision Model", window.vision_combo),
-        4,
+        2,
         0,
         1,
         2,
@@ -289,7 +274,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        5,
+        3,
         0,
         1,
         2,
@@ -301,7 +286,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        6,
+        4,
         0,
         1,
         2,
@@ -313,7 +298,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        7,
+        5,
         0,
         1,
         2,
@@ -329,7 +314,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        8,
+        6,
         0,
         1,
         2,
@@ -345,7 +330,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        8,
+        6,
         0,
         1,
         2,
@@ -367,7 +352,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        9,
+        7,
         0,
         1,
         2,
@@ -383,9 +368,14 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        10,
+        8,
         0,
     )
+
+    # "Navigation Debug" is controlled solely by the Navigation switch in
+    # main_window._build_navigation_snapshot_bar() (docked above the canvas
+    # header), not by a side-panel control -- a single, always-visible
+    # toggle instead of two controls for the same state.
 
     options_grid.setColumnStretch(0, 1)
     options_grid.setColumnStretch(1, 1)
@@ -650,80 +640,9 @@ def build_config_panel(window):
 
     main_layout.addWidget(scroll, 1)
 
-    # Bottom actions
-    actions = QFrame()
-    actions.setObjectName("actionPanelBottom")
-
-    actions_layout = QVBoxLayout(actions)
-    actions_layout.setContentsMargins(12, 12, 12, 12)
-    actions_layout.setSpacing(8)
-
-    window.start_button = QPushButton("Start Simulation")
-    window.start_button.setObjectName("startButton")
-    window.start_button.setIcon(make_icon("play", "white"))
-    window.start_button.setIconSize(QSize(22, 22))
-    window.start_button.clicked.connect(window.handle_start_pause_button)
-
-    bottom_buttons = QHBoxLayout()
-    bottom_buttons.setSpacing(8)
-
-    file_buttons = QHBoxLayout()
-    file_buttons.setSpacing(8)
-
-    window.reset_button = QPushButton("Restart")
-    window.reset_button.setObjectName("secondaryButton")
-    window.reset_button.setIcon(make_icon("reset", TEXT))
-    window.reset_button.setIconSize(QSize(18, 18))
-    window.reset_button.clicked.connect(window.restart_simulation)
-
-    window.speed_button = QPushButton(f"Speed {window.simulation_speed:.2f}x")
-    window.speed_button.setObjectName("secondaryButton")
-    window.speed_button.setIcon(make_icon("gear", TEXT))
-    window.speed_button.setIconSize(QSize(18, 18))
-    window.speed_button.clicked.connect(window.cycle_simulation_speed)
-
-    window.metrics_button = QPushButton("Metrics")
-    window.metrics_button.setObjectName("secondaryButton")
-    window.metrics_button.setIcon(make_icon("maximize", TEXT))
-    window.metrics_button.setIconSize(QSize(18, 18))
-    window.metrics_button.clicked.connect(window.open_metrics_window)
-
-    window.console_button = QPushButton("Console")
-    window.console_button.setObjectName("secondaryButton")
-    window.console_button.setIcon(make_icon("console", TEXT))
-    window.console_button.setIconSize(QSize(18, 18))
-    window.console_button.clicked.connect(window.open_console_window)
-
-    window.load_button = QPushButton("Load .sim")
-    window.load_button.setObjectName("secondaryButton")
-    window.load_button.setIcon(make_icon("reset", TEXT))
-    window.load_button.setIconSize(QSize(18, 18))
-    window.load_button.clicked.connect(window.load_simulation_config)
-
-    window.save_button = QPushButton("Save .sim")
-    window.save_button.setObjectName("secondaryButton")
-    window.save_button.setIcon(make_icon("save", TEXT))
-    window.save_button.setIconSize(QSize(18, 18))
-    window.save_button.clicked.connect(window.save_simulation_config)
-
-    monitor_buttons = QHBoxLayout()
-    monitor_buttons.setSpacing(8)
-
-    bottom_buttons.addWidget(window.reset_button)
-    bottom_buttons.addWidget(window.speed_button)
-
-    monitor_buttons.addWidget(window.metrics_button)
-    monitor_buttons.addWidget(window.console_button)
-
-    file_buttons.addWidget(window.load_button)
-    file_buttons.addWidget(window.save_button)
-
-    actions_layout.addWidget(window.start_button)
-    actions_layout.addLayout(bottom_buttons)
-    actions_layout.addLayout(monitor_buttons)
-    actions_layout.addLayout(file_buttons)
-
-    main_layout.addWidget(actions)
+    # Runtime actions live in the canvas action bar. The configuration panel
+    # now contains only configuration fields; Load/Save are exposed from the
+    # top-bar gear menu.
 
     # Signals
     numeric_widgets = [
@@ -763,7 +682,6 @@ def build_config_panel(window):
         widget.valueChanged.connect(window.update_preview)
 
     window.preview_switch.toggled.connect(window.update_preview)
-    window.state_switch.toggled.connect(window.update_preview)
     # Editor controls are created in build_editor_panel(). Do not create the
     # editor tool combo here; doing so would leave the editor with wrong options.
     window.planner_combo.currentTextChanged.connect(window.update_preview)
@@ -771,7 +689,6 @@ def build_config_panel(window):
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
     window.coordinator_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)
-    window.orders_switch.toggled.connect(window.update_preview)
     window.obstacles_switch.toggled.connect(window.update_preview)
     window.explored_area_switch.toggled.connect(window.update_preview)
     window.body_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
@@ -800,16 +717,14 @@ def build_config_panel(window):
 
     # Controls that define the initial conditions, algorithms, and physical
     # model are locked while a simulation is active. Display-only controls
-    # such as Robot Orders, Show Obstacles, Explored Area, Metrics, and
-    # Speed stay available because they do not invalidate the running state.
+    # such as Show Obstacles, Explored Area, Metrics, and Speed stay
+    # available because they do not invalidate the running state.
     window.locked_during_run_widgets = [
         window.top_bar.mode_selector,
-        window.state_switch,
         window.planner_combo,
         window.path_simplifier_combo,
         window.exploration_planner_combo,
         window.coordinator_combo,
-        window.control_combo,
         window.vision_combo,
         window.robot_count_input,
         window.same_config_switch,
@@ -844,7 +759,6 @@ def build_config_panel(window):
         window.goal_tol_input,
         window.goal_x_input,
         window.goal_y_input,
-        window.load_button,
         window.top_bar.single_mode_button,
         window.top_bar.multi_mode_button,
     ]

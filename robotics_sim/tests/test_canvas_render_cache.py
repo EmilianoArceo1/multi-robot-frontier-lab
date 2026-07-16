@@ -464,9 +464,14 @@ def test_instrumentation_does_not_disturb_existing_render_caches():
     """Adding fine-grained timers around existing draw calls must not
     change which branch any cache takes -- a second, unchanged frame must
     still reuse every existing cache object, exactly as before this
-    round's instrumentation."""
+    round's instrumentation.
+
+    draw_executed_path() is no longer called from draw_plot() (the
+    executed-trail line was dropped from the always-on render pipeline by
+    request -- see robotics_sim/app/simulation_canvas.py's draw_plot()
+    comment); its own cache behavior when called directly is still covered
+    by the test_executed_trail_cache_* tests below."""
     canvas = _make_canvas()
-    canvas.config.show_robot_orders = True
     canvas.set_mapped_obstacle_points([(1.0, 1.0), (2.0, 2.0)])
     canvas.set_planned_path([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
     canvas.set_path([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)])
@@ -476,13 +481,11 @@ def test_instrumentation_does_not_disturb_existing_render_caches():
     static_plot_cache = canvas._static_plot_cache
     mapped_points_cache = canvas._mapped_points_cache
     planned_route_cache = canvas._planned_route_cache
-    executed_trail_pixmap = canvas._executed_trail_pixmap
     fov_cache_snapshot = dict(canvas._sensor_polygon_caches_by_robot)
 
     assert static_plot_cache is not None
     assert mapped_points_cache is not None
     assert planned_route_cache is not None
-    assert executed_trail_pixmap is not None
     assert fov_cache_snapshot
 
     _full_paint_once(canvas)
@@ -490,7 +493,6 @@ def test_instrumentation_does_not_disturb_existing_render_caches():
     assert canvas._static_plot_cache is static_plot_cache
     assert canvas._mapped_points_cache is mapped_points_cache
     assert canvas._planned_route_cache is planned_route_cache
-    assert canvas._executed_trail_pixmap is executed_trail_pixmap
     for cache_key, (pose, signature, polygon) in canvas._sensor_polygon_caches_by_robot.items():
         assert polygon is fov_cache_snapshot[cache_key][2], (
             "the FOV cache must still return the identical cached polygon object "

@@ -116,7 +116,7 @@ def _is_traversable(grid: OccupancyGrid, cell: GridCell) -> bool:
     return False
 
 
-def _line_of_sight_grid_safe(grid: OccupancyGrid, a: GridCell, b: GridCell) -> bool:
+def line_of_sight_grid_safe(grid: OccupancyGrid, a: GridCell, b: GridCell) -> bool:
     """Return whether the segment a-b stays in traversable cells."""
     for cell in _bresenham_cells(a, b):
         if not _is_traversable(grid, cell):
@@ -143,7 +143,7 @@ def simplify_path_by_line_of_sight(
         next_idx = anchor_idx + 1
 
         for candidate_idx in range(len(path) - 1, anchor_idx, -1):
-            if _line_of_sight_grid_safe(grid, path[anchor_idx], path[candidate_idx]):
+            if line_of_sight_grid_safe(grid, path[anchor_idx], path[candidate_idx]):
                 next_idx = candidate_idx
                 break
 
@@ -250,7 +250,7 @@ def simplify_path_by_rdp_grid_safe(
 
     proposed = _rdp(path, float(epsilon_cells))
 
-    if len(proposed) <= 2 and _line_of_sight_grid_safe(grid, proposed[0], proposed[-1]):
+    if len(proposed) <= 2 and line_of_sight_grid_safe(grid, proposed[0], proposed[-1]):
         return proposed
 
     # Build a position map to avoid path.index(...) ambiguity.
@@ -270,7 +270,7 @@ def simplify_path_by_rdp_grid_safe(
         point_idx = candidate_indices[0]
         anchor = repaired[-1]
 
-        if _line_of_sight_grid_safe(grid, anchor, point):
+        if line_of_sight_grid_safe(grid, anchor, point):
             repaired.append(point)
             search_start = point_idx
             continue
@@ -285,7 +285,7 @@ def simplify_path_by_rdp_grid_safe(
         search_start = point_idx
 
     if repaired[-1] != path[-1]:
-        if _line_of_sight_grid_safe(grid, repaired[-1], path[-1]):
+        if line_of_sight_grid_safe(grid, repaired[-1], path[-1]):
             repaired.append(path[-1])
         else:
             tail_start = positions.get(repaired[-1], [0])[-1]

@@ -33,12 +33,21 @@ class CollisionReport:
 
     The boolean `collision` is the main decision signal. The other fields exist
     for status messages, debugging, and future visualization.
+
+    `distance` is only populated on a collision hit for the point-cloud checks
+    (check_segment_points/check_position_points/check_predicted_motion_points),
+    since that is the only case where those checks already compute a scalar
+    distance before comparing it to robot_radius. On a clear result there is
+    no single distance value to report -- the loop simply finds nothing within
+    radius of any sampled point, so this stays None rather than being invented
+    (e.g. as a nearest-point search the real check never performs).
     """
 
     collision: bool
     reason: str = "clear"
     obstacle: RectObstacle | None = None
     point: Point2D | None = None
+    distance: float | None = None
 
 
 @dataclass(frozen=True)
@@ -318,12 +327,14 @@ class CollisionChecker:
         """
         for point in obstacle_points:
             mapped_point = (float(point[0]), float(point[1]))
-            if point_inside_disk(position, mapped_point, robot_radius):
+            distance = math.hypot(position[0] - mapped_point[0], position[1] - mapped_point[1])
+            if distance <= robot_radius:
                 return CollisionReport(
                     collision=True,
                     reason="robot center is inside a mapped obstacle point radius",
                     obstacle=None,
                     point=mapped_point,
+                    distance=distance,
                 )
 
         return CollisionReport(collision=False)
@@ -343,12 +354,14 @@ class CollisionChecker:
 
         for point in obstacle_points:
             mapped_point = (float(point[0]), float(point[1]))
-            if distance_point_to_segment(mapped_point, start, end) <= robot_radius:
+            distance = distance_point_to_segment(mapped_point, start, end)
+            if distance <= robot_radius:
                 return CollisionReport(
                     collision=True,
                     reason="local path segment intersects mapped obstacle point radius",
                     obstacle=None,
                     point=mapped_point,
+                    distance=distance,
                 )
 
         return CollisionReport(collision=False)
@@ -375,6 +388,7 @@ class CollisionChecker:
                     reason="predicted motion enters a mapped obstacle point radius",
                     obstacle=None,
                     point=report.point,
+                    distance=report.distance,
                 )
 
         return CollisionReport(collision=False)

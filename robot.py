@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 import numpy as np
 
 from robotics_sim.control.modes import RobotMode
@@ -8,6 +10,9 @@ from robotics_sim.core.limits import RobotLimits
 from robotics_sim.core.state import RobotState
 from robotics_sim.models.dynamic_unicycle import DynamicUnicycle2D
 from robotics_sim.planning.waypoint_manager import WaypointManager
+
+if TYPE_CHECKING:
+    from robotics_sim.diagnostics.capture import NavigationDebugCapture
 
 
 class Robot:
@@ -249,6 +254,7 @@ class Robot:
         goal=None,
         blocked: bool = False,
         failed: bool = False,
+        capture: "NavigationDebugCapture | None" = None,
     ) -> np.ndarray:
         """
         Compute nominal control.
@@ -258,6 +264,10 @@ class Robot:
             2. update logical mode
             3. get active waypoint
             4. compute nominal control
+
+        capture: optional diagnostic sink forwarded to
+        TrackingController.compute_control(); None (the default) costs
+        nothing extra.
         """
         if goal is not None:
             self.set_goal(goal)
@@ -274,6 +284,7 @@ class Robot:
             target=target,
             limits=self.limits,
             mode=self.mode,
+            capture=capture,
         )
 
         return self.clip_control(control)

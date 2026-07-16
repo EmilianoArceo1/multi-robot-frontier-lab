@@ -322,6 +322,13 @@ class SimulationConfig:
     agent_mode: str = "Single Robot Mode"
     grid_resolution: float = 0.5
 
+    # Dynamic fire/hazard layer. Occupancy remains UNKNOWN/FREE/OCCUPIED;
+    # these parameters control a separate continuous thermal field.
+    default_fire_intensity: float = 1.0
+    default_fire_radius: float = 2.0
+    fire_selection_radius: float = 0.6
+    hazard_block_threshold: float = 0.55
+
     # Simulation camera/view rectangle. In editor mode this is shown as a
     # red adjustable frame. In simulation mode this rectangle is the world area
     # mapped to the canvas viewport.
@@ -533,6 +540,12 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "obstacles": [list(obstacle) for obstacle in config.obstacles],
             "grid_resolution": config.grid_resolution,
         },
+        "hazard": {
+            "default_fire_intensity": config.default_fire_intensity,
+            "default_fire_radius": config.default_fire_radius,
+            "fire_selection_radius": config.fire_selection_radius,
+            "block_threshold": config.hazard_block_threshold,
+        },
         "camera": {
             "center_x": config.camera_center_x,
             "center_y": config.camera_center_y,
@@ -612,6 +625,7 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     simulation = payload.get("simulation", {}) if isinstance(payload.get("simulation", {}), dict) else {}
     camera = payload.get("camera", {}) if isinstance(payload.get("camera", {}), dict) else {}
     multi_robot = payload.get("multi_robot", {}) if isinstance(payload.get("multi_robot", {}), dict) else {}
+    hazard = payload.get("hazard", {}) if isinstance(payload.get("hazard", {}), dict) else {}
 
     planner_type = str(planner.get("type", default.planner_type))
     if planner_type not in PLANNER_OPTIONS:
@@ -720,6 +734,40 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         grid_resolution=_as_float(
             map_data.get("grid_resolution", default.grid_resolution),
             default.grid_resolution,
+        ),
+        default_fire_intensity=min(
+            1.0,
+            max(
+                1e-6,
+                _as_float(
+                    hazard.get("default_fire_intensity", default.default_fire_intensity),
+                    default.default_fire_intensity,
+                ),
+            ),
+        ),
+        default_fire_radius=max(
+            1e-6,
+            _as_float(
+                hazard.get("default_fire_radius", default.default_fire_radius),
+                default.default_fire_radius,
+            ),
+        ),
+        fire_selection_radius=max(
+            0.0,
+            _as_float(
+                hazard.get("fire_selection_radius", default.fire_selection_radius),
+                default.fire_selection_radius,
+            ),
+        ),
+        hazard_block_threshold=min(
+            1.0,
+            max(
+                1e-6,
+                _as_float(
+                    hazard.get("block_threshold", default.hazard_block_threshold),
+                    default.hazard_block_threshold,
+                ),
+            ),
         ),
         camera_center_x=_as_float(camera.get("center_x", default.camera_center_x), default.camera_center_x),
         camera_center_y=_as_float(camera.get("center_y", default.camera_center_y), default.camera_center_y),

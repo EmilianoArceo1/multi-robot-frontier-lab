@@ -1008,6 +1008,39 @@ class SimulationControllerMixin:
     def final_goal_xy(self) -> tuple[float, float]:
         return (float(self.config.goal_x), float(self.config.goal_y))
 
+    def _restore_final_goal_into_config_and_widgets(self, goal_xy: tuple[float, float]) -> None:
+        """Sync config.goal_x/goal_y and the Goal X/Y widgets to *goal_xy*.
+
+        Used by restore_navigation_debug_snapshot(): final_goal_xy() (read by
+        select_navigation_goal()/every subsequent replan) returns config.
+        goal_x/goal_y directly, never agent.final_goal_xy -- restoring only
+        the agent field leaves config, and the GUI showing it, pointed at
+        whatever goal the live run had since moved on to.
+
+        Widgets are updated with signals blocked, same pattern as
+        MainWindow.load_selected_robot_into_panel()/refresh_same_position_
+        rows() -- a restore must not trigger update_preview()-style edit
+        callbacks, replans, or additional navigation-debug snapshots.
+        """
+        gx, gy = float(goal_xy[0]), float(goal_xy[1])
+        self.config.goal_x = gx
+        self.config.goal_y = gy
+
+        widgets = [
+            widget
+            for widget in (getattr(self, "goal_x_input", None), getattr(self, "goal_y_input", None))
+            if widget is not None
+        ]
+        blocked = [widget.blockSignals(True) for widget in widgets]
+        try:
+            if hasattr(self, "goal_x_input"):
+                self.goal_x_input.setValue(gx)
+            if hasattr(self, "goal_y_input"):
+                self.goal_y_input.setValue(gy)
+        finally:
+            for widget, was_blocked in zip(widgets, blocked):
+                widget.blockSignals(was_blocked)
+
     def select_navigation_goal(self, start_xy: tuple[float, float]) -> tuple[tuple[float, float] | None, str]:
         """
         Select the current navigation target.
@@ -2710,12 +2743,20 @@ class SimulationControllerMixin:
         return NavigationDebugEventKind.TICK
 
     def _navigation_debug_belief_frame(self) -> Maybe[BeliefMapDebug]:
-        """Return a compact immutable map frame, reusing it until the belief changes.
+        """Return a compact immutable map frame.
 
         Navigation history records every simulation tick. Copying a full grid on
-        every tick would make the replay prohibitively large, so BeliefMap exposes
-        a monotonic visual revision and all snapshots for the same revision share
-        one compressed BeliefMapDebug object.
+        every tick would make the replay prohibitively large, so the expensive
+        grid/explored_by_robot compression is cached and reused across ticks
+        that share the same BeliefMap.revision.
+
+        visit_count/last_seen are compressed fresh on every call instead:
+        BeliefMap.revision explicitly does NOT bump for visit-count/last-seen-
+        only changes (see its own docstring), so reusing the revision-keyed
+        cache for them would silently restore an earlier tick's visit history
+        under a later tick's snapshot. These two arrays are small (uint16/
+        float32, one grid-sized array each), so compressing them every call
+        is cheap relative to the grid/explored cache this preserves.
         """
         belief = getattr(self, "belief_map", None)
         if belief is None:
@@ -2724,33 +2765,45 @@ class SimulationControllerMixin:
         revision = int(getattr(belief, "revision", 0))
         cache_key = (id(belief), revision, int(getattr(belief, "robot_count", 1)))
         cached_key = getattr(self, "_nav_debug_belief_frame_key", None)
-        cached_frame = getattr(self, "_nav_debug_belief_frame_cache", None)
-        if cached_key == cache_key and cached_frame is not None:
-            return Maybe.of(cached_frame)
-
-        grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
-        explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
-        if explored.shape[0] == 1 and not np.any(explored):
-            known_cells = grid != UNKNOWN
-            if np.any(known_cells):
-                explored = explored.copy()
-                explored[0] = known_cells.astype(np.uint8, copy=False)
-        packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
-        frame = BeliefMapDebug(
-            revision=revision,
-            resolution=float(belief.resolution),
-            bounds=tuple(float(v) for v in belief.bounds),
-            grid_shape=(int(grid.shape[0]), int(grid.shape[1])),
-            grid_zlib=zlib.compress(grid.tobytes(order="C"), level=1),
-            explored_shape=(
+        cached_parts = getattr(self, "_nav_debug_belief_frame_cache", None)
+        if cached_key == cache_key and cached_parts is not None:
+            resolution, bounds, grid_shape, grid_zlib, explored_shape, explored_packbits_zlib = cached_parts
+        else:
+            grid = np.ascontiguousarray(belief.grid, dtype=np.int8)
+            explored = np.ascontiguousarray(belief.explored_by_robot, dtype=np.uint8)
+            if explored.shape[0] == 1 and not np.any(explored):
+                known_cells = grid != UNKNOWN
+                if np.any(known_cells):
+                    explored = explored.copy()
+                    explored[0] = known_cells.astype(np.uint8, copy=False)
+            packed_explored = np.packbits(explored.reshape(-1), bitorder="little")
+            resolution = float(belief.resolution)
+            bounds = tuple(float(v) for v in belief.bounds)
+            grid_shape = (int(grid.shape[0]), int(grid.shape[1]))
+            grid_zlib = zlib.compress(grid.tobytes(order="C"), level=1)
+            explored_shape = (
                 int(explored.shape[0]),
                 int(explored.shape[1]),
                 int(explored.shape[2]),
-            ),
-            explored_packbits_zlib=zlib.compress(packed_explored.tobytes(), level=1),
+            )
+            explored_packbits_zlib = zlib.compress(packed_explored.tobytes(), level=1)
+            cached_parts = (resolution, bounds, grid_shape, grid_zlib, explored_shape, explored_packbits_zlib)
+            self._nav_debug_belief_frame_key = cache_key
+            self._nav_debug_belief_frame_cache = cached_parts
+
+        visit_count = np.ascontiguousarray(belief.visit_count, dtype=np.uint16)
+        last_seen = np.ascontiguousarray(belief.last_seen, dtype=np.float32)
+        frame = BeliefMapDebug(
+            revision=revision,
+            resolution=resolution,
+            bounds=bounds,
+            grid_shape=grid_shape,
+            grid_zlib=grid_zlib,
+            explored_shape=explored_shape,
+            explored_packbits_zlib=explored_packbits_zlib,
+            visit_count_zlib=zlib.compress(visit_count.tobytes(order="C"), level=1),
+            last_seen_zlib=zlib.compress(last_seen.tobytes(order="C"), level=1),
         )
-        self._nav_debug_belief_frame_key = cache_key
-        self._nav_debug_belief_frame_cache = frame
         return Maybe.of(frame)
 
     def _navigation_debug_hazard_frame(self) -> Maybe[HazardDebug]:
@@ -4235,7 +4288,34 @@ class SimulationControllerMixin:
                 explored = explored.copy()
                 explored[0] = known_cells
 
-        if grid.shape != belief.grid.shape or explored.shape != belief.explored_by_robot.shape:
+        # visit_count/last_seen -- restored exactly, never reconstructed from
+        # grid/explored (a cell can be FREE with any visit count >= 1; only
+        # the exact captured count is correct). Empty bytes means this frame
+        # predates the field existing -- fall back to BeliefMap's own
+        # zero-state defaults for that case rather than crashing.
+        if frame.visit_count_zlib:
+            visit_count = (
+                np.frombuffer(zlib.decompress(frame.visit_count_zlib), dtype=np.uint16)
+                .reshape(frame.grid_shape)
+                .copy()
+            )
+        else:
+            visit_count = np.zeros(frame.grid_shape, dtype=np.uint16)
+        if frame.last_seen_zlib:
+            last_seen = (
+                np.frombuffer(zlib.decompress(frame.last_seen_zlib), dtype=np.float32)
+                .reshape(frame.grid_shape)
+                .copy()
+            )
+        else:
+            last_seen = np.full(frame.grid_shape, -1.0, dtype=np.float32)
+
+        if (
+            grid.shape != belief.grid.shape
+            or explored.shape != belief.explored_by_robot.shape
+            or visit_count.shape != belief.visit_count.shape
+            or last_seen.shape != belief.last_seen.shape
+        ):
             # Geometry changed since capture (resolution/bounds/robot_count) --
             # cannot restore safely.
             return False
@@ -4254,8 +4334,14 @@ class SimulationControllerMixin:
         self.robot.v = float(snapshot.robot_pose.v)
 
         # 4. Belief map + explored area (authoritative -- see docstring).
+        # visit_count/last_seen are restored alongside grid/explored_by_robot
+        # so average_seen_penalty()/stats() (revisit_ratio, etc.) read the
+        # exact historical values instead of whatever the live run had
+        # accumulated past this point.
         belief.grid = grid
         belief.explored_by_robot = explored
+        belief.visit_count = visit_count
+        belief.last_seen = last_seen
         belief.revision += 1
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
@@ -4326,6 +4412,14 @@ class SimulationControllerMixin:
             if agent is not None:
                 agent.waypoints.clear()
 
+        # 7a. Tracking FSM mode -- both branches above reset it to IDLE
+        # (set_waypoints() does this as a side effect; the else branch does
+        # it explicitly), so this must run AFTER them to actually restore
+        # the captured ROTATE/TRACK/etc. mode instead of losing it. Uses
+        # the state machine's own public restore API rather than writing
+        # robot.state_machine.mode directly from here.
+        self.robot.state_machine.restore_mode(snapshot.tracking_mode)
+
         if agent is not None:
             # Pending/prefetch route state and route-repair bookkeeping are
             # always cleared regardless of branch above -- a path prefetched
@@ -4340,6 +4434,17 @@ class SimulationControllerMixin:
             if not agent_state.unavailable and agent_state.value is not None:
                 state = agent_state.value
                 agent.final_goal_xy = state.final_goal_xy
+                if state.final_goal_xy is not None:
+                    # final_goal_xy() (the authoritative source select_
+                    # navigation_goal()/replans read) returns config.goal_x/
+                    # goal_y directly, NOT agent.final_goal_xy -- restoring
+                    # only the agent field above left config/the GUI still
+                    # showing whatever goal the live run had moved on to. No
+                    # coordinate to restore config/widgets to when the
+                    # snapshot itself had no final goal (state.final_goal_xy
+                    # is None) -- config.goal_x/y has no "unset" state, so it
+                    # is left as-is rather than forced to some placeholder.
+                    self._restore_final_goal_into_config_and_widgets(state.final_goal_xy)
                 agent.exploration_target_xy = state.exploration_target_xy
                 agent.active_path_goal_xy = state.active_path_goal_xy
                 agent.active_path_mode = state.active_path_mode

@@ -26,20 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from robotics_sim.simulation.config import (
-    BLUE,
-    BLUE_LIGHT,
-    BORDER,
-    BORDER_SOFT,
-    CARD,
-    GREEN,
-    GREEN_LIGHT,
-    MAROON,
-    ORANGE,
-    PANEL_CARD,
-    TEXT,
-    TEXT_MUTED,
-)
+from robotics_sim.app.theme import ThemeColors, ThemeMode, theme_colors, with_alpha
 
 
 def _maybe_text(maybe_value, formatter=str) -> str:
@@ -67,6 +54,12 @@ class _InfoSection(QFrame):
     def __init__(self, title: str, fields: tuple[tuple[str, str], ...], parent=None):
         super().__init__(parent)
         self.setObjectName("reasoningSection")
+        # A QFrame styled only via a *cascaded* stylesheet rule (not its own
+        # setStyleSheet() call) needs this explicitly, or Qt skips painting
+        # the QSS background and the default palette color shows through
+        # instead -- invisible in light mode (both were near-white) but a
+        # glaring light card on a dark panel in dark mode.
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.values: dict[str, QLabel] = {}
 
         root = QVBoxLayout(self)
@@ -122,122 +115,10 @@ class NavigationReasoningWindow(QFrame):
         super().__init__(parent)
         self.setObjectName("navigationReasoningPanel")
         self.setMinimumWidth(320)
-        self.setStyleSheet(
-            f"""
-            QFrame#navigationReasoningPanel {{
-                background: {CARD};
-                border: none;
-            }}
-            QLabel {{
-                color: {TEXT};
-                background: transparent;
-            }}
-            QLabel#reasoningTitle {{
-                color: {TEXT};
-                font-size: 15px;
-                font-weight: 900;
-            }}
-            QLabel#reasoningSubtitle {{
-                color: {TEXT_MUTED};
-                font-size: 10px;
-                font-weight: 600;
-            }}
-            QLabel#reasoningViewBadge {{
-                color: {BLUE};
-                background: {BLUE_LIGHT};
-                border: 1px solid #B9D5FA;
-                border-radius: 9px;
-                padding: 3px 8px;
-                font-size: 9px;
-                font-weight: 900;
-            }}
-            QFrame#reasoningSummaryCard {{
-                background: #F8FAFD;
-                border: 1px solid {BORDER};
-                border-radius: 10px;
-            }}
-            QLabel#reasoningDecisionBadge {{
-                color: {GREEN};
-                background: {GREEN_LIGHT};
-                border-radius: 8px;
-                padding: 4px 8px;
-                font-size: 10px;
-                font-weight: 900;
-            }}
-            QLabel#reasoningExplanation {{
-                color: {TEXT};
-                font-size: 11px;
-                font-weight: 800;
-            }}
-            QLabel#reasoningMeta {{
-                color: {TEXT_MUTED};
-                font-size: 9px;
-                font-weight: 700;
-            }}
-            QFrame#reasoningSection {{
-                background: {PANEL_CARD};
-                border: 1px solid {BORDER_SOFT};
-                border-radius: 9px;
-            }}
-            QLabel#reasoningSectionTitle {{
-                color: {MAROON};
-                font-size: 10px;
-                font-weight: 900;
-            }}
-            QLabel#reasoningFieldName {{
-                color: {TEXT_MUTED};
-                font-size: 9px;
-                font-weight: 800;
-                min-width: 82px;
-            }}
-            QLabel#reasoningFieldValue {{
-                color: {TEXT};
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 9px;
-                font-weight: 650;
-            }}
-            QFrame#reasoningPlaceholder {{
-                background: #F8FAFD;
-                border: 1px dashed {BORDER};
-                border-radius: 11px;
-            }}
-            QLabel#reasoningPlaceholderTitle {{
-                color: {TEXT};
-                font-size: 12px;
-                font-weight: 900;
-            }}
-            QLabel#reasoningPlaceholderBody {{
-                color: {TEXT_MUTED};
-                font-size: 10px;
-                font-weight: 600;
-            }}
-            QFrame#reasoningFooter {{
-                background: #F8F9FB;
-                border-top: 1px solid {BORDER_SOFT};
-            }}
-            QLabel#reasoningHistoryLabel {{
-                color: {TEXT_MUTED};
-                font-size: 9px;
-                font-weight: 800;
-            }}
-            QPushButton#panelCloseButton {{
-                border: none;
-                background: transparent;
-                color: {TEXT_MUTED};
-                font-size: 18px;
-                font-weight: 700;
-            }}
-            QPushButton#panelCloseButton:hover {{
-                color: {TEXT};
-                background: rgba(20,25,35,0.06);
-                border-radius: 5px;
-            }}
-            QScrollArea#navigationReasoningScroll {{
-                background: #F4F6F9;
-                border: none;
-            }}
-            """
-        )
+        self._theme_mode = ThemeMode.LIGHT
+        self._last_tracking_mode = "—"
+        self._last_decision_kind = "—"
+        self.setStyleSheet(self._build_stylesheet(theme_colors(self._theme_mode)))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -278,18 +159,27 @@ class NavigationReasoningWindow(QFrame):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.viewport().setStyleSheet("background: #F4F6F9;")
+        # NOTE: do not call self.scroll.viewport().setStyleSheet(...) here --
+        # a stylesheet set directly on a QScrollArea's internal viewport
+        # widget breaks QSS cascade propagation to everything nested inside
+        # it (verified: identical child rules simply stop resolving), which
+        # is what silently kept every card below stuck showing a light
+        # fallback color even after this window's own stylesheet went dark.
+        # QFrame#reasoningSummaryCard/reasoningSection etc. below take their
+        # background from the window-level stylesheet cascading through the
+        # (unstyled) viewport instead.
         root.addWidget(self.scroll, 1)
 
         self.content = QWidget()
         self.content.setObjectName("navigationReasoningContent")
-        self.content.setStyleSheet("QWidget#navigationReasoningContent { background: #F4F6F9; }")
+        self.content.setAttribute(Qt.WA_StyledBackground, True)
         content_layout = QVBoxLayout(self.content)
         content_layout.setContentsMargins(10, 10, 10, 12)
         content_layout.setSpacing(9)
 
         self.placeholder = QFrame()
         self.placeholder.setObjectName("reasoningPlaceholder")
+        self.placeholder.setAttribute(Qt.WA_StyledBackground, True)
         placeholder_layout = QVBoxLayout(self.placeholder)
         placeholder_layout.setContentsMargins(18, 26, 18, 26)
         placeholder_layout.setSpacing(6)
@@ -316,6 +206,7 @@ class NavigationReasoningWindow(QFrame):
 
         self.summary_card = QFrame()
         self.summary_card.setObjectName("reasoningSummaryCard")
+        self.summary_card.setAttribute(Qt.WA_StyledBackground, True)
         summary_layout = QVBoxLayout(self.summary_card)
         summary_layout.setContentsMargins(12, 11, 12, 11)
         summary_layout.setSpacing(7)
@@ -416,6 +307,7 @@ class NavigationReasoningWindow(QFrame):
         # label still reflects whatever that bar selects.
         footer = QFrame(self)
         footer.setObjectName("reasoningFooter")
+        footer.setAttribute(Qt.WA_StyledBackground, True)
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(12, 8, 10, 8)
         footer_layout.setSpacing(7)
@@ -431,6 +323,133 @@ class NavigationReasoningWindow(QFrame):
 
         self.set_no_snapshot()
 
+    def _build_stylesheet(self, c: ThemeColors) -> str:
+        return f"""
+            QFrame#navigationReasoningPanel {{
+                background: {c.card_background};
+                border: none;
+            }}
+            QLabel {{
+                color: {c.text_primary};
+                background: transparent;
+            }}
+            QLabel#reasoningTitle {{
+                color: {c.text_primary};
+                font-size: 15px;
+                font-weight: 900;
+            }}
+            QLabel#reasoningSubtitle {{
+                color: {c.text_secondary};
+                font-size: 10px;
+                font-weight: 600;
+            }}
+            QLabel#reasoningViewBadge {{
+                color: {c.accent};
+                background: {with_alpha(c.accent, 38)};
+                border: 1px solid {with_alpha(c.accent, 90)};
+                border-radius: 9px;
+                padding: 3px 8px;
+                font-size: 9px;
+                font-weight: 900;
+            }}
+            QFrame#reasoningSummaryCard {{
+                background: {c.panel_background};
+                border: 1px solid {c.border};
+                border-radius: 10px;
+            }}
+            QLabel#reasoningDecisionBadge {{
+                color: {c.success};
+                background: {with_alpha(c.success, 38)};
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 10px;
+                font-weight: 900;
+            }}
+            QLabel#reasoningExplanation {{
+                color: {c.text_primary};
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QLabel#reasoningMeta {{
+                color: {c.text_secondary};
+                font-size: 9px;
+                font-weight: 700;
+            }}
+            QFrame#reasoningSection {{
+                background: {c.panel_background};
+                border: 1px solid {c.border};
+                border-radius: 9px;
+            }}
+            QLabel#reasoningSectionTitle {{
+                color: {c.accent};
+                font-size: 10px;
+                font-weight: 900;
+            }}
+            QLabel#reasoningFieldName {{
+                color: {c.text_secondary};
+                font-size: 9px;
+                font-weight: 800;
+                min-width: 82px;
+            }}
+            QLabel#reasoningFieldValue {{
+                color: {c.text_primary};
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 9px;
+                font-weight: 650;
+            }}
+            QFrame#reasoningPlaceholder {{
+                background: {c.panel_background};
+                border: 1px dashed {c.border};
+                border-radius: 11px;
+            }}
+            QLabel#reasoningPlaceholderTitle {{
+                color: {c.text_primary};
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            QLabel#reasoningPlaceholderBody {{
+                color: {c.text_secondary};
+                font-size: 10px;
+                font-weight: 600;
+            }}
+            QFrame#reasoningFooter {{
+                background: {c.panel_background};
+                border-top: 1px solid {c.border};
+            }}
+            QLabel#reasoningHistoryLabel {{
+                color: {c.text_secondary};
+                font-size: 9px;
+                font-weight: 800;
+            }}
+            QPushButton#panelCloseButton {{
+                border: none;
+                background: transparent;
+                color: {c.text_secondary};
+                font-size: 18px;
+                font-weight: 700;
+            }}
+            QPushButton#panelCloseButton:hover {{
+                color: {c.text_primary};
+                background: {with_alpha(c.text_primary, 22)};
+                border-radius: 5px;
+            }}
+            QScrollArea#navigationReasoningScroll {{
+                background: {c.app_background};
+                border: none;
+            }}
+            QWidget#navigationReasoningContent {{
+                background: {c.app_background};
+            }}
+            """
+
+    def set_theme_mode(self, mode: ThemeMode | str) -> None:
+        """Re-theme the panel in place. Only chrome/status colors change --
+        no snapshot data, history position, or widget structure is touched."""
+        self._theme_mode = ThemeMode(mode)
+        self.setStyleSheet(self._build_stylesheet(theme_colors(self._theme_mode)))
+        self._set_decision_accent(self._last_tracking_mode, self._last_decision_kind)
+        self.update()
+
     def set_no_snapshot(self) -> None:
         self.placeholder.setVisible(True)
         self.details.setVisible(False)
@@ -440,15 +459,18 @@ class NavigationReasoningWindow(QFrame):
         self._explanation_label.setText("No navigation decisions captured yet.")
 
     def _set_decision_accent(self, tracking_mode: str, decision_kind: str) -> None:
+        self._last_tracking_mode = tracking_mode
+        self._last_decision_kind = decision_kind
         text = f"{tracking_mode} {decision_kind}".upper()
+        c = theme_colors(self._theme_mode)
         if any(token in text for token in ("STOP", "BLOCK", "COLLISION", "FAILED")):
-            foreground, background = "#B42318", "#FDE8E7"
+            foreground, background = c.destructive, with_alpha(c.destructive, 38)
         elif any(token in text for token in ("ROTATE", "REPLAN", "HOLD")):
-            foreground, background = ORANGE, "#FFF1E5"
+            foreground, background = c.warning, with_alpha(c.warning, 38)
         elif "TRACK" in text or "FOLLOW" in text:
-            foreground, background = GREEN, GREEN_LIGHT
+            foreground, background = c.success, with_alpha(c.success, 38)
         else:
-            foreground, background = BLUE, BLUE_LIGHT
+            foreground, background = c.accent, with_alpha(c.accent, 38)
         self._decision_badge.setStyleSheet(
             f"color: {foreground}; background: {background}; border-radius: 8px; "
             "padding: 4px 8px; font-size: 10px; font-weight: 900;"

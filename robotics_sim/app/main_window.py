@@ -12,12 +12,13 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSize, QThreadPool
+from PySide6.QtCore import Qt, QTimer, QSize, QThreadPool, QEasingCurve, QPropertyAnimation
 from PySide6.QtGui import QAction, QColor, QFont, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -35,6 +36,18 @@ from robotics_sim.simulation.config import *
 from robotics_sim.diagnostics.event_log import NavigationDebugEventLog
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.simulation.engine import PlannerWorker, SimulationControllerMixin
+from robotics_sim.app.theme import (
+    THEME_SETTINGS_KEY,
+    ThemeColors,
+    ThemeMode,
+    apply_application_theme,
+    build_application_stylesheet,
+    dropdown_popup_stylesheet,
+    open_theme_settings,
+    parse_theme_mode,
+    theme_colors,
+    with_alpha,
+)
 from robotics_sim.app.widgets import (
     HeroHeader,
     NumericStepper,
@@ -46,6 +59,7 @@ from robotics_sim.app.widgets import (
 )
 from robotics_sim.app.simulation_canvas import SimulationCanvas
 from robotics_sim.app.navigation_reasoning_window import NavigationReasoningWindow
+from robotics_sim.app.config_panel import BrushSizePreview
 from robotics_sim.app.config_panel import build_config_panel as build_right_config_panel
 from robotics_sim.app.map_editor import (
     MIN_EDITOR_OBSTACLE_SIZE,
@@ -220,8 +234,26 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.last_control = np.array([[0.0], [0.0]], dtype=float)
         self.last_time = time.perf_counter()
 
+        # Loaded before the first stylesheet()/build_ui() call -- both read
+        # self._theme_mode. Starts light the very first run (no saved
+        # value) and on any invalid saved value; see _load_saved_theme()'s
+        # docstring for the exact persistence rules.
+        self._theme_mode = self._load_saved_theme()
+        self._theme_transition_animation = None
+        self._theme_transition_overlay = None
+
         self.setStyleSheet(self.stylesheet())
         self.build_ui()
+
+        # Custom-painted children (canvas, every ToggleSwitch, the docked
+        # reasoning panel) default to light at construction time regardless
+        # of the loaded theme -- this first _apply_theme() call corrects
+        # them and wires the theme button now that top_bar exists. Also
+        # applies the app-level stylesheet so QMenu/QToolTip popups (which
+        # do not inherit MainWindow's own setStyleSheet()) render correctly
+        # from the very first paint.
+        self.top_bar.theme_button.clicked.connect(self._toggle_theme)
+        self._apply_theme(self._theme_mode)
 
         self.resize_to_screen()
         QTimer.singleShot(0, self.center_on_screen)
@@ -425,6 +457,84 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas_action_bar = bar
         self.canvas.set_action_bar(bar)
 
+    def _update_canvas_action_bar_icons(self) -> None:
+        """Re-render the canvas action bar's hand-drawn icons in the current
+        theme's text color. The QPushButton labels/background already
+        update for free via the QSS#canvasActionButton rule -- only the
+        baked QIcon bitmaps need a manual refresh. canvasStartButton keeps
+        its hardcoded white icon; its maroon background never changes with
+        theme, same as the Resume button in the navigation snapshot bar."""
+        color = theme_colors(self._theme_mode).text_primary
+        icon_specs = (
+            ("reset_button", "reset", 16),
+            ("speed_button", "gear", 16),
+            ("metrics_button", "maximize", 16),
+            ("console_button", "console", 16),
+        )
+        for attr_name, icon_type, size in icon_specs:
+            button = getattr(self, attr_name, None)
+            if button is not None:
+                button.setIcon(make_icon(icon_type, color))
+                button.setIconSize(QSize(size, size))
+
+    def _navigation_snapshot_bar_stylesheet(self, c: ThemeColors) -> str:
+        """Stylesheet for the navigation snapshot bar (Navigation switch,
+        `<`/`>` history step buttons, Resume from snapshot). Rebuilt and
+        reapplied on every theme change by _apply_theme() since it is a
+        self-contained inline stylesheet, not reachable by the app-level
+        QSS cascade."""
+        return f"""
+            QFrame#navigationSnapshotBar {{
+                background: {c.card_background};
+                border: 1px solid {c.border};
+                border-radius: 10px;
+            }}
+            QLabel#navigationSnapshotLabel {{
+                color: {c.text_primary};
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QLabel#navigationSnapshotCounter {{
+                color: {c.text_primary};
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QPushButton#navigationSnapshotStepButton {{
+                background: {c.card_background};
+                border: 1px solid {c.border};
+                border-radius: 6px;
+                color: {c.text_primary};
+                font-size: 13px;
+                font-weight: 900;
+            }}
+            QPushButton#navigationSnapshotStepButton:hover:enabled {{
+                border-color: {c.accent};
+                background: {with_alpha(c.accent, 32)};
+                color: {c.accent};
+            }}
+            QPushButton#navigationSnapshotStepButton:disabled {{
+                color: {c.text_disabled};
+                background: {c.elevated_background};
+            }}
+            QPushButton#navigationSnapshotResumeButton {{
+                background: {MAROON};
+                border: none;
+                border-radius: 7px;
+                color: white;
+                font-size: 11px;
+                font-weight: 800;
+                padding: 0 12px;
+            }}
+            QPushButton#navigationSnapshotResumeButton:hover:enabled {{
+                background: {MAROON_DARK};
+            }}
+            QPushButton#navigationSnapshotResumeButton:disabled {{
+                background: {c.elevated_background};
+                color: {c.text_disabled};
+            }}
+            """
+
     def _build_navigation_snapshot_bar(self) -> None:
         """Primary Navigation Debug control, docked above the canvas header.
 
@@ -441,59 +551,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         bar = QFrame()
         bar.setObjectName("navigationSnapshotBar")
         bar.setFixedHeight(46)
-        bar.setStyleSheet(
-            f"""
-            QFrame#navigationSnapshotBar {{
-                background: {CARD};
-                border: 1px solid {BORDER};
-                border-radius: 10px;
-            }}
-            QLabel#navigationSnapshotLabel {{
-                color: {TEXT};
-                font-size: 11px;
-                font-weight: 800;
-            }}
-            QLabel#navigationSnapshotCounter {{
-                color: {TEXT};
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 11px;
-                font-weight: 700;
-            }}
-            QPushButton#navigationSnapshotStepButton {{
-                background: {CARD};
-                border: 1px solid {BORDER};
-                border-radius: 6px;
-                color: {TEXT};
-                font-size: 13px;
-                font-weight: 900;
-            }}
-            QPushButton#navigationSnapshotStepButton:hover:enabled {{
-                border-color: {BLUE};
-                background: {BLUE_LIGHT};
-                color: {BLUE};
-            }}
-            QPushButton#navigationSnapshotStepButton:disabled {{
-                color: rgba(90,100,110,0.30);
-                background: #F2F3F5;
-            }}
-            QPushButton#navigationSnapshotResumeButton {{
-                background: {MAROON};
-                border: none;
-                border-radius: 7px;
-                color: white;
-                font-size: 11px;
-                font-weight: 800;
-                padding: 0 12px;
-            }}
-            QPushButton#navigationSnapshotResumeButton:hover:enabled {{
-                background: {MAROON_DARK};
-            }}
-            QPushButton#navigationSnapshotResumeButton:disabled {{
-                background: #E5E7EB;
-                color: rgba(90,100,110,0.55);
-            }}
-            """
-        )
+        bar.setStyleSheet(self._navigation_snapshot_bar_stylesheet(theme_colors(self._theme_mode)))
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(8)
@@ -605,22 +663,174 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         return build_editor_panel(self)
 
     def _install_config_panel_close_button(self, panel: QWidget) -> None:
-        """Attach a small close control without modifying the panel builders."""
+        """Attach a small close control without modifying the panel builders.
+
+        Styled via the global stylesheet's QPushButton#configPanelCloseButton
+        rule (see theme.py) rather than an inline setStyleSheet() here, so it
+        stays correctly themed after a later theme toggle without needing
+        its own propagation call.
+        """
         button = QPushButton("×", panel)
-        button.setObjectName("panelCloseButton")
+        button.setObjectName("configPanelCloseButton")
         button.setFixedSize(26, 24)
         button.move(max(0, SIDE_PANEL_WIDTH - 34), 8)
         button.setToolTip("Close configuration panel")
-        button.setStyleSheet(
-            "QPushButton { border: none; background: rgba(255,255,255,185); "
-            "color: #5E6672; border-radius: 5px; font-size: 18px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(255,255,255,235); color: #22252A; }"
-        )
         button.clicked.connect(lambda: self.set_configuration_panel_visible(False))
         button.raise_()
 
+    def _load_saved_theme(self) -> ThemeMode:
+        """Read the persisted theme preference.
+
+        Read-only -- never writes. Missing/invalid values resolve to light
+        (see theme.parse_theme_mode()), which is also the correct behavior
+        the very first time the app ever runs, before any value has been
+        saved.
+        """
+        settings = open_theme_settings()
+        return parse_theme_mode(settings.value(THEME_SETTINGS_KEY))
+
+    def _apply_theme(self, mode: ThemeMode | str) -> None:
+        """Apply `mode` everywhere the app's own chrome needs it -- and
+        nothing else. Deliberately does not touch SimulationEngine state:
+        no reset, no snapshot/history change, no pause/resume, no robot
+        rebuild, no panel visibility change, no Single/Multiple/Editor mode
+        change. Safe to call at any point in a run, including mid-simulation.
+
+        Three kinds of propagation, each cheap:
+        1. QSS-selector-styled widgets (top bar, panels, tabs, menus,
+           inputs, buttons, tooltips, scrollbars) update for free the
+           moment the stylesheet is reapplied -- no per-widget call needed.
+        2. Widgets with their own inline stylesheet or custom QPainter
+           output that the global QSS cannot reach (every ToggleSwitch,
+           the docked NavigationReasoningWindow, SimulationCanvas's themed
+           chrome layers) get one explicit set_theme_mode() call each.
+        3. update_navigation_debug_step_buttons() is NOT called here --
+           theme has no effect on history/capture state, only on how it's
+           painted, which set_theme_mode() above already covers.
+
+        Every color swap above is still an instant, synchronous hard cut --
+        callers (tests included) can rely on self._theme_mode and every
+        widget's styling being fully updated the moment this method
+        returns. The soft crossfade started at the bottom is a purely
+        cosmetic overlay painted on top of the already-final state; it
+        never delays or defers any of the above.
+        """
+        mode = ThemeMode(mode)
+        theme_changed = mode != self._theme_mode
+        before_snapshot = self.grab() if theme_changed and self.isVisible() else None
+        self._theme_mode = mode
+
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            # Reaches QMenu/QToolTip popups, which do not inherit
+            # MainWindow's own setStyleSheet() (see build_application_
+            # stylesheet()'s docstring).
+            apply_application_theme(app, mode)
+        self.setStyleSheet(self.stylesheet())
+
+        for switch in self.findChildren(ToggleSwitch):
+            switch.set_theme_mode(mode)
+
+        for brush_preview in self.findChildren(BrushSizePreview):
+            brush_preview.set_theme_mode(mode)
+
+        # Combo popups tagged by config_panel.labeled_combo() -- their
+        # QListView stylesheet is not reachable by the ordinary app-level
+        # QSS cascade (see dropdown_popup_stylesheet()'s docstring).
+        popup_qss = dropdown_popup_stylesheet(mode)
+        for combo in self.findChildren(QComboBox):
+            if combo.property("themedDropdownPopup"):
+                combo.view().setStyleSheet(popup_qss)
+
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None and hasattr(canvas, "set_theme_mode"):
+            canvas.set_theme_mode(mode)
+
+        reasoning_window = getattr(self, "navigation_reasoning_window", None)
+        if reasoning_window is not None and hasattr(reasoning_window, "set_theme_mode"):
+            reasoning_window.set_theme_mode(mode)
+
+        # Self-contained inline stylesheets not reachable by the app-level
+        # QSS cascade (same reason as the combo popups above).
+        snapshot_bar = getattr(self, "navigation_snapshot_bar", None)
+        if snapshot_bar is not None:
+            snapshot_bar.setStyleSheet(self._navigation_snapshot_bar_stylesheet(theme_colors(mode)))
+
+        self._update_canvas_action_bar_icons()
+
+        self._update_theme_button()
+        self.update()
+
+        if before_snapshot is not None:
+            self._start_theme_crossfade(before_snapshot)
+
+    def _start_theme_crossfade(self, before: "QPixmap") -> None:
+        """Fade the pre-toggle appearance out over the newly-applied theme
+        so the switch reads as a smooth transition instead of a hard cut.
+
+        Purely cosmetic and additive: by the time this runs, _apply_theme()
+        has already applied every color synchronously, so this only ever
+        layers a fading snapshot on top -- it cannot affect simulation
+        state, widget visibility, or any theme-toggle test assertion.
+        """
+        if self._theme_transition_animation is not None:
+            self._theme_transition_animation.stop()
+        if self._theme_transition_overlay is not None:
+            self._theme_transition_overlay.deleteLater()
+
+        overlay = QLabel(self)
+        overlay.setPixmap(before)
+        overlay.setGeometry(self.rect())
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+        effect = QGraphicsOpacityEffect(overlay)
+        overlay.setGraphicsEffect(effect)
+        overlay.show()
+        overlay.raise_()
+
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(220)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+
+        def _finish():
+            overlay.deleteLater()
+            self._theme_transition_overlay = None
+            self._theme_transition_animation = None
+
+        animation.finished.connect(_finish)
+        self._theme_transition_overlay = overlay
+        self._theme_transition_animation = animation
+        animation.start()
+
+    def _toggle_theme(self) -> None:
+        """The theme_button's click handler. Flips light<->dark, applies
+        it, and persists immediately (see theme.py's persistence rules --
+        only the theme name is ever written)."""
+        new_mode = ThemeMode.DARK if self._theme_mode == ThemeMode.LIGHT else ThemeMode.LIGHT
+        self._apply_theme(new_mode)
+        settings = open_theme_settings()
+        settings.setValue(THEME_SETTINGS_KEY, new_mode.value)
+        settings.sync()
+
+    def _update_theme_button(self) -> None:
+        """The button's icon always shows the CURRENTLY ACTIVE mode (sun
+        while light is active, moon while dark is active) -- never the
+        mode a click would switch to."""
+        button = getattr(self.top_bar, "theme_button", None)
+        if button is None:
+            return
+        if self._theme_mode == ThemeMode.DARK:
+            button.setIcon(make_icon("theme_dark", "white"))
+            button.setToolTip("Dark mode active — switch to light mode")
+        else:
+            button.setIcon(make_icon("theme_light", "white"))
+            button.setToolTip("Light mode active — switch to dark mode")
+
     def _build_panel_visibility_menu(self) -> None:
-        """Use the top-bar gear as the panel and file-action menu.
+        """Use the top-bar menu button ("⋮") as the panel and file-action
+        menu. Independent of theme_button ("☀"/"☾"), which never opens this
+        menu and toggles only the app theme -- see _toggle_theme().
 
         Snapshot export is deliberately placed before the scenario actions and
         revalidated immediately before every popup.  This avoids a stale native
@@ -674,8 +884,9 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.panel_visibility_menu.aboutToShow.connect(
             self._prepare_panel_visibility_menu
         )
-        self.top_bar.gear_button.setToolTip("Panels and file actions")
-        self.top_bar.gear_button.clicked.connect(self._show_panel_visibility_menu)
+        # Tooltip already set by TopBar itself ("Open application menu");
+        # not overridden here so there is exactly one place that owns it.
+        self.top_bar.menu_button.clicked.connect(self._show_panel_visibility_menu)
 
     def _prepare_panel_visibility_menu(self) -> None:
         """Guarantee that the export action is present and the popup is resized.
@@ -700,7 +911,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
     def _show_panel_visibility_menu(self) -> None:
         self._prepare_panel_visibility_menu()
-        button = self.top_bar.gear_button
+        button = self.top_bar.menu_button
         position = button.mapToGlobal(button.rect().bottomLeft())
         self.panel_visibility_menu.exec(position)
 
@@ -1744,499 +1955,12 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
     # ========================================================
 
     def stylesheet(self):
-        return f"""
-        QWidget#root {{
-            background: {BG};
-            font-family: "Segoe UI";
-            color: {TEXT};
-        }}
-
-        QWidget#body {{
-            background: {BG};
-        }}
-
-        QFrame#topBar {{
-            background: qlineargradient(
-                x1: 0, y1: 0,
-                x2: 1, y2: 0,
-                stop: 0 {MAROON_DARK},
-                stop: 1 {MAROON}
-            );
-        }}
-
-        QLabel#topTitle {{
-            color: white;
-            font-size: 14px;
-            font-weight: 900;
-            background: transparent;
-        }}
-
-        QLabel#statusReady {{
-            color: {GREEN};
-            font-size: 12px;
-            font-weight: 800;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 14px;
-            padding: 5px 13px;
-        }}
-
-        QLabel#statusRunning {{
-            color: {GREEN};
-            font-size: 12px;
-            font-weight: 800;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 14px;
-            padding: 5px 13px;
-        }}
-
-        QLabel#statusPaused {{
-            color: {ORANGE};
-            font-size: 12px;
-            font-weight: 800;
-            background: rgba(255,255,255,0.08);
-            border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 14px;
-            padding: 5px 13px;
-        }}
-
-        QPushButton#topIconButton,
-        QPushButton#windowButton,
-        QPushButton#closeButton {{
-            background: transparent;
-            border: none;
-            border-radius: 6px;
-        }}
-
-        QPushButton#topIconButton:hover,
-        QPushButton#windowButton:hover {{
-            background: rgba(255,255,255,0.12);
-        }}
-
-        QPushButton#closeButton:hover {{
-            background: #B42318;
-        }}
-
-        QComboBox#topModeSelector {{
-            background: rgba(255,255,255,0.08);
-            color: #FFFFFF;
-            border: 1px solid rgba(255,255,255,0.16);
-            border-radius: 6px;
-            padding-left: 9px;
-            font-size: 11px;
-            font-weight: 800;
-            min-height: 28px;
-        }}
-
-        QComboBox#topModeSelector::drop-down {{
-            width: 22px;
-            border: none;
-        }}
-
-        QPushButton#modeSegmentButton {{
-            background: rgba(255,255,255,0.08);
-            color: #FFFFFF;
-            border: 1px solid rgba(255,255,255,0.18);
-            border-radius: 7px;
-            font-size: 11px;
-            font-weight: 900;
-        }}
-
-        QPushButton#modeSegmentButton:hover {{
-            background: rgba(255,255,255,0.14);
-        }}
-
-        QPushButton#modeSegmentButton:checked {{
-            background: #FFFFFF;
-            color: {MAROON};
-            border: 1px solid #FFFFFF;
-        }}
-
-        QPushButton#modeSegmentButton:disabled {{
-            color: rgba(255,255,255,0.45);
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.08);
-        }}
-
-        QFrame#sidePanel {{
-            background: {CARD};
-            border: 1px solid {BORDER};
-            border-radius: 14px;
-        }}
-
-        QWidget#sidePanelContainer {{
-            background: {CARD};
-            border: 1px solid {BORDER};
-            border-radius: 14px;
-        }}
-
-        QTabWidget#sidePanelTabs {{
-            background: transparent;
-            border: none;
-        }}
-
-        QTabWidget#sidePanelTabs::pane {{
-            background: {CARD};
-            border: none;
-            border-radius: 12px;
-            top: -1px;
-        }}
-
-        QTabWidget#sidePanelTabs QTabBar::tab {{
-            background: #F2F3F6;
-            color: {TEXT_MUTED};
-            border: 1px solid {BORDER};
-            border-bottom: none;
-            padding: 8px 12px;
-            min-width: 120px;
-            font-size: 10px;
-            font-weight: 850;
-        }}
-
-        QTabWidget#sidePanelTabs QTabBar::tab:first {{
-            border-top-left-radius: 10px;
-        }}
-
-        QTabWidget#sidePanelTabs QTabBar::tab:last {{
-            border-top-right-radius: 10px;
-        }}
-
-        QTabWidget#sidePanelTabs QTabBar::tab:selected {{
-            background: {CARD};
-            color: {MAROON};
-            border-color: {BORDER};
-        }}
-
-        QTabWidget#sidePanelTabs QTabBar::tab:hover:!selected {{
-            background: #E9ECF2;
-            color: {TEXT};
-        }}
-
-        QScrollArea#configScroll {{
-            background: transparent;
-            border: none;
-        }}
-
-        QWidget#scrollContent {{
-            background: transparent;
-        }}
-
-        QFrame#sectionCard {{
-            background: {PANEL_CARD};
-            border: 1px solid {BORDER_SOFT};
-            border-radius: 9px;
-        }}
-
-        QFrame#actionPanelBottom {{
-            background: {CARD};
-            border-top: 1px solid {BORDER_SOFT};
-            border-bottom-left-radius: 14px;
-            border-bottom-right-radius: 14px;
-        }}
-
-        QLabel#sectionTitle {{
-            color: {MAROON};
-            font-size: 13px;
-            font-weight: 900;
-        }}
-
-        QLabel#fieldLabel {{
-            color: {TEXT_MUTED};
-            font-size: 10px;
-            font-weight: 700;
-        }}
-
-        QLabel#subsectionLabel {{
-            color: #5E6673;
-            font-size: 10px;
-            font-weight: 900;
-            padding-top: 3px;
-        }}
-
-        QPushButton#stepperButton {{
-            background: #F8F9FB;
-            color: {MAROON};
-            border: 1px solid {BORDER};
-            border-radius: 5px;
-            min-height: 28px;
-            font-size: 13px;
-            font-weight: 900;
-        }}
-
-        QPushButton#stepperButton:hover {{
-            background: #F0F2F5;
-            border: 1px solid {MAROON};
-        }}
-
-        QLineEdit#numericInput {{
-            background: white;
-            color: #000000;
-            border: 1px solid {BORDER};
-            border-radius: 5px;
-            min-height: 28px;
-            font-size: 11px;
-            font-weight: 900;
-            padding-left: 4px;
-            padding-right: 4px;
-        }}
-
-        QLineEdit#numericInput:focus {{
-            border: 2px solid {MAROON};
-        }}
-
-        QLineEdit#smallNumericInput {{
-            background: white;
-            color: #000000;
-            border: 1px solid {BORDER};
-            border-radius: 5px;
-            min-height: 28px;
-            font-size: 11px;
-            font-weight: 900;
-        }}
-
-        QLineEdit#smallNumericInput:focus {{
-            border: 2px solid {MAROON};
-        }}
-
-                QComboBox {{
-            background-color: #FFFFFF;
-            color: #111827;
-            border: 1px solid {BORDER};
-            border-radius: 7px;
-            min-height: 34px;
-            padding-left: 10px;
-            padding-right: 28px;
-            font-size: 12px;
-            font-weight: 800;
-            selection-background-color: #F4EAEA;
-            selection-color: {MAROON};
-        }}
-
-        QComboBox:hover {{
-            background-color: #FBFCFE;
-            border: 1px solid #B8C0CC;
-        }}
-
-        QComboBox:focus {{
-            background-color: #FFFFFF;
-            border: 2px solid {MAROON};
-        }}
-
-        QComboBox::drop-down {{
-            subcontrol-origin: padding;
-            subcontrol-position: top right;
-            width: 28px;
-            border-left: 1px solid {BORDER_SOFT};
-            border-top-right-radius: 7px;
-            border-bottom-right-radius: 7px;
-            background-color: #FFFFFF;
-        }}
-
-        QComboBox::down-arrow {{
-            image: none;
-            width: 0px;
-            height: 0px;
-            border-left: 5px solid transparent;
-            border-right: 5px solid transparent;
-            border-top: 6px solid #111827;
-            margin-right: 8px;
-        }}
-
-        QComboBox QAbstractItemView {{
-            background-color: #FFFFFF;
-            color: #111827;
-            border: 1px solid {BORDER};
-            border-radius: 6px;
-            padding: 4px;
-            outline: 0px;
-            selection-background-color: #F4EAEA;
-            selection-color: {MAROON};
-        }}
-
-        QComboBox QAbstractItemView::item {{
-            min-height: 28px;
-            padding: 6px 8px;
-            color: #111827;
-            background-color: #FFFFFF;
-        }}
-
-        QComboBox QAbstractItemView::item:selected {{
-            color: {MAROON};
-            background-color: #F4EAEA;
-        }}
-
-        QComboBox QAbstractItemView::item:hover {{
-            color: {MAROON};
-            background-color: #FAF2F2;
-        }}
-
-        QSlider::groove:horizontal {{
-            height: 4px;
-            background: #E0E2E7;
-            border-radius: 2px;
-        }}
-
-        QSlider::sub-page:horizontal {{
-            background: {MAROON};
-            border-radius: 2px;
-        }}
-
-        QSlider::handle:horizontal {{
-            background: {MAROON};
-            border: 2px solid white;
-            width: 13px;
-            height: 13px;
-            margin: -5px 0;
-            border-radius: 7px;
-        }}
-
-        QCheckBox {{
-            color: {TEXT};
-            font-size: 11px;
-            font-weight: 700;
-        }}
-
-        QCheckBox::indicator {{
-            width: 15px;
-            height: 15px;
-            border-radius: 3px;
-            border: 1.5px solid {MAROON};
-            background: white;
-        }}
-
-        QCheckBox::indicator:checked {{
-            background: {MAROON};
-        }}
-
-        QFrame#canvasActionBar {{
-            background: rgba(250, 251, 253, 245);
-            border: 1px solid {BORDER};
-            border-radius: 9px;
-        }}
-
-        QPushButton#canvasStartButton {{
-            background: {MAROON};
-            color: white;
-            border: none;
-            border-radius: 7px;
-            min-height: 30px;
-            font-size: 11px;
-            font-weight: 900;
-        }}
-
-        QPushButton#canvasStartButton:hover {{
-            background: #6A0000;
-        }}
-
-        QPushButton#canvasActionButton {{
-            background: white;
-            color: {TEXT};
-            border: 1px solid {BORDER};
-            border-radius: 7px;
-            min-height: 30px;
-            font-size: 10px;
-            font-weight: 800;
-        }}
-
-        QPushButton#canvasActionButton:hover {{
-            background: #F5F6F8;
-            border-color: #BBC4D0;
-        }}
-
-        QPushButton#startButton {{
-            background: {MAROON};
-            color: white;
-            border: none;
-            border-radius: 7px;
-            min-height: 40px;
-            font-size: 14px;
-            font-weight: 900;
-        }}
-
-        QPushButton#startButton:hover {{
-            background: #6A0000;
-        }}
-
-        QPushButton#secondaryButton {{
-            background: white;
-            color: {TEXT};
-            border: 1px solid {BORDER};
-            border-radius: 6px;
-            min-height: 32px;
-            font-size: 11px;
-            font-weight: 800;
-        }}
-
-        QPushButton#secondaryButton:hover {{
-            background: #F5F6F8;
-        }}
-
-        QPushButton#secondaryButton:checked {{
-            background: #F4EAEA;
-            color: {MAROON};
-            border: 1px solid {MAROON};
-        }}
-
-        QTableWidget {{
-            background: #1F1F1F;
-            color: #FFFFFF;
-            gridline-color: #3D3D3D;
-            border: 1px solid #4B4B4B;
-            border-radius: 8px;
-            font-size: 12px;
-        }}
-
-        QTableWidget::item {{
-            padding: 7px 8px;
-        }}
-
-        QTableWidget::item:selected {{
-            background: #0B79D0;
-            color: #FFFFFF;
-        }}
-
-        QHeaderView::section {{
-            background: #343434;
-            color: #FFFFFF;
-            border: none;
-            border-bottom: 1px solid #525252;
-            padding: 8px;
-            font-size: 12px;
-            font-weight: 900;
-        }}
-
-        QLabel#metricsMessageBox {{
-            background: #252525;
-            color: #FFFFFF;
-            border: 1px solid #4B4B4B;
-            border-radius: 8px;
-            padding: 10px;
-            font-size: 12px;
-        }}
-
-        QPlainTextEdit#consoleText {{
-            background: #171717;
-            color: #F3F4F6;
-            border: 1px solid #4B4B4B;
-            border-radius: 8px;
-            padding: 10px;
-            font-family: Consolas, "Cascadia Mono", monospace;
-            font-size: 11px;
-        }}
-
-        QScrollBar:vertical {{
-            border: none;
-            background: transparent;
-            width: 5px;
-        }}
-
-        QScrollBar::handle:vertical {{
-            background: {BORDER};
-            border-radius: 2px;
-        }}
-
-        QScrollBar:horizontal {{
-            height: 0px;
-        }}
+        """Return the full application stylesheet for the current theme.
+
+        Delegates entirely to theme.build_application_stylesheet() -- see
+        that module for the actual QSS. Kept as a method (not inlined at
+        call sites) because SimulationMetricsWindow/SimulationConsoleWindow
+        already call owner.stylesheet() to pick up whatever theme is
+        active at the moment they are constructed.
         """
+        return build_application_stylesheet(self._theme_mode)

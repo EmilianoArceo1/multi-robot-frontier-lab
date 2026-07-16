@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from robotics_sim.simulation.config import *
+from robotics_sim.app.theme import ThemeMode, theme_colors
 
 def make_icon(icon_type: str, color: str = TEXT) -> QIcon:
     pixmap = QPixmap(28, 28)
@@ -121,6 +122,44 @@ def make_icon(icon_type: str, color: str = TEXT) -> QIcon:
         painter.drawRoundedRect(QRectF(5, 6, 10, 8), 2, 2)
         painter.drawRoundedRect(QRectF(14, 14, 10, 8), 2, 2)
         painter.drawLine(QPointF(15, 10), QPointF(18, 14))
+
+    elif icon_type == "menu_dots":
+        # The application-menu trigger ("more actions" -- Configuration,
+        # Navigation Reasoning, export, load/save .sim). Drawn as a vector
+        # glyph (not the Unicode "⋮" character) so it renders identically
+        # regardless of the host font's glyph coverage -- see theme.py's
+        # module docstring on avoiding external font/icon dependencies.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(c)
+        for cy in (8.0, 14.0, 20.0):
+            painter.drawEllipse(QRectF(12.0, cy - 2.0, 4.0, 4.0))
+
+    elif icon_type == "theme_light":
+        # Sun -- shown while light mode is ACTIVE (the icon reflects the
+        # current mode, not the mode a click would switch to).
+        painter.setBrush(c)
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QRectF(9.5, 9.5, 9.0, 9.0))
+        painter.setPen(QPen(c, 2.0, Qt.SolidLine, Qt.RoundCap))
+        for angle in range(0, 360, 45):
+            rad = math.radians(angle)
+            x1 = 14 + 8.0 * math.cos(rad)
+            y1 = 14 + 8.0 * math.sin(rad)
+            x2 = 14 + 11.5 * math.cos(rad)
+            y2 = 14 + 11.5 * math.sin(rad)
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+    elif icon_type == "theme_dark":
+        # Crescent moon -- shown while dark mode is ACTIVE. Drawn as one
+        # disc minus an offset disc (even-odd fill) rather than the Unicode
+        # "☾" glyph, for the same font-independence reason as menu_dots.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(c)
+        moon_path = QPainterPath()
+        moon_path.setFillRule(Qt.OddEvenFill)
+        moon_path.addEllipse(QRectF(7.5, 7.5, 13.0, 13.0))
+        moon_path.addEllipse(QRectF(11.5, 6.0, 13.0, 13.0))
+        painter.drawPath(moon_path)
 
     painter.end()
     return QIcon(pixmap)
@@ -257,11 +296,26 @@ class TopBar(QFrame):
         self.editor_button.clicked.connect(self.window.toggle_editor_mode_from_button)
         self.update_mode_icon(self.mode_selector.currentText())
 
-        self.gear_button = QPushButton()
-        self.gear_button.setObjectName("topIconButton")
-        self.gear_button.setIcon(make_icon("gear", "white"))
-        self.gear_button.setIconSize(QSize(20, 20))
-        self.gear_button.setFixedSize(34, 32)
+        # The old single gear button opened a menu that also mixed in a
+        # theme choice would have had to compete with. Split into two
+        # independent controls instead: `menu_button` ("⋮", opens the
+        # existing Configuration/Navigation Reasoning/export/load/save
+        # menu, unchanged) and `theme_button` (sun/moon, toggles the theme
+        # directly -- never opens the menu). MainWindow wires both and owns
+        # the theme_button's icon/tooltip via _update_theme_button(); this
+        # widget only exposes the two buttons.
+        self.menu_button = QPushButton()
+        self.menu_button.setObjectName("topIconButton")
+        self.menu_button.setIcon(make_icon("menu_dots", "white"))
+        self.menu_button.setIconSize(QSize(20, 20))
+        self.menu_button.setFixedSize(34, 32)
+        self.menu_button.setToolTip("Open application menu")
+
+        self.theme_button = QPushButton()
+        self.theme_button.setObjectName("topIconButton")
+        self.theme_button.setIcon(make_icon("theme_light", "white"))
+        self.theme_button.setIconSize(QSize(20, 20))
+        self.theme_button.setFixedSize(34, 32)
 
         self.min_button = QPushButton()
         self.min_button.setObjectName("windowButton")
@@ -294,7 +348,8 @@ class TopBar(QFrame):
         layout.addWidget(self.multi_mode_button)
         layout.addWidget(self.editor_button)
         layout.addSpacing(12)
-        layout.addWidget(self.gear_button)
+        layout.addWidget(self.menu_button)
+        layout.addWidget(self.theme_button)
         layout.addWidget(self.min_button)
         layout.addWidget(self.max_button)
         layout.addWidget(self.close_button)
@@ -953,6 +1008,15 @@ class ToggleSwitch(QPushButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(48, 26)
         self.toggled.connect(self.update)
+        # Starts light -- matches the app's own default (see
+        # MainWindow._load_saved_theme()) -- and is updated explicitly by
+        # MainWindow._apply_theme(), never read from global state, so a
+        # switch never goes stale if it isn't currently visible/repainting.
+        self._theme_mode = ThemeMode.LIGHT
+
+    def set_theme_mode(self, mode) -> None:
+        self._theme_mode = ThemeMode(mode)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -960,16 +1024,23 @@ class ToggleSwitch(QPushButton):
 
         checked = self.isChecked()
         rect = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        colors = theme_colors(self._theme_mode)
 
         if checked:
+            # The ON track stays the brand maroon in both themes -- a
+            # strong saturated color reads fine against either card
+            # background, so it does not need a theme variant.
             track_color = QColor(MAROON)
             knob_color = QColor("white")
             text_color = QColor("white")
             label = "ON"
         else:
-            track_color = QColor(218, 223, 231)
-            knob_color = QColor("white")
-            text_color = QColor(90, 96, 106)
+            # The OFF track/text DO need a theme variant: the original
+            # light-grey pair (218,223,231)/(90,96,106) has almost no
+            # contrast against a dark card background.
+            track_color = QColor(colors.border)
+            knob_color = QColor(colors.card_background)
+            text_color = QColor(colors.text_secondary)
             label = "OFF"
 
         painter.setPen(Qt.NoPen)

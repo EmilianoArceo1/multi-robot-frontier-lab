@@ -710,6 +710,10 @@ class SimulationControllerMixin:
         canvas = getattr(self, "canvas", None)
         if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
             canvas.set_hazard_snapshot(self.hazard_service.snapshot())
+        # Push the fresh (empty) discovered-hazard frame once, then clear
+        # dirty -- there is nothing pending to flush right after a reset.
+        self.push_discovered_hazard_frame()
+        self._discovered_hazard_render_dirty = False
 
     def ensure_belief_map(self) -> BeliefMap:
         """Return the active belief map, creating it if needed."""
@@ -741,9 +745,57 @@ class SimulationControllerMixin:
         return self.hazard_service
 
     def push_hazard_snapshot(self) -> None:
+        """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
+        potential editor use (see SimulationCanvas.draw_fires(), no longer
+        called from the live paint loop) -- never confuse this with
+        push_discovered_hazard_frame(), which is what runtime actually
+        renders."""
         canvas = getattr(self, "canvas", None)
         if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
             canvas.set_hazard_snapshot(self.ensure_hazard_service().snapshot())
+
+    def push_discovered_hazard_frame(self) -> None:
+        """Push the team's DISCOVERED hazard belief -- the only hazard layer
+        live simulation renders (see SimulationCanvas.draw_discovered_
+        hazard()). Independent of push_hazard_snapshot() (ground truth):
+        the canvas must never receive both bundled into one ambiguous
+        payload, so this uses its own explicit setter/dict shape.
+
+        Uses HazardBelief.snapshot() (one full-grid copy) -- O(robots*
+        height*width), not the narrow read_cells()/blocked_cells() the
+        sensor-update/planning hot paths use. Callers must not invoke this
+        per robot per tick: see _flush_discovered_hazard_render(), the only
+        caller besides reset_belief_map()'s own initial empty-frame push,
+        which collapses however many robots' FoV updates happened this
+        step into at most one push.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or not hasattr(canvas, "set_discovered_hazard_frame"):
+            return
+        service = self.ensure_hazard_service()
+        canvas.set_discovered_hazard_frame(
+            {
+                "frame": service.belief.snapshot(),
+                "bounds": service.field.bounds,
+                "resolution": service.field.resolution,
+            }
+        )
+
+    def _flush_discovered_hazard_render(self) -> None:
+        """Push at most one discovered-hazard render frame per simulation
+        step, regardless of how many robots' FoV updates marked the render
+        dirty this tick (see update_explored_free_points_from_polygon()).
+
+        Called once, after every robot due for a sensor update this tick has
+        already run it -- see simulation_step()/simulation_step_multi()'s
+        own call sites, right after their sensor-update block/loop.
+        Reads only the dirty flag and HazardBelief (via push_discovered_
+        hazard_frame()) -- never HazardField/FireSource.
+        """
+        if not getattr(self, "_discovered_hazard_render_dirty", False):
+            return
+        self._discovered_hazard_render_dirty = False
+        self.push_discovered_hazard_frame()
 
     def occupancy_grid_snapshot(self) -> dict | None:
         """Read-only snapshot of the current belief/occupancy grid, for the
@@ -5917,6 +5969,22 @@ class SimulationControllerMixin:
             # at all (see add_fire()/on_fire_toggle_requested()).
             if observation.newly_blocked_cells > 0:
                 self._replan_routes_affected_by_hazard()
+            # Mark the render dirty only on an actual VISUAL change -- new
+            # cells becoming observed, or an already-observed cell's value
+            # changing. Deliberately NOT observation.changed: that is also
+            # True for a newly_attributed_cells-only change (another robot
+            # attributing an already-known, already-blocked cell), which
+            # never alters what the heatmap looks like. The actual push is
+            # collapsed to at most one per simulation step by
+            # _flush_discovered_hazard_render(), called once after every
+            # robot due this tick has run its sensor update -- never here,
+            # which runs once per robot.
+            visual_changed = (
+                observation.newly_observed_cells > 0
+                or observation.changed_value_cells > 0
+            )
+            if visual_changed:
+                self._discovered_hazard_render_dirty = True
 
     def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
         """
@@ -6355,6 +6423,11 @@ class SimulationControllerMixin:
 
             self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
 
+            # All robots due this tick have run their sensor update above --
+            # collapse however many of them marked the discovered-hazard
+            # render dirty into at most one push.
+            self._flush_discovered_hazard_render()
+
             if newly_discovered_all:
                 self.mapping_update_count += 1
                 replanned = self.replan_multi_robots_affected_by_points(
@@ -6660,6 +6733,10 @@ class SimulationControllerMixin:
             _explored_update_perf_start = time.perf_counter()
             self.record_explored_area(force=False)
             _record_perf(self, "explored_update", time.perf_counter() - _explored_update_perf_start)
+            # The single robot due this tick has run its sensor update
+            # above -- collapse whatever it marked dirty into at most one
+            # push (see simulation_step_multi()'s equivalent call site).
+            self._flush_discovered_hazard_render()
             # update_sensed_obstacles() times its own obstacle_extract/
             # belief_update sub-sections internally (see its body) --
             # finer-grained than the old combined "sensor_update" figure,

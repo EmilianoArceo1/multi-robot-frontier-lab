@@ -148,11 +148,19 @@ class SimulationCanvas(QWidget):
         self.multi_path_points: list[list[tuple[float, float]]] = []
         self.multi_last_controls: list[np.ndarray] = []
         self.planned_path_points: list[tuple[float, float]] = []
-        # Read-only snapshot of the independent continuous hazard field.
+        # Read-only snapshot of the independent continuous hazard field
+        # (GROUND TRUTH -- kept for legacy/potential editor use only; see
+        # draw_fires(), no longer called from the live paint loop).
         # The canvas never owns fire sources and never writes occupancy.
         self._hazard_snapshot: dict | None = None
         self._hazard_pixmap_cache: QPixmap | None = None
         self._hazard_pixmap_cache_key: tuple | None = None
+        # Read-only frame of the team's DISCOVERED hazard belief -- what
+        # live simulation actually renders (see draw_discovered_hazard()).
+        # {"frame": HazardBeliefFrame, "bounds": ..., "resolution": ...}.
+        self._discovered_hazard_frame: dict | None = None
+        self._discovered_hazard_pixmap_cache: QPixmap | None = None
+        self._discovered_hazard_pixmap_cache_key: tuple | None = None
         self.exploration_target_xy: tuple[float, float] | None = None
         self.multi_exploration_targets: list[tuple[float, float] | None] = []
         self.multi_invalidated_exploration_targets: list[list[tuple[float, float]]] = []
@@ -640,10 +648,24 @@ class SimulationCanvas(QWidget):
         self.update()
 
     def set_hazard_snapshot(self, snapshot: dict | None) -> None:
-        """Store a read-only hazard snapshot pushed by the runtime service."""
+        """Store a read-only GROUND-TRUTH hazard snapshot. Kept for legacy/
+        potential editor use -- draw_fires() (the only consumer) is no
+        longer called from the live paint loop; runtime rendering uses
+        set_discovered_hazard_frame() instead. Never mix the two payload
+        shapes into one ambiguous dict."""
         self._hazard_snapshot = snapshot
         self._hazard_pixmap_cache = None
         self._hazard_pixmap_cache_key = None
+        self.update()
+
+    def set_discovered_hazard_frame(self, payload: dict | None) -> None:
+        """Store a read-only frame of the team's DISCOVERED hazard belief --
+        {"frame": HazardBeliefFrame, "bounds": ..., "resolution": ...}. This
+        is what live simulation actually renders (see draw_discovered_
+        hazard()); the frame's arrays are already immutable copies (see
+        HazardBelief.snapshot()), so this never stores a mutable reference
+        the runtime could later change out from under a paint call."""
+        self._discovered_hazard_frame = payload
         self.update()
 
     def set_fires(self, fires) -> None:
@@ -2073,7 +2095,11 @@ class SimulationCanvas(QWidget):
             (time.perf_counter() - _mapped_obstacle_points_start) * 1000.0
         )
 
-        self.draw_fires(painter)
+        # Live simulation renders only what the team has actually
+        # discovered -- never the omniscient ground truth (draw_fires(),
+        # kept intact for legacy/potential editor use, is no longer called
+        # here; see draw_discovered_hazard()'s own docstring).
+        self.draw_discovered_hazard(painter)
         self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 
         # Robot-related layers, broken down into named sub-buckets for the
@@ -3649,6 +3675,116 @@ class SimulationCanvas(QWidget):
         painter.save()
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(target, self._hazard_pixmap_cache, QRectF(self._hazard_pixmap_cache.rect()))
+        painter.restore()
+
+    def _build_discovered_hazard_pixmap(self, frame) -> QPixmap | None:
+        """Same semantic yellow -> orange -> red gradient as
+        _build_hazard_pixmap() (ground truth) -- theme-independent, see
+        test_theme_palette.py -- but gated on observed=True per cell. An
+        unobserved cell gets alpha=0 regardless of its (always 0.0, by
+        HazardBelief's own contract) value: this is the actual omniscience
+        guard, not an incidental byproduct of unobserved cells already
+        being zero.
+        """
+        values = np.asarray(frame.values, dtype=np.float32)
+        observed = np.asarray(frame.observed, dtype=bool)
+        if values.ndim != 2 or values.size == 0:
+            return None
+
+        heat = np.clip(values, 0.0, 1.0)
+        height, width = heat.shape
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+
+        low = heat <= 0.5
+        high = ~low
+        low_t = np.clip(heat * 2.0, 0.0, 1.0)
+        high_t = np.clip((heat - 0.5) * 2.0, 0.0, 1.0)
+
+        # Low hazard: pale yellow -> orange. High hazard: orange -> red.
+        rgba[..., 0] = 255
+        rgba[..., 1] = np.where(
+            low,
+            225.0 - 95.0 * low_t,
+            130.0 - 95.0 * high_t,
+        ).astype(np.uint8)
+        rgba[..., 2] = np.where(
+            low,
+            70.0 - 45.0 * low_t,
+            25.0 - 10.0 * high_t,
+        ).astype(np.uint8)
+        rgba[..., 3] = np.where(
+            observed & (heat > 0.0),
+            35.0 + 175.0 * np.power(heat, 0.72),
+            0.0,
+        ).astype(np.uint8)
+
+        # Grid row 0 is the world's lower edge; QImage row 0 is the top.
+        rgba = np.ascontiguousarray(np.flipud(rgba))
+        image = QImage(
+            rgba.data,
+            width,
+            height,
+            int(rgba.strides[0]),
+            QImage.Format_RGBA8888,
+        ).copy()
+        return QPixmap.fromImage(image)
+
+    def draw_discovered_hazard(self, painter: QPainter):
+        """Draw the TEAM's DISCOVERED hazard belief -- observed=True cells
+        only. Never the omniscient ground-truth HazardField (see
+        draw_fires(), kept for legacy/potential editor use but no longer
+        called from here): no FireSource, no real fire radius/center, ever
+        read for this.
+
+        The cached pixmap is keyed on (revision, bounds, resolution) only --
+        never viewport/zoom (the pixmap is built in grid-aligned pixel
+        space; world_to_screen() below repositions it per paint call
+        cheaply, exactly like draw_fires()) and never theme (these colors
+        are semantic and theme-independent, see test_theme_palette.py).
+        """
+        if self._navigation_debug_history_snapshot() is not None:
+            # Browsing HISTORY: no historical HazardBelief frame exists yet
+            # (a later phase) -- hide the layer entirely rather than
+            # showing the live frame or falling back to ground truth, which
+            # would mix past/present or leak omniscient information.
+            return
+
+        payload = self._discovered_hazard_frame
+        if not payload:
+            return
+        frame = payload.get("frame")
+        if frame is None or not np.any(frame.observed):
+            return
+
+        cache_key = (
+            int(getattr(frame, "revision", 0)),
+            tuple(payload.get("bounds", ())),
+            float(payload.get("resolution", 0.0)),
+        )
+        if (
+            self._discovered_hazard_pixmap_cache is None
+            or self._discovered_hazard_pixmap_cache_key != cache_key
+        ):
+            self._discovered_hazard_pixmap_cache = self._build_discovered_hazard_pixmap(frame)
+            self._discovered_hazard_pixmap_cache_key = cache_key
+        if self._discovered_hazard_pixmap_cache is None:
+            return
+
+        x_min, x_max, y_min, y_max = map(float, payload["bounds"])
+        left, top = self.world_to_screen(x_min, y_max)
+        right, bottom = self.world_to_screen(x_max, y_min)
+        target = QRectF(
+            min(left, right),
+            min(top, bottom),
+            abs(right - left),
+            abs(bottom - top),
+        )
+
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(
+            target, self._discovered_hazard_pixmap_cache, QRectF(self._discovered_hazard_pixmap_cache.rect())
+        )
         painter.restore()
 
     @staticmethod

@@ -127,6 +127,7 @@ def test_canvas_semantic_colors_are_not_theme_dependent():
         SimulationCanvas.draw_multi_planned_routes,
         SimulationCanvas.draw_goal_and_robot,
         SimulationCanvas.draw_fires,
+        SimulationCanvas.draw_discovered_hazard,
     )
     for method in semantic_methods:
         source = inspect.getsource(method)

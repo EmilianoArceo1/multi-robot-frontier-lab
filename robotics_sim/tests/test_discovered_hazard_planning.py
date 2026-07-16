@@ -206,6 +206,7 @@ def _build_fake_engine(*, robot_xy=(0.5, 0.5), planner_type: str = "A*", running
         "remove_fire_near",
         "on_fire_toggle_requested",
         "push_hazard_snapshot",
+        "push_discovered_hazard_frame",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 

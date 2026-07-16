@@ -54,11 +54,23 @@ def _build_fake_engine(*, robot_count: int = 1) -> SimpleNamespace:
         hazard_service=hazard_service,
         simulation_time=3.0,
         explored_free_points=set(),
+        push_calls=[],
     )
     fake.ensure_belief_map = lambda: fake.belief_map
     fake.update_explored_free_points_from_polygon = (
         SimulationControllerMixin.update_explored_free_points_from_polygon.__get__(fake)
     )
+    # Spy instead of the real push (which needs a canvas to do anything) --
+    # lets tests count exactly how many render pushes actually happened,
+    # independent of the dirty flag _flush_discovered_hazard_render() reads.
+    fake.push_discovered_hazard_frame = lambda: fake.push_calls.append(1)
+    fake._flush_discovered_hazard_render = (
+        SimulationControllerMixin._flush_discovered_hazard_render.__get__(fake)
+    )
+    # Not under test here (see test_discovered_hazard_planning.py for the
+    # real replanning-trigger tests) -- a no-op so a newly_blocked_cells > 0
+    # observation doesn't fail with AttributeError on this lightweight fake.
+    fake._replan_routes_affected_by_hazard = lambda: None
     return fake
 
 
@@ -428,3 +440,145 @@ def test_belief_property_returns_the_same_object_not_a_copy_each_time():
     service = _make_service()
 
     assert service.belief is service.belief
+
+
+# ---------------------------------------------------------------------------
+# Render-push throttling: update_explored_free_points_from_polygon() must
+# never call push_discovered_hazard_frame() itself (a full HazardBelief.
+# snapshot() -- O(robots*height*width)); it only marks a dirty flag on a
+# real VISUAL change. _flush_discovered_hazard_render() collapses however
+# many robots marked it dirty this simulation step into at most one push.
+# ---------------------------------------------------------------------------
+
+
+def test_marking_dirty_does_not_push_immediately():
+    """7. update_explored_free_points_from_polygon() by itself marks dirty
+    but never calls push_discovered_hazard_frame()."""
+    fake = _build_fake_engine()
+    polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
+
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+
+    assert fake._discovered_hazard_render_dirty is True
+    assert fake.push_calls == []
+
+
+def test_one_robot_visual_change_flushes_to_one_push():
+    """1. A single robot with a visual change produces one push once the
+    step's flush point runs."""
+    fake = _build_fake_engine()
+    polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
+
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+    fake._flush_discovered_hazard_render()
+
+    assert fake.push_calls == [1]
+    assert fake._discovered_hazard_render_dirty is False
+
+
+def test_three_robots_in_one_step_produce_a_single_push():
+    """2. Three robots each observing new cells in the same simulation step
+    must still collapse into exactly one push at the step's flush point --
+    never one push per robot."""
+    fake = _build_fake_engine(robot_count=3)
+    polygon_a = _square_polygon(0.0, 0.0, 2.0, 2.0)
+    polygon_b = _square_polygon(4.0, 4.0, 6.0, 6.0)
+    polygon_c = _square_polygon(8.0, 8.0, 9.5, 9.5)
+
+    # Mirrors simulation_step_multi()'s loop: every robot's FoV update runs
+    # before the single flush call at the end of the tick.
+    fake.update_explored_free_points_from_polygon(polygon_a, robot_index=0)
+    fake.update_explored_free_points_from_polygon(polygon_b, robot_index=1)
+    fake.update_explored_free_points_from_polygon(polygon_c, robot_index=2)
+    fake._flush_discovered_hazard_render()
+
+    assert fake.push_calls == [1]
+
+
+def test_identical_observation_does_not_flush_a_push():
+    """3. Repeating an identical observation never marks dirty, so the
+    subsequent flush is a no-op."""
+    fake = _build_fake_engine()
+    polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+    fake._flush_discovered_hazard_render()
+    assert fake.push_calls == [1]  # sanity: the first observation did flush
+
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)  # identical repeat
+    fake._flush_discovered_hazard_render()
+
+    assert fake.push_calls == [1], "an identical repeat must not produce a second push"
+
+
+def test_attribution_only_change_does_not_flush_a_push():
+    """4. A different robot attributing an already-known cell (same value,
+    same observed) changes only observed_by_robot -- must not flush."""
+    fake = _build_fake_engine(robot_count=2)
+    polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+    fake._flush_discovered_hazard_render()
+    assert fake.push_calls == [1]
+
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=1)  # same cells, robot 1
+    fake._flush_discovered_hazard_render()
+
+    assert fake.push_calls == [1], "an attribution-only change must not produce a second push"
+
+
+def test_changed_value_cells_flushes_a_push():
+    """5. A value change on an already-observed cell (changed_value_cells >
+    0) must flush, even though newly_observed_cells is 0 for it. Both
+    intensities stay above block_threshold (0.55 default) so the blocked
+    state does not transition -- this isolates changed_value_cells from
+    newly_blocked_cells (already covered by other tests/fixtures)."""
+    service = _make_service()
+    service.field.add_fire((5.5, 5.5), intensity=0.6, radius=2.0)
+    fake = _build_fake_engine()
+    fake.hazard_service = service
+    polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+    fake._flush_discovered_hazard_render()
+    assert fake.push_calls == [1]
+
+    # Ground truth heats up further at the same cell; re-observing now
+    # changes the stored VALUE (not just attribution) for an already-
+    # observed, already-blocked cell -- newly_blocked_cells stays 0, so this
+    # goes through the real call site, not a hand-rolled dirty assignment.
+    service.field.remove_fire(service.field.sources()[0].fire_id)
+    service.field.add_fire((5.5, 5.5), intensity=0.9, radius=2.0)
+    fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
+    fake._flush_discovered_hazard_render()
+
+    assert fake.push_calls == [1, 1]
+
+
+def test_reset_produces_one_empty_frame_push_and_leaves_dirty_false():
+    """6. reset_belief_map() still pushes one coherent empty frame and
+    leaves the dirty flag False afterward -- nothing pending to flush right
+    after a reset."""
+    pushed: list[dict] = []
+    fake = SimpleNamespace(
+        config=SimpleNamespace(
+            grid_resolution=_RESOLUTION,
+            default_fire_intensity=1.0,
+            default_fire_radius=2.0,
+            fire_selection_radius=0.6,
+            hazard_block_threshold=0.55,
+        ),
+        canvas=SimpleNamespace(
+            set_hazard_snapshot=lambda snapshot: None,
+            set_discovered_hazard_frame=lambda payload: pushed.append(payload),
+        ),
+    )
+    fake.reset_belief_map = SimulationControllerMixin.reset_belief_map.__get__(fake)
+    fake.ensure_belief_map = SimulationControllerMixin.ensure_belief_map.__get__(fake)
+    fake.ensure_hazard_service = SimulationControllerMixin.ensure_hazard_service.__get__(fake)
+    fake.push_discovered_hazard_frame = SimulationControllerMixin.push_discovered_hazard_frame.__get__(fake)
+
+    fake.reset_belief_map(robot_count=1)
+
+    assert len(pushed) == 1
+    frame = pushed[0]["frame"]
+    assert not frame.observed.any()
+    assert frame.revision == 0
+    assert fake._discovered_hazard_render_dirty is False

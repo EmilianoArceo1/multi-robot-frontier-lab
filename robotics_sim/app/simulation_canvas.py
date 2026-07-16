@@ -30,6 +30,7 @@ from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
 from robotics_sim.simulation.config import *
 from robotics_sim.simulation.navigation_modes import is_goal_seeking_planner
+from robotics_sim.app.theme import ThemeMode, theme_colors
 from robotics_sim.app.map_editor import (
     MIN_EDITOR_OBSTACLE_SIZE,
     connected_obstacle_indices,
@@ -137,6 +138,8 @@ class SimulationCanvas(QWidget):
         self.setObjectName("canvasCard")
         self.setMinimumSize(610, 500)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self._theme_mode = ThemeMode.LIGHT
 
         self.robot = None
         self.robots: list = []
@@ -478,6 +481,21 @@ class SimulationCanvas(QWidget):
     def invalidate_static_plot_cache(self):
         self._static_plot_cache = None
         self._static_plot_cache_size = None
+
+    def set_theme_mode(self, mode: ThemeMode | str) -> None:
+        """Re-theme the canvas chrome (card/header/plot backdrop/borders and
+        the obstacle/explored-area tints that must stand out against a dark
+        canvas). Only invalidates the *theme-dependent* pixmap caches --
+        belief map, routes, hazards, and the explored-area seed/history state
+        are untouched, so a theme switch never looks like a fresh run."""
+        mode = ThemeMode(mode)
+        if mode == self._theme_mode:
+            return
+        self._theme_mode = mode
+        self.invalidate_static_plot_cache()
+        self.invalidate_obstacles_cache()
+        self.invalidate_explored_area_cache()
+        self.update()
 
     def invalidate_explored_area_cache(self):
         self._explored_area_cache = None
@@ -1642,11 +1660,12 @@ class SimulationCanvas(QWidget):
             )
 
     def draw_card(self, painter: QPainter):
+        c = theme_colors(self._theme_mode)
         rect = QRectF(self.rect().adjusted(0, 0, -1, -1))
         path = QPainterPath()
         path.addRoundedRect(rect, 12, 12)
-        painter.fillPath(path, QColor(CARD))
-        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.fillPath(path, QColor(c.card_background))
+        painter.setPen(QPen(QColor(c.border), 1))
         painter.drawPath(path)
 
     def draw_title(self, painter: QPainter):
@@ -1658,12 +1677,13 @@ class SimulationCanvas(QWidget):
             center -> FPS / simulation time / speed + eye button
             right  -> short status message
         """
+        c = theme_colors(self._theme_mode)
         reserved_rect = self.metrics_reserved_rect()
 
         # Left title. Keep it in its own small area so it never collides with
         # the centered metrics controls.
         painter.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        painter.setPen(QColor(TEXT))
+        painter.setPen(QColor(c.text_primary))
         title_rect = QRectF(24, 13, max(120.0, reserved_rect.left() - 36.0), 28)
         title = painter.fontMetrics().elidedText(
             "Simulation Preview",
@@ -1681,7 +1701,7 @@ class SimulationCanvas(QWidget):
         # Right status. Long status messages are elided because the center
         # metrics controls have priority in this header row.
         painter.setFont(QFont("Segoe UI", 8))
-        painter.setPen(QColor(TEXT_FAINT))
+        painter.setPen(QColor(c.text_secondary))
         status_left = reserved_rect.right() + 16.0
         status_width = max(0.0, self.width() - status_left - 24.0)
         if status_width >= 70.0:
@@ -1699,12 +1719,13 @@ class SimulationCanvas(QWidget):
         Draw runtime counters in a compact top-center pill.
         """
         painter.save()
+        c = theme_colors(self._theme_mode)
 
         path = QPainterPath()
         path.addRoundedRect(rect, 12.5, 12.5)
 
-        painter.setPen(QPen(QColor(218, 223, 231, 190), 1.0))
-        painter.setBrush(QBrush(QColor(255, 255, 255, 218)))
+        painter.setPen(QPen(QColor(c.border_strong), 1.0))
+        painter.setBrush(QBrush(QColor(c.elevated_background)))
         painter.drawPath(path)
 
         dot_color = QColor(GREEN) if self.fps >= 50.0 else QColor(ORANGE)
@@ -1718,7 +1739,7 @@ class SimulationCanvas(QWidget):
         painter.drawEllipse(QRectF(dot_x, dot_y, 6.0, 6.0))
 
         painter.setFont(QFont("Consolas", 8, QFont.Bold))
-        painter.setPen(QColor(TEXT))
+        painter.setPen(QColor(c.text_primary))
 
         text = (
             f"FPS {self.fps:04.1f}"
@@ -1736,16 +1757,17 @@ class SimulationCanvas(QWidget):
     def draw_metrics_eye_button(self, painter: QPainter, rect: QRectF):
         """Draw the open/closed eye button used to hide/show counters."""
         painter.save()
+        c = theme_colors(self._theme_mode)
 
         path = QPainterPath()
         path.addRoundedRect(rect, 12.5, 12.5)
-        painter.setPen(QPen(QColor(218, 223, 231, 190), 1.0))
-        painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        painter.setPen(QPen(QColor(c.border_strong), 1.0))
+        painter.setBrush(QBrush(QColor(c.elevated_background)))
         painter.drawPath(path)
 
         cx = rect.center().x()
         cy = rect.center().y()
-        eye_color = QColor(TEXT if self.metrics_visible else TEXT_MUTED)
+        eye_color = QColor(c.text_primary if self.metrics_visible else c.text_secondary)
         painter.setPen(QPen(eye_color, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.setBrush(Qt.NoBrush)
 
@@ -1781,7 +1803,7 @@ class SimulationCanvas(QWidget):
         rect = self.plot_rect()
         cache_painter.save()
         cache_painter.setClipRect(rect)
-        cache_painter.fillRect(rect, QColor("#F9FBFD"))
+        cache_painter.fillRect(rect, QColor(theme_colors(self._theme_mode).app_background))
         self.draw_grid(cache_painter, rect)
         cache_painter.restore()
         cache_painter.end()
@@ -1812,6 +1834,15 @@ class SimulationCanvas(QWidget):
             return
 
         self.rebuild_explored_area_cache()
+
+    def _explored_area_alpha(self, light_alpha: int) -> int:
+        """Scale an explored-area wash alpha (tuned against the light-mode
+        near-white canvas) up for dark mode, where the same low alpha over a
+        near-black backdrop barely reads. Same hue/robot color either way --
+        only how strongly it stands out from the backdrop changes."""
+        if self._theme_mode == ThemeMode.DARK:
+            return min(255, int(light_alpha * 2.8))
+        return light_alpha
 
     def _paint_explored_mask_to_cache(
         self,
@@ -1869,7 +1900,7 @@ class SimulationCanvas(QWidget):
                 self._explored_area_seed_mask,
                 self._explored_area_seed_resolution,
                 self._explored_area_seed_bounds,
-                alpha=24,
+                alpha=self._explored_area_alpha(24),
             )
             cache_painter.restore()
             cache_painter.end()
@@ -1902,12 +1933,13 @@ class SimulationCanvas(QWidget):
                 self.rebuild_explored_area_cache()
                 return
             target_cache = self._explored_area_cache
-            fill_color = QColor(35, 111, 207, 24)
+            fill_color = QColor(35, 111, 207)
+            fill_color.setAlpha(self._explored_area_alpha(24))
             composition_mode = QPainter.CompositionMode_Source
         else:
             target_cache = self.ensure_robot_explored_area_cache(int(robot_index))
             fill_color = robot_color(int(robot_index))
-            fill_color.setAlpha(24)
+            fill_color.setAlpha(self._explored_area_alpha(24))
 
             # Same principle as single-robot explored area: each robot owns a
             # homogeneous cache. Repainting the same zone by the same robot
@@ -1960,12 +1992,16 @@ class SimulationCanvas(QWidget):
         cache_painter = QPainter(self._mapped_points_cache)
         cache_painter.setRenderHint(QPainter.Antialiasing)
         cache_painter.setClipRect(self.plot_rect())
-        cache_painter.setPen(QPen(QColor(130, 0, 42, 150), 0.35))
-        cache_painter.setBrush(QBrush(QColor(224, 45, 96, 225)))
+        # Neon pink-red, deliberately the same in both themes -- these dots
+        # mark the robot's own discovered obstacle samples and must stay
+        # unmistakably loud against either a light or a dark canvas.
+        cache_painter.setPen(QPen(QColor(179, 0, 54, 210), 0.6))
+        cache_painter.setBrush(QBrush(QColor(255, 23, 92, 235)))
 
-        # Keep this tiny. The density comes from mapping_point_spacing, not from
-        # drawing large circles.
-        point_radius = 0.18
+        # Keep this small. The density comes from mapping_point_spacing, not
+        # from drawing large circles -- just a touch bigger than before so
+        # the bolder color reads clearly.
+        point_radius = 0.24
 
         for px, py in points:
             sx, sy = self.world_to_screen(px, py)
@@ -1995,7 +2031,7 @@ class SimulationCanvas(QWidget):
         if self._static_plot_cache is not None:
             painter.drawPixmap(0, 0, self._static_plot_cache)
         else:
-            painter.fillRect(rect, QColor("#F9FBFD"))
+            painter.fillRect(rect, QColor(theme_colors(self._theme_mode).app_background))
             self.draw_grid(painter, rect)
         self._last_background_cache_hit = cache_hit
         self._render_layer_ms["background"] = (time.perf_counter() - _background_start) * 1000.0
@@ -2101,7 +2137,7 @@ class SimulationCanvas(QWidget):
         painter.restore()
 
         _plot_border_start = time.perf_counter()
-        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.setPen(QPen(QColor(theme_colors(self._theme_mode).border), 1))
         painter.drawRect(rect)
         _plot_border_ms = (time.perf_counter() - _plot_border_start) * 1000.0
         self._render_layer_ms["plot_border"] = _plot_border_ms
@@ -2161,7 +2197,13 @@ class SimulationCanvas(QWidget):
         return f"{value:.2f}"
 
     def draw_grid(self, painter: QPainter, rect):
-        """Draw an infinite-style coordinate grid for the current view."""
+        """Draw an infinite-style coordinate grid for the current view.
+
+        The faint hatching/labels below are canvas chrome (a backdrop aid,
+        not simulated-world data) so they read from the current theme. The
+        world-axis line itself (GRID_AXIS) is semantic and deliberately
+        untouched -- see theme.py's module docstring."""
+        c = theme_colors(self._theme_mode)
         left, right, bottom, top = self.active_view_bounds_world()
         span_x = max(0.1, right - left)
         span_y = max(0.1, top - bottom)
@@ -2171,7 +2213,7 @@ class SimulationCanvas(QWidget):
         painter.save()
 
         # Minor grid.
-        painter.setPen(QPen(QColor(235, 238, 243), 1))
+        painter.setPen(QPen(QColor(c.border), 1))
         start_x = math.floor(left / minor_step) * minor_step
         x = start_x
         while x <= right + minor_step * 0.5:
@@ -2188,8 +2230,8 @@ class SimulationCanvas(QWidget):
 
         # Major grid and coordinate labels.
         painter.setFont(QFont("Consolas", 7))
-        label_color = QColor(116, 126, 142, 185)
-        major_pen = QPen(QColor(210, 216, 226), 1.15)
+        label_color = QColor(c.text_secondary)
+        major_pen = QPen(QColor(c.border_strong), 1.15)
         axis_pen = QPen(GRID_AXIS, 1.8)
 
         x = math.floor(left / step) * step
@@ -2750,6 +2792,7 @@ class SimulationCanvas(QWidget):
             self.width(),
             self.height(),
             self._view_transform_signature(),
+            self._theme_mode,
         )
         if self._nav_debug_explored_cache is None or self._nav_debug_explored_cache_key != cache_key:
             cache = QPixmap(self.size())
@@ -2762,7 +2805,7 @@ class SimulationCanvas(QWidget):
                 environment["explored_by_robot"],
                 float(environment["resolution"]),
                 environment["bounds"],
-                alpha=30,
+                alpha=self._explored_area_alpha(30),
             )
             cache_painter.restore()
             cache_painter.end()
@@ -3197,26 +3240,34 @@ class SimulationCanvas(QWidget):
         painter: QPainter,
         indices: list[int],
     ) -> None:
-        """Draw one connected obstacle object without internal seams."""
+        """Draw one connected obstacle object without internal seams.
+
+        These are still the same neutral-gray tones on both themes (obstacles
+        stay obstacles, not chrome) -- but in dark mode the fill/stroke are
+        lifted several notches lighter so they read clearly against the dark
+        canvas backdrop instead of the mid-gray tuned for a near-white one.
+        """
         path = self.obstacle_group_screen_path(indices)
         if path.isEmpty():
             return
 
+        dark = self._theme_mode == ThemeMode.DARK
+
         if self.editor_mode:
-            fill = QColor(178, 181, 188, 105)
-            stroke = QColor(82, 84, 92, 165)
+            fill = QColor(210, 213, 219, 130) if dark else QColor(178, 181, 188, 105)
+            stroke = QColor(160, 165, 175, 200) if dark else QColor(82, 84, 92, 165)
             pen_width = 1.35
         else:
             coverage = self.obstacle_group_mapping_coverage(indices)
             fully_discovered = coverage >= OBSTACLE_COMPLETE_COVERAGE
 
             if fully_discovered:
-                fill = QColor(190, 194, 202, 170)
-                stroke = QColor(82, 84, 92, 210)
+                fill = QColor(224, 227, 233, 195) if dark else QColor(190, 194, 202, 170)
+                stroke = QColor(176, 181, 191, 235) if dark else QColor(82, 84, 92, 210)
                 pen_width = 1.7
             else:
-                fill = QColor(178, 181, 188, 85)
-                stroke = QColor(82, 84, 92, 105)
+                fill = QColor(210, 213, 219, 105) if dark else QColor(178, 181, 188, 85)
+                stroke = QColor(160, 165, 175, 130) if dark else QColor(82, 84, 92, 105)
                 pen_width = 1.2
 
         painter.setPen(QPen(stroke, pen_width))
@@ -4196,6 +4247,19 @@ class SimulationCanvas(QWidget):
             painter.drawText(QPointF(mx + 4, my - 4), f"d={snapshot.controller.distance_to_goal.value:.2f}m")
         painter.restore()
 
+    def _navigation_debug_label_color(self, color: QColor) -> QColor:
+        """This label's backing plate (see below) is always a light,
+        translucent white -- deliberately, so the map stays visible through
+        it -- regardless of the app's own light/dark theme. Composited over
+        a dark canvas that translucent white reads as a mid-grey rather than
+        near-white, so the semantic colors below (tuned for a near-white
+        backing) lose contrast in dark mode. Darken them for dark mode only;
+        the hue/meaning (grey=neutral, green=live/ok, orange=rotate/history,
+        red=blocked) never changes, and light mode is untouched."""
+        if self._theme_mode == ThemeMode.DARK:
+            return color.darker(150)
+        return color
+
     def draw_navigation_debug_robot_label(self, painter: QPainter):
         """Compact floating readout anchored above the robot, following it
         every frame like a nameplate -- short formulas only (the full
@@ -4211,17 +4275,17 @@ class SimulationCanvas(QWidget):
 
         lines: list[str] = []
         colors: list[QColor] = []
-        accent = QColor(TEXT_MUTED)
+        accent = self._navigation_debug_label_color(QColor(TEXT_MUTED))
 
         mode_line = snapshot.tracking_mode or snapshot.navigation_state
         lines.append(f"{mode_line} · {snapshot.decision_kind}")
-        colors.append(QColor(TEXT_MUTED))
+        colors.append(self._navigation_debug_label_color(QColor(TEXT_MUTED)))
 
         if not snapshot.controller.heading_error.unavailable and not snapshot.rotate_threshold.unavailable:
             eth = math.degrees(snapshot.controller.heading_error.value)
             thr = math.degrees(snapshot.rotate_threshold.value)
             rotate = abs(eth) > thr
-            accent = QColor(ORANGE) if rotate else QColor(GREEN)
+            accent = self._navigation_debug_label_color(QColor(ORANGE) if rotate else QColor(GREEN))
             lines.append(f"|eθ|={abs(eth):.1f}° {'>' if rotate else '≤'} thr={thr:.1f}°")
             lines.append(f"ROTATE={rotate}")
             colors.append(accent)
@@ -4230,16 +4294,16 @@ class SimulationCanvas(QWidget):
         checker_label, terms = self._navigation_debug_pick_live_terms(snapshot)
         if terms is not None and terms.blocked:
             distance_text = "n/a" if terms.distance.unavailable else f"{terms.distance.value:.2f}m"
-            accent = QColor(RED)
+            accent = self._navigation_debug_label_color(QColor(RED))
             lines.append(f"{checker_label}: BLOCKED d={distance_text}<r={terms.required_clearance:.2f}m")
             colors.append(accent)
 
         position, total = self._nav_debug_history_position
         if position is not None:
-            view_color = QColor(ORANGE)
+            view_color = self._navigation_debug_label_color(QColor(ORANGE))
             view_text = f"HISTORY {position}/{total}"
         else:
-            view_color = QColor(GREEN)
+            view_color = self._navigation_debug_label_color(QColor(GREEN))
             view_text = "LIVE"
         lines.append(view_text)
         colors.append(view_color)

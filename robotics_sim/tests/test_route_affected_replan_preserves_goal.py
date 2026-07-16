@@ -139,6 +139,7 @@ def _build_fake_engine(*, position=(6.0, 3.0), goal_tolerance=0.25) -> SimpleNam
         "apply_route_result",
         "request_route_async",
         "replan_after_new_information",
+        "_invalidate_prefetch_request",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 

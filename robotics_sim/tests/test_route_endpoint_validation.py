@@ -147,7 +147,12 @@ def _build_fake_engine(*, position=(3.0, -4.7), goal_tolerance=0.25) -> SimpleNa
     fake.final_goal_xy = lambda: (0.0, 0.0)
     fake.runtime_agent = lambda robot_index=None: fake.agent
 
-    for name in ("apply_route_result", "log_route_assignment", "on_prefetch_route_ready"):
+    for name in (
+        "apply_route_result",
+        "log_route_assignment",
+        "on_prefetch_route_ready",
+        "_invalidate_prefetch_request",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     return fake
@@ -261,6 +266,9 @@ def test_incomplete_route_does_not_leave_robot_stuck_in_stop_with_stale_path_goa
 def test_prefetch_route_rejected_when_final_waypoint_does_not_reach_pending_target():
     fake = _build_fake_engine()
     fake.agent.pending_target_xy = PENDING_TARGET
+    # The target request_id=1 was launched for -- on_prefetch_route_ready()
+    # validates against this captured target, not agent.pending_target_xy.
+    fake.prefetch_targets = {0: PENDING_TARGET}
 
     fake.on_prefetch_route_ready(1, 0, True, "path found with A*", [ROUTE_ENDPOINT_TOO_FAR])
 
@@ -279,6 +287,7 @@ def test_prefetch_route_rejected_when_final_waypoint_does_not_reach_pending_targ
 def test_prefetch_route_accepted_when_final_waypoint_reaches_pending_target():
     fake = _build_fake_engine()
     fake.agent.pending_target_xy = PENDING_TARGET
+    fake.prefetch_targets = {0: PENDING_TARGET}
 
     fake.on_prefetch_route_ready(1, 0, True, "path found with A*", [ROUTE_ENDPOINT_CLOSE_ENOUGH])
 

@@ -154,7 +154,12 @@ def _build_fake_engine(*, position=ROBOT_NEAR_TARGET, goal_tolerance=0.25) -> Si
 
     fake.build_planner_kwargs = _spy_build_planner_kwargs
 
-    for name in ("apply_navigation_decision", "apply_route_result", "request_route_async"):
+    for name in (
+        "apply_navigation_decision",
+        "apply_route_result",
+        "request_route_async",
+        "_invalidate_prefetch_request",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     # Wrap the real, bound request_route_async with a call-recording spy so

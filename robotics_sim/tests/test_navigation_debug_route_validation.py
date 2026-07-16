@@ -98,6 +98,7 @@ def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamesp
         "_navigation_debug_hazard_frame",
         "_navigation_debug_agent_state_frame",
         "_navigation_debug_metrics_frame",
+        "_invalidate_prefetch_request",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 

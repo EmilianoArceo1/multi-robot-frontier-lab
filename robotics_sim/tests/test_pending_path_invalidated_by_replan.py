@@ -138,6 +138,7 @@ def _build_fake_engine(*, robot_xy=(6.57, 3.58)) -> SimpleNamespace:
     fake.replan_after_new_information = _spy_replan_after_new_information
     fake.safety_replan_cooldown_seconds = lambda: 1.5
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 

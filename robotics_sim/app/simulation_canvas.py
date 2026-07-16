@@ -13,6 +13,7 @@ import math
 import os
 import time
 import zlib
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize, QTimer
@@ -161,6 +162,12 @@ class SimulationCanvas(QWidget):
         self._discovered_hazard_frame: dict | None = None
         self._discovered_hazard_pixmap_cache: QPixmap | None = None
         self._discovered_hazard_pixmap_cache_key: tuple | None = None
+        # Separate pixmap cache for the HISTORICAL discovered-hazard frame
+        # (see _decoded_navigation_debug_hazard_belief()) -- kept distinct
+        # from the live cache above so toggling between LIVE and HISTORY
+        # repeatedly never thrashes either one.
+        self._discovered_hazard_history_pixmap_cache: QPixmap | None = None
+        self._discovered_hazard_history_pixmap_cache_key: tuple | None = None
         self.exploration_target_xy: tuple[float, float] | None = None
         self.multi_exploration_targets: list[tuple[float, float] | None] = []
         self.multi_invalidated_exploration_targets: list[list[tuple[float, float]]] = []
@@ -311,6 +318,12 @@ class SimulationCanvas(QWidget):
         self._nav_debug_environment_decoded: dict | None = None
         self._nav_debug_explored_cache: QPixmap | None = None
         self._nav_debug_explored_cache_key: tuple | None = None
+        # Decoded historical HazardBelief state (values/observed/bounds/
+        # resolution) -- same one-decode-per-(frame, revision) pattern as
+        # _nav_debug_environment_decode_key above, see
+        # _decoded_navigation_debug_hazard_belief().
+        self._nav_debug_hazard_belief_decode_key: tuple | None = None
+        self._nav_debug_hazard_belief_decoded: dict | None = None
         # Optional docked panel the full field breakdown is forwarded
         # to -- see set_navigation_reasoning_window(). None until
         # main_window.py registers one.
@@ -2440,6 +2453,58 @@ class SimulationCanvas(QWidget):
         self._nav_debug_environment_decoded = decoded
         return decoded
 
+    def _decoded_navigation_debug_hazard_belief(self) -> dict | None:
+        """Decode the selected historical snapshot's HazardBeliefDebug
+        exactly once per (frame identity, revision) -- same pattern as
+        _decoded_navigation_debug_environment() for BeliefMapDebug.
+
+        Returns None when the selected snapshot has no hazard_belief field
+        at all (an older snapshot captured before this existed) -- callers
+        must hide the hazard layer entirely in that case, never fall back
+        to the live frame or ground truth.
+
+        bounds/resolution are read from the SAME snapshot's belief_map
+        frame rather than duplicated into HazardBeliefDebug -- both are
+        captured from the same tick's BeliefMap/HazardBelief, which always
+        share one GridGeometry (see hazard_service.RuntimeHazardService).
+        """
+        snapshot = self._navigation_debug_history_snapshot()
+        if snapshot is None:
+            return None
+        maybe_hazard_belief = getattr(snapshot, "hazard_belief", None)
+        if maybe_hazard_belief is None or maybe_hazard_belief.unavailable or maybe_hazard_belief.value is None:
+            return None
+        maybe_belief_map = getattr(snapshot, "belief_map", None)
+        if maybe_belief_map is None or maybe_belief_map.unavailable or maybe_belief_map.value is None:
+            return None
+
+        frame = maybe_hazard_belief.value
+        belief_map_frame = maybe_belief_map.value
+        key = (id(frame), int(frame.revision))
+        if self._nav_debug_hazard_belief_decode_key == key:
+            return self._nav_debug_hazard_belief_decoded
+
+        values = (
+            np.frombuffer(zlib.decompress(frame.values_zlib), dtype=np.float32)
+            .reshape(frame.shape)
+            .copy()
+        )
+        observed_packed = np.frombuffer(zlib.decompress(frame.observed_packbits_zlib), dtype=np.uint8)
+        observed = np.unpackbits(
+            observed_packed, bitorder="little", count=int(np.prod(frame.shape))
+        ).reshape(frame.shape).astype(bool, copy=False)
+
+        decoded = {
+            "values": values,
+            "observed": observed,
+            "revision": int(frame.revision),
+            "bounds": tuple(belief_map_frame.bounds),
+            "resolution": float(belief_map_frame.resolution),
+        }
+        self._nav_debug_hazard_belief_decode_key = key
+        self._nav_debug_hazard_belief_decoded = decoded
+        return decoded
+
     def set_navigation_reasoning_window(self, window) -> None:
         """Register the docked NavigationReasoningWindow so the 3
         setters below can forward pushes to it too. Optional -- None (the
@@ -2464,6 +2529,8 @@ class SimulationCanvas(QWidget):
             self._nav_debug_environment_decoded = None
             self._nav_debug_explored_cache = None
             self._nav_debug_explored_cache_key = None
+            self._nav_debug_hazard_belief_decode_key = None
+            self._nav_debug_hazard_belief_decoded = None
         self._refresh_navigation_reasoning_window()
         self.update()
 
@@ -3736,17 +3803,58 @@ class SimulationCanvas(QWidget):
         called from here): no FireSource, no real fire radius/center, ever
         read for this.
 
-        The cached pixmap is keyed on (revision, bounds, resolution) only --
-        never viewport/zoom (the pixmap is built in grid-aligned pixel
-        space; world_to_screen() below repositions it per paint call
+        Browsing HISTORY renders the SELECTED snapshot's own historical
+        HazardBelief frame (via _decoded_navigation_debug_hazard_belief(),
+        decoded/cached separately from the live pixmap so toggling between
+        LIVE and HISTORY never thrashes either cache) -- never the live
+        frame, never ground truth. A historical snapshot with no
+        HazardBeliefDebug at all (captured before this existed) hides the
+        layer entirely rather than falling back to anything else.
+
+        Both pixmap caches are keyed on (revision, bounds, resolution)
+        only -- never viewport/zoom (the pixmap is built in grid-aligned
+        pixel space; world_to_screen() below repositions it per paint call
         cheaply, exactly like draw_fires()) and never theme (these colors
         are semantic and theme-independent, see test_theme_palette.py).
+        Both reuse the same _build_discovered_hazard_pixmap() color
+        formula -- no second copy of it here.
         """
         if self._navigation_debug_history_snapshot() is not None:
-            # Browsing HISTORY: no historical HazardBelief frame exists yet
-            # (a later phase) -- hide the layer entirely rather than
-            # showing the live frame or falling back to ground truth, which
-            # would mix past/present or leak omniscient information.
+            historical = self._decoded_navigation_debug_hazard_belief()
+            if historical is None:
+                return
+            if not np.any(historical["observed"]):
+                return
+
+            cache_key = (
+                int(historical["revision"]),
+                tuple(historical["bounds"]),
+                float(historical["resolution"]),
+            )
+            if (
+                self._discovered_hazard_history_pixmap_cache is None
+                or self._discovered_hazard_history_pixmap_cache_key != cache_key
+            ):
+                frame_like = SimpleNamespace(values=historical["values"], observed=historical["observed"])
+                self._discovered_hazard_history_pixmap_cache = self._build_discovered_hazard_pixmap(frame_like)
+                self._discovered_hazard_history_pixmap_cache_key = cache_key
+            pixmap = self._discovered_hazard_history_pixmap_cache
+            if pixmap is None:
+                return
+
+            x_min, x_max, y_min, y_max = map(float, historical["bounds"])
+            left, top = self.world_to_screen(x_min, y_max)
+            right, bottom = self.world_to_screen(x_max, y_min)
+            target = QRectF(
+                min(left, right),
+                min(top, bottom),
+                abs(right - left),
+                abs(bottom - top),
+            )
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+            painter.restore()
             return
 
         payload = self._discovered_hazard_frame

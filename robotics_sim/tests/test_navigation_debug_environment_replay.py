@@ -16,6 +16,7 @@ from __future__ import annotations
 import zlib
 
 import numpy as np
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
@@ -25,6 +26,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
+    HazardBeliefDebug,
     Maybe,
     NavigationDebugSnapshot,
     PathDebug,
@@ -60,6 +62,24 @@ def _make_belief_frame(*, revision: int, occupied_cell: tuple[int, int]) -> Beli
     )
 
 
+def _make_hazard_belief_frame(*, revision: int, hot_cell: tuple[int, int], hot_value: float = 0.8) -> HazardBeliefDebug:
+    values = np.zeros(_GRID_SHAPE, dtype=np.float32)
+    values[hot_cell] = hot_value
+    observed = np.zeros(_GRID_SHAPE, dtype=bool)
+    observed[hot_cell] = True
+    observed_by_robot = observed.reshape((1,) + _GRID_SHAPE)
+    packed_observed = np.packbits(observed.reshape(-1), bitorder="little")
+    packed_observed_by_robot = np.packbits(observed_by_robot.reshape(-1), bitorder="little")
+    return HazardBeliefDebug(
+        shape=_GRID_SHAPE,
+        robot_count=1,
+        revision=revision,
+        values_zlib=zlib.compress(values.tobytes(order="C"), level=1),
+        observed_packbits_zlib=zlib.compress(packed_observed.tobytes(), level=1),
+        observed_by_robot_packbits_zlib=zlib.compress(packed_observed_by_robot.tobytes(), level=1),
+    )
+
+
 def _make_sensor(polygon: list[tuple[float, float]] | None) -> SensorDebug:
     if not polygon:
         return SensorDebug()
@@ -72,7 +92,11 @@ def _make_sensor(polygon: list[tuple[float, float]] | None) -> SensorDebug:
 
 
 def _make_snapshot(
-    *, snapshot_id: int, belief_frame: BeliefMapDebug | None, polygon: list[tuple[float, float]] | None = None
+    *,
+    snapshot_id: int,
+    belief_frame: BeliefMapDebug | None,
+    polygon: list[tuple[float, float]] | None = None,
+    hazard_belief_frame: HazardBeliefDebug | None = None,
 ) -> NavigationDebugSnapshot:
     return NavigationDebugSnapshot(
         snapshot_id=snapshot_id,
@@ -114,6 +138,7 @@ def _make_snapshot(
         ),
         sensor=_make_sensor(polygon),
         belief_map=Maybe.of(belief_frame) if belief_frame is not None else Maybe.missing(),
+        hazard_belief=Maybe.of(hazard_belief_frame) if hazard_belief_frame is not None else Maybe.missing(),
     )
 
 
@@ -214,6 +239,137 @@ def test_decode_key_cleared_when_snapshot_reset_to_none():
 
     assert canvas._nav_debug_environment_decode_key is None
     assert canvas._nav_debug_environment_decoded is None
+
+
+# ---------------------------------------------------------------------------
+# _decoded_navigation_debug_hazard_belief() -- Team HazardBelief's own
+# decode/cache pipeline, kept entirely separate from _decoded_navigation_
+# debug_environment() above (BeliefMapDebug) even though both read from the
+# same selected historical snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_hazard_belief_returns_none_in_live_view():
+    canvas = _make_canvas()
+    snapshot = _make_snapshot(
+        snapshot_id=1,
+        belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)),
+        hazard_belief_frame=_make_hazard_belief_frame(revision=1, hot_cell=(1, 1)),
+    )
+    canvas.set_navigation_debug_snapshot(snapshot)
+    canvas.set_navigation_debug_history_position(None, 1)  # LIVE, not HISTORY
+
+    assert canvas._decoded_navigation_debug_hazard_belief() is None
+
+
+def test_hazard_belief_returns_none_when_navigation_debug_disabled():
+    canvas = _make_canvas()
+    canvas.navigation_debug_enabled = False
+    snapshot = _make_snapshot(
+        snapshot_id=1,
+        belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)),
+        hazard_belief_frame=_make_hazard_belief_frame(revision=1, hot_cell=(1, 1)),
+    )
+    _select_history(canvas, snapshot)
+
+    assert canvas._decoded_navigation_debug_hazard_belief() is None
+
+
+def test_hazard_belief_returns_none_when_snapshot_has_no_hazard_belief_field():
+    """An old snapshot captured before HazardBeliefDebug existed -- must hide
+    the layer, never fall back to the live frame or ground truth (see
+    draw_discovered_hazard()'s own history branch)."""
+    canvas = _make_canvas()
+    snapshot = _make_snapshot(snapshot_id=1, belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)))
+    _select_history(canvas, snapshot)
+
+    assert canvas._decoded_navigation_debug_hazard_belief() is None
+
+
+def test_hazard_belief_returns_none_when_snapshot_has_no_belief_map():
+    """hazard_belief present but belief_map missing -- an inconsistent
+    capture that should never happen in practice (both are captured from
+    the same tick), but bounds/resolution come from belief_map alone (see
+    the method's own docstring), so this must degrade to "hide", not crash."""
+    canvas = _make_canvas()
+    snapshot = _make_snapshot(
+        snapshot_id=1, belief_frame=None, hazard_belief_frame=_make_hazard_belief_frame(revision=1, hot_cell=(1, 1))
+    )
+    _select_history(canvas, snapshot)
+
+    assert canvas._decoded_navigation_debug_hazard_belief() is None
+
+
+def test_hazard_belief_decodes_values_and_observed_correctly():
+    canvas = _make_canvas()
+    frame = _make_hazard_belief_frame(revision=1, hot_cell=(2, 3), hot_value=0.6)
+    snapshot = _make_snapshot(
+        snapshot_id=1, belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)), hazard_belief_frame=frame
+    )
+    _select_history(canvas, snapshot)
+
+    decoded = canvas._decoded_navigation_debug_hazard_belief()
+
+    assert decoded is not None
+    assert decoded["values"].shape == _GRID_SHAPE
+    assert decoded["values"].dtype == np.float32
+    assert decoded["values"][2, 3] == pytest.approx(0.6)
+    assert decoded["observed"][2, 3] == True  # noqa: E712
+    assert decoded["observed"][0, 0] == False  # noqa: E712
+    assert decoded["resolution"] == _RESOLUTION
+    assert decoded["bounds"] == _BOUNDS
+
+
+def test_hazard_belief_cache_reused_for_the_same_frame_revision():
+    canvas = _make_canvas()
+    frame = _make_hazard_belief_frame(revision=1, hot_cell=(0, 0))
+    snapshot = _make_snapshot(
+        snapshot_id=1, belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)), hazard_belief_frame=frame
+    )
+    _select_history(canvas, snapshot)
+
+    first = canvas._decoded_navigation_debug_hazard_belief()
+    second = canvas._decoded_navigation_debug_hazard_belief()
+
+    assert second is first, "identical (frame identity, revision) must not re-decompress/re-decode"
+
+
+def test_hazard_belief_cache_rebuilds_on_new_revision():
+    canvas = _make_canvas()
+    snapshot_a = _make_snapshot(
+        snapshot_id=1,
+        belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)),
+        hazard_belief_frame=_make_hazard_belief_frame(revision=1, hot_cell=(0, 0)),
+    )
+    _select_history(canvas, snapshot_a)
+    first = canvas._decoded_navigation_debug_hazard_belief()
+
+    snapshot_b = _make_snapshot(
+        snapshot_id=2,
+        belief_frame=_make_belief_frame(revision=2, occupied_cell=(1, 1)),
+        hazard_belief_frame=_make_hazard_belief_frame(revision=2, hot_cell=(1, 1)),
+    )
+    _select_history(canvas, snapshot_b)
+    second = canvas._decoded_navigation_debug_hazard_belief()
+
+    assert second is not first
+    assert second["observed"][1, 1] == True  # noqa: E712
+
+
+def test_hazard_belief_decode_key_cleared_when_snapshot_reset_to_none():
+    canvas = _make_canvas()
+    snapshot = _make_snapshot(
+        snapshot_id=1,
+        belief_frame=_make_belief_frame(revision=1, occupied_cell=(0, 0)),
+        hazard_belief_frame=_make_hazard_belief_frame(revision=1, hot_cell=(0, 0)),
+    )
+    _select_history(canvas, snapshot)
+    assert canvas._decoded_navigation_debug_hazard_belief() is not None
+
+    canvas.set_navigation_debug_snapshot(None)
+
+    assert canvas._nav_debug_hazard_belief_decode_key is None
+    assert canvas._nav_debug_hazard_belief_decoded is None
 
 
 # ---------------------------------------------------------------------------

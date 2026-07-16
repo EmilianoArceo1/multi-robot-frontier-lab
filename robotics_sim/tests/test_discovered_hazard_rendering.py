@@ -19,13 +19,30 @@ identity, and frame contents -- never a full-screenshot comparison.
 from __future__ import annotations
 
 import inspect
+import zlib
 
+import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from robotics_sim.app.simulation_canvas import SimulationCanvas
 from robotics_sim.app.theme import ThemeMode
+from robotics_sim.diagnostics.navigation_snapshot import (
+    BeliefMapDebug,
+    ControllerDebug,
+    FrontierDebug,
+    HazardBeliefDebug,
+    Maybe,
+    NavigationDebugSnapshot,
+    PathDebug,
+    PlanningGridDebug,
+    Pose,
+    PredictedMotionDebug,
+    RouteValidationDebug,
+    SafetyDebug,
+    SensorDebug,
+)
 from robotics_sim.environment.grid_geometry import GridGeometry
 from robotics_sim.environment.hazard_belief import HazardBelief
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
@@ -353,6 +370,187 @@ def test_history_without_a_historical_belief_frame_hides_the_layer():
         "browsing history with no historical hazard-belief frame must hide "
         "the layer -- never fall back to the live frame or ground truth"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: HISTORY *with* a real historical HazardBeliefDebug frame replays
+# that exact frame -- via its own separate pixmap cache
+# (_discovered_hazard_history_pixmap_cache), never the live one.
+# ---------------------------------------------------------------------------
+
+
+def _make_belief_map_debug() -> BeliefMapDebug:
+    grid = np.full((5, 5), -1, dtype=np.int8)  # UNKNOWN
+    explored = np.zeros((1, 5, 5), dtype=np.uint8)
+    packed = np.packbits(explored.reshape(-1), bitorder="little")
+    return BeliefMapDebug(
+        revision=1,
+        resolution=_RESOLUTION,
+        bounds=_BOUNDS,
+        grid_shape=(5, 5),
+        grid_zlib=zlib.compress(grid.tobytes(order="C"), level=1),
+        explored_shape=(1, 5, 5),
+        explored_packbits_zlib=zlib.compress(packed.tobytes(), level=1),
+    )
+
+
+def _make_hazard_belief_debug(belief: HazardBelief) -> HazardBeliefDebug:
+    frame = belief.snapshot()
+    values = np.ascontiguousarray(frame.values, dtype=np.float32)
+    observed = np.ascontiguousarray(frame.observed, dtype=bool)
+    observed_by_robot = np.ascontiguousarray(frame.observed_by_robot, dtype=bool)
+    packed_observed = np.packbits(observed.reshape(-1), bitorder="little")
+    packed_observed_by_robot = np.packbits(observed_by_robot.reshape(-1), bitorder="little")
+    return HazardBeliefDebug(
+        shape=(int(values.shape[0]), int(values.shape[1])),
+        robot_count=belief.robot_count,
+        revision=frame.revision,
+        values_zlib=zlib.compress(values.tobytes(order="C"), level=1),
+        observed_packbits_zlib=zlib.compress(packed_observed.tobytes(), level=1),
+        observed_by_robot_packbits_zlib=zlib.compress(packed_observed_by_robot.tobytes(), level=1),
+    )
+
+
+def _make_history_snapshot(belief: HazardBelief, *, snapshot_id: int = 1) -> NavigationDebugSnapshot:
+    return NavigationDebugSnapshot(
+        snapshot_id=snapshot_id,
+        simulation_time=1.0,
+        robot_id="R1",
+        navigation_state="moving",
+        decision_kind="FOLLOW_PATH",
+        decision_reason="",
+        robot_pose=Pose(x=0.0, y=0.0, theta=0.0, v=0.0),
+        path=PathDebug(
+            raw_path=Maybe.missing(),
+            simplified_path=Maybe.missing(),
+            active_path=(),
+            pending_path=(),
+            active_segment=None,
+            active_waypoint_index=None,
+            planner_name=Maybe.missing(),
+            simplifier_name=Maybe.missing(),
+        ),
+        route=RouteValidationDebug(first_segment=Maybe.missing(), endpoint_reaches_goal=None),
+        predicted_motion=PredictedMotionDebug(trajectory=Maybe.missing(), collision=Maybe.missing()),
+        safety=SafetyDebug(robot_radius=0.2, safety_radius=0.3, active_segment=Maybe.missing()),
+        planning_grid=PlanningGridDebug(
+            start_cell=Maybe.missing(),
+            start_cell_world=Maybe.missing(),
+            first_waypoint_cell=Maybe.missing(),
+            first_waypoint_world=Maybe.missing(),
+            unknown_is_traversable=Maybe.missing(),
+            start_cell_cleared=Maybe.missing(),
+        ),
+        controller=ControllerDebug(
+            v=0.0, omega=0.0, acceleration=0.0, heading_error=Maybe.missing(), distance_to_goal=Maybe.missing()
+        ),
+        frontier=FrontierDebug(
+            candidate_count=Maybe.missing(),
+            selected_target=Maybe.missing(),
+            selected_score=Maybe.missing(),
+            reason=Maybe.missing(),
+        ),
+        sensor=SensorDebug(),
+        belief_map=Maybe.of(_make_belief_map_debug()),
+        hazard_belief=Maybe.of(_make_hazard_belief_debug(belief)),
+    )
+
+
+def _enter_history(canvas: SimulationCanvas, snapshot: NavigationDebugSnapshot, *, position: int = 2, total: int = 10) -> None:
+    canvas.navigation_debug_enabled = True
+    canvas.set_navigation_debug_snapshot(snapshot)
+    canvas.set_navigation_debug_history_position(position, total)
+
+
+def test_history_replays_the_exact_observed_cells_and_values_from_the_snapshot():
+    canvas = _make_canvas()
+    belief = _make_belief()
+    belief.observe_cells([2], [2], [0.8], robot_index=0)
+    _enter_history(canvas, _make_history_snapshot(belief))
+
+    _draw_once(canvas)
+
+    pixmap = canvas._discovered_hazard_history_pixmap_cache
+    assert pixmap is not None
+    assert _pixel_alpha(pixmap, 2, 2) > 0
+    assert _pixel_alpha(pixmap, 0, 0) == 0
+    assert canvas._discovered_hazard_pixmap_cache is None, "the LIVE cache must never be touched by history rendering"
+
+
+def test_history_unobserved_cells_stay_transparent_next_to_an_observed_one():
+    canvas = _make_canvas()
+    belief = _make_belief()
+    belief.observe_cells([1, 1, 2, 2], [1, 2, 1, 2], [0.7, 0.7, 0.7, 0.7], robot_index=0)
+    _enter_history(canvas, _make_history_snapshot(belief))
+
+    _draw_once(canvas)
+    pixmap = canvas._discovered_hazard_history_pixmap_cache
+
+    for row in range(5):
+        for col in range(5):
+            alpha = _pixel_alpha(pixmap, row, col)
+            if row in (1, 2) and col in (1, 2):
+                assert alpha > 0, f"observed hot cell ({row},{col}) must be visible"
+            else:
+                assert alpha == 0, f"unobserved cell ({row},{col}) must stay transparent"
+
+
+def test_history_pixmap_cache_reused_for_the_same_revision():
+    canvas = _make_canvas()
+    belief = _make_belief()
+    belief.observe_cells([2], [2], [0.8], robot_index=0)
+    _enter_history(canvas, _make_history_snapshot(belief))
+    _draw_once(canvas)
+    cache_after_first = canvas._discovered_hazard_history_pixmap_cache
+    assert cache_after_first is not None
+
+    _draw_once(canvas)
+
+    assert canvas._discovered_hazard_history_pixmap_cache is cache_after_first
+
+
+def test_history_pixmap_cache_rebuilds_on_a_new_snapshot_revision():
+    canvas = _make_canvas()
+    belief = _make_belief()
+    belief.observe_cells([2], [2], [0.8], robot_index=0)
+    _enter_history(canvas, _make_history_snapshot(belief, snapshot_id=1))
+    _draw_once(canvas)
+    cache_after_first = canvas._discovered_hazard_history_pixmap_cache
+
+    belief.observe_cells([3], [3], [0.6], robot_index=0)  # bumps revision
+    _enter_history(canvas, _make_history_snapshot(belief, snapshot_id=2))
+    _draw_once(canvas)
+
+    assert canvas._discovered_hazard_history_pixmap_cache is not cache_after_first
+    assert _pixel_alpha(canvas._discovered_hazard_history_pixmap_cache, 3, 3) > 0
+
+
+def test_history_and_live_pixmap_caches_never_thrash_each_other():
+    canvas = _make_canvas()
+    live_belief = _make_belief()
+    live_belief.observe_cells([0], [0], [0.9], robot_index=0)
+    canvas.set_discovered_hazard_frame(_payload(live_belief))
+    _draw_once(canvas)
+    live_cache_before = canvas._discovered_hazard_pixmap_cache
+    assert live_cache_before is not None
+
+    history_belief = _make_belief()
+    history_belief.observe_cells([4], [4], [0.5], robot_index=0)
+    _enter_history(canvas, _make_history_snapshot(history_belief))
+    _draw_once(canvas)
+
+    assert canvas._discovered_hazard_pixmap_cache is live_cache_before, (
+        "entering HISTORY must not rebuild/clear the LIVE cache"
+    )
+    assert canvas._discovered_hazard_history_pixmap_cache is not None
+    assert _pixel_alpha(canvas._discovered_hazard_history_pixmap_cache, 4, 4) > 0
+
+    # Leaving HISTORY back to LIVE must still show the untouched live cache.
+    canvas.navigation_debug_enabled = False
+    canvas.set_navigation_debug_history_position(None, 10)
+    _draw_once(canvas)
+
+    assert canvas._discovered_hazard_pixmap_cache is live_cache_before
 
 
 # ---------------------------------------------------------------------------

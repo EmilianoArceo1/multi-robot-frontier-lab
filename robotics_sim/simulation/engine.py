@@ -115,6 +115,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
+    HazardBeliefDebug,
     HazardDebug,
     HazardSourceDebug,
     Maybe,
@@ -128,6 +129,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     SafetyDebug,
     SensorDebug,
 )
+from robotics_sim.environment.hazard_belief import HazardBeliefFrame
 from robotics_sim.environment.hazard_field import FireSource
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
@@ -2835,6 +2837,52 @@ class SimulationControllerMixin:
             )
         )
 
+    def _navigation_debug_hazard_belief_frame(self) -> Maybe[HazardBeliefDebug]:
+        """Return a compact immutable Team HazardBelief frame, reusing it
+        until the belief actually changes -- same revision-keyed cache
+        pattern as _navigation_debug_belief_frame() (BeliefMapDebug).
+
+        Never reads HazardField/FireSource -- only HazardBelief.snapshot(),
+        deliberately separate from _navigation_debug_hazard_frame() above
+        (ground truth). The cache key includes id(belief) and shape/
+        robot_count (not just revision) so a reset that recreates the
+        RuntimeHazardService/HazardBelief, or a grid-resolution/robot-count
+        change, invalidates it even on the rare chance a fresh belief's
+        revision coincides with the previous one's.
+        """
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is None:
+            return Maybe.missing()
+        belief = hazard_service.belief
+
+        revision = int(belief.revision)
+        shape = (int(belief.shape[0]), int(belief.shape[1]))
+        robot_count = int(belief.robot_count)
+        cache_key = (id(belief), revision, shape, robot_count)
+        cached_key = getattr(self, "_nav_debug_hazard_belief_frame_key", None)
+        cached_frame = getattr(self, "_nav_debug_hazard_belief_frame_cache", None)
+        if cached_key == cache_key and cached_frame is not None:
+            return Maybe.of(cached_frame)
+
+        frame = belief.snapshot()
+        values = np.ascontiguousarray(frame.values, dtype=np.float32)
+        observed = np.ascontiguousarray(frame.observed, dtype=bool)
+        observed_by_robot = np.ascontiguousarray(frame.observed_by_robot, dtype=bool)
+        packed_observed = np.packbits(observed.reshape(-1), bitorder="little")
+        packed_observed_by_robot = np.packbits(observed_by_robot.reshape(-1), bitorder="little")
+
+        debug_frame = HazardBeliefDebug(
+            shape=shape,
+            robot_count=robot_count,
+            revision=revision,
+            values_zlib=zlib.compress(values.tobytes(order="C"), level=1),
+            observed_packbits_zlib=zlib.compress(packed_observed.tobytes(), level=1),
+            observed_by_robot_packbits_zlib=zlib.compress(packed_observed_by_robot.tobytes(), level=1),
+        )
+        self._nav_debug_hazard_belief_frame_key = cache_key
+        self._nav_debug_hazard_belief_frame_cache = debug_frame
+        return Maybe.of(debug_frame)
+
     def _navigation_debug_agent_state_frame(self, agent) -> Maybe[AgentStateDebug]:
         """Freeze the RobotAgent fields restore needs explicitly -- see
         AgentStateDebug's docstring for exactly what is and is not included
@@ -3079,6 +3127,7 @@ class SimulationControllerMixin:
         )
         belief_map_debug = self._navigation_debug_belief_frame()
         hazard_debug = self._navigation_debug_hazard_frame()
+        hazard_belief_debug = self._navigation_debug_hazard_belief_frame()
         agent_state_debug = self._navigation_debug_agent_state_frame(agent)
         metrics_debug = self._navigation_debug_metrics_frame()
 
@@ -3105,6 +3154,7 @@ class SimulationControllerMixin:
             sensor=sensor,
             belief_map=belief_map_debug,
             hazard=hazard_debug,
+            hazard_belief=hazard_belief_debug,
             agent_state=agent_state_debug,
             metrics=metrics_debug,
         )
@@ -4224,6 +4274,39 @@ class SimulationControllerMixin:
             return False, "Select a historical snapshot to resume from."
         return True, ""
 
+    def _restore_empty_hazard_belief(self, hazard_service: RuntimeHazardService) -> None:
+        """Reset hazard_service.belief to a deterministic empty state:
+        revision EXACTLY 0, not whatever HazardBelief.clear() would leave
+        behind.
+
+        HazardBelief.clear() is a no-op (keeps the current revision) when
+        the belief was already empty, and otherwise bumps the revision by
+        exactly 1 -- so restoring the SAME historical snapshot from two
+        different "future" live states could clear() into two different
+        revisions. That would be a nondeterministic result for a restore
+        that is supposed to reproduce one frozen moment exactly, and would
+        confuse the (id(belief), revision, ...) cache in _navigation_debug_
+        hazard_belief_frame() and anything else that trusts revision as a
+        change signal.
+
+        Used for every fallback case in restore_navigation_debug_snapshot()
+        (missing HazardBeliefDebug, corrupt payload, shape/robot_count
+        mismatch) -- explicit HazardBelief.restore() with all-zero arrays,
+        never HazardBelief.clear(). Never derives state from HazardField,
+        never re-runs a sensor; the RuntimeHazardService instance itself is
+        left exactly as it is.
+        """
+        belief = hazard_service.belief
+        height, width = belief.shape
+        belief.restore(
+            HazardBeliefFrame(
+                values=np.zeros((height, width), dtype=np.float32),
+                observed=np.zeros((height, width), dtype=bool),
+                observed_by_robot=np.zeros((belief.robot_count, height, width), dtype=bool),
+                revision=0,
+            )
+        )
+
     def restore_navigation_debug_snapshot(self, index: int | None = None) -> bool:
         """Roll the live simulation back to the frozen state at history
         `index` (defaults to the currently viewed HISTORY position), then
@@ -4319,17 +4402,15 @@ class SimulationControllerMixin:
 
         # 4b. Hazards -- a layer fully separate from occupancy (see
         # HazardField's module docstring); this never touches belief.grid
-        # above. Only ground-truth FireSources are restored here; the team
-        # HazardBelief is a separate later-phase concern (Phase 5 snapshot
-        # restore). apply_hazard_belief_to_planning_grid() recomputes fresh
-        # from hazard_service.belief on every planning call (no separate
-        # costmap cache to invalidate), and the canvas's heatmap pixmap is
-        # keyed on HazardField.version, so push_hazard_snapshot() below is
-        # sufficient
-        # to invalidate the render cache too.
+        # above. Ground-truth FireSources and the team's discovered
+        # HazardBelief are restored independently of each other (see
+        # HazardBeliefDebug's own docstring) -- a fire that was never
+        # observed before capture stays unobserved after restore, exactly
+        # as it was; HazardBelief is never derived from FireSource/
+        # HazardField here.
+        hazard_service = self.ensure_hazard_service()
         if not snapshot.hazard.unavailable and snapshot.hazard.value is not None:
             hazard_frame = snapshot.hazard.value
-            hazard_service = self.ensure_hazard_service()
             restored_sources = tuple(
                 FireSource(
                     fire_id=source.fire_id,
@@ -4340,7 +4421,72 @@ class SimulationControllerMixin:
                 for source in hazard_frame.sources
             )
             hazard_service.field.restore_sources(restored_sources, next_fire_id=hazard_frame.next_fire_id)
-            self.push_hazard_snapshot()
+
+        # HazardBelief -- discovered-only. A snapshot captured before this
+        # field existed (hazard_belief.unavailable), a shape/robot_count
+        # mismatch (geometry changed since capture), or a corrupt/empty
+        # byte payload all fall back to the SAME safe, DETERMINISTIC result:
+        # an empty HazardBelief at revision exactly 0 (see _restore_empty_
+        # hazard_belief() -- never HazardBelief.clear(), whose resulting
+        # revision depends on whatever state existed before the restore).
+        # Never HazardField as a stand-in for "observed" -- that is exactly
+        # the omniscience leak this whole feature exists to prevent. No
+        # sensor re-run, no marking every ground-truth cell observed.
+        hazard_belief_maybe = snapshot.hazard_belief
+        restored_belief = False
+        if not hazard_belief_maybe.unavailable and hazard_belief_maybe.value is not None:
+            belief_debug = hazard_belief_maybe.value
+            try:
+                values = (
+                    np.frombuffer(zlib.decompress(belief_debug.values_zlib), dtype=np.float32)
+                    .reshape(belief_debug.shape)
+                    .copy()
+                )
+                observed_packed = np.frombuffer(
+                    zlib.decompress(belief_debug.observed_packbits_zlib), dtype=np.uint8
+                )
+                observed = np.unpackbits(
+                    observed_packed, bitorder="little", count=int(np.prod(belief_debug.shape))
+                ).reshape(belief_debug.shape).astype(bool, copy=False)
+                observed_by_robot_shape = (belief_debug.robot_count,) + tuple(belief_debug.shape)
+                observed_by_robot_packed = np.frombuffer(
+                    zlib.decompress(belief_debug.observed_by_robot_packbits_zlib), dtype=np.uint8
+                )
+                observed_by_robot = np.unpackbits(
+                    observed_by_robot_packed, bitorder="little", count=int(np.prod(observed_by_robot_shape))
+                ).reshape(observed_by_robot_shape).astype(bool, copy=False)
+
+                # HazardBelief.restore() itself validates shape/dtype
+                # against this instance's own geometry/robot_count and
+                # raises ValueError on mismatch -- caught below, same
+                # fallback as a snapshot with no hazard_belief at all.
+                hazard_service.belief.restore(
+                    HazardBeliefFrame(
+                        values=values,
+                        observed=observed,
+                        observed_by_robot=observed_by_robot,
+                        revision=int(belief_debug.revision),
+                    )
+                )
+                restored_belief = True
+            except (ValueError, zlib.error):
+                restored_belief = False
+
+        if not restored_belief:
+            self._restore_empty_hazard_belief(hazard_service)
+
+        # Any cached hazard-belief debug frame keyed on the now-discarded
+        # future is stale.
+        self._nav_debug_hazard_belief_frame_key = None
+        self._nav_debug_hazard_belief_frame_cache = None
+
+        self.push_hazard_snapshot()
+        # Push the just-restored belief to the canvas exactly once. Hazard
+        # observation runs synchronously inside record_explored_area() (no
+        # in-flight async worker can land later and overwrite this), so
+        # there is nothing else that could race this push.
+        self.push_discovered_hazard_frame()
+        self._discovered_hazard_render_dirty = False
 
         # 5. mapped_obstacle_points is append-only at runtime (see
         # update_sensed_obstacles()), so truncating to the snapshot's own

@@ -317,15 +317,13 @@ def test_first_segment_blocked_route_is_rejected_before_acceptance():
         prefetch_workers={0: object()},
         prefetch_request_ids={0: 1},
         mapped_obstacle_points=[(1.0, 0.0)],  # sits directly on the first segment
-        config=SimpleNamespace(goal_tolerance=0.25, grid_resolution=0.5),
+        config=SimpleNamespace(goal_tolerance=0.25),
         simulation_time=1.0,
         collision_checker=CollisionChecker(),
     )
     fake.runtime_agent = lambda robot_index=None: agent
     fake.safety_radius = lambda: 0.3
     fake.log_console_message = lambda msg: console_logs.append(msg)
-    for name in ("sanitize_planner_obstacle_points", "obstacle_points_for_segment_safety_check"):
-        setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     SimulationControllerMixin.on_prefetch_route_ready(
         fake,
@@ -353,15 +351,13 @@ def test_first_segment_clear_route_is_accepted_as_pending():
         prefetch_workers={0: object()},
         prefetch_request_ids={0: 1},
         mapped_obstacle_points=[],  # no obstacles at all
-        config=SimpleNamespace(goal_tolerance=0.25, grid_resolution=0.5),
+        config=SimpleNamespace(goal_tolerance=0.25),
         simulation_time=1.0,
         collision_checker=CollisionChecker(),
     )
     fake.runtime_agent = lambda robot_index=None: agent
     fake.safety_radius = lambda: 0.3
     fake.log_console_message = lambda msg: None
-    for name in ("sanitize_planner_obstacle_points", "obstacle_points_for_segment_safety_check"):
-        setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     SimulationControllerMixin.on_prefetch_route_ready(
         fake,

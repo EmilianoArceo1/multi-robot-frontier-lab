@@ -147,13 +147,7 @@ def _build_fake_engine(*, position=(3.0, -4.7), goal_tolerance=0.25) -> SimpleNa
     fake.final_goal_xy = lambda: (0.0, 0.0)
     fake.runtime_agent = lambda robot_index=None: fake.agent
 
-    for name in (
-        "apply_route_result",
-        "log_route_assignment",
-        "on_prefetch_route_ready",
-        "sanitize_planner_obstacle_points",
-        "obstacle_points_for_segment_safety_check",
-    ):
+    for name in ("apply_route_result", "log_route_assignment", "on_prefetch_route_ready"):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     return fake

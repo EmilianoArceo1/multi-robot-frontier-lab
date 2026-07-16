@@ -2099,13 +2099,12 @@ class SimulationControllerMixin:
             # assigned, producing a safety-replan loop instead of a working
             # route. Falls through to the shared failure-handling code below.
             start_xy = (float(self.robot.x), float(self.robot.y))
-            segment_robot_radius = self.safety_radius()
             blocked_on_arrival = bool(clean_waypoints) and route_first_segment_blocked(
                 self.collision_checker,
                 start_xy,
                 clean_waypoints[0],
-                self.obstacle_points_for_segment_safety_check(start_xy, segment_robot_radius),
-                segment_robot_radius,
+                list(self.mapped_obstacle_points),
+                self.safety_radius(),
             )
 
             # Reject a route that claims success but whose final waypoint
@@ -6276,13 +6275,12 @@ class SimulationControllerMixin:
             # samples appeared near the route could still be promoted via
             # ACCEPT_PENDING_PATH straight into a now-unsafe segment.
             robot_xy_now = (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None
-            prefetch_segment_robot_radius = self.safety_radius()
             if robot_xy_now is not None and route_first_segment_blocked(
                 self.collision_checker,
                 robot_xy_now,
                 clean_waypoints[0],
-                self.obstacle_points_for_segment_safety_check(robot_xy_now, prefetch_segment_robot_radius),
-                prefetch_segment_robot_radius,
+                list(self.mapped_obstacle_points),
+                self.safety_radius(),
             ):
                 rejected_target = agent.pending_target_xy
                 agent.first_segment_blocked_count += 1

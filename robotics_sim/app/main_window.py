@@ -1341,6 +1341,22 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         exclusion from locked_during_run_widgets in config_panel.py)."""
         self.canvas.set_grid_overlay_enabled(bool(enabled))
 
+    def on_hazard_map_toggled(self, enabled: bool) -> None:
+        """Toggle the full ground-truth hazard DEBUG overlay -- ADDS the
+        complete HazardField as a blue heatmap under the (always-visible)
+        discovered hazard layer; never hides anything. Independent of Fire
+        Markers below. Rendering-only, same contract as Show Grid: never
+        touches self.config/HazardBelief/planning, stays interactive while
+        a simulation is running."""
+        self.canvas.set_hazard_map_enabled(bool(enabled))
+
+    def on_fire_markers_toggled(self, enabled: bool) -> None:
+        """Toggle whether UNDISCOVERED fire sources are also shown -- ADDS
+        the full ground-truth FireSource set; discovered sources are
+        always drawn regardless. Independent of Hazard Map above. Same
+        rendering-only contract."""
+        self.canvas.set_fire_markers_enabled(bool(enabled))
+
     def on_navigation_debug_toggled(self, enabled: bool) -> None:
         """Enable/disable navigation-debug capture -- and *only* capture.
 

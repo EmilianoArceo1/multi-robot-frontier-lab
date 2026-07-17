@@ -361,6 +361,36 @@ def build_config_panel(window):
         0,
     )
 
+    # "Hazard Map" / "Fire Markers" are two independent rendering-only
+    # ground-truth DEBUG overlays, both default OFF: what the team has
+    # actually discovered (the warm hazard heatmap and its discovered fire
+    # sources) is ALWAYS visible regardless of these -- turning a toggle ON
+    # only ADDS the full ground-truth layer on top, it never hides
+    # discovered information (see SimulationCanvas.draw_ground_truth_
+    # hazard_map()/draw_fire_markers()'s own docstrings). Neither touches
+    # SimulationConfig/HazardBelief/planning, so both are deliberately left
+    # out of numeric_widgets and locked_during_run_widgets below and stay
+    # interactive while a simulation is running -- see MainWindow.
+    # on_hazard_map_toggled()/on_fire_markers_toggled().
+    window.hazard_map_toggle = ToggleSwitch(False)
+    window.hazard_map_toggle.setToolTip(
+        "Show the complete ground-truth hazard field. Visualization only."
+    )
+    options_grid.addWidget(
+        labeled_toggle("Hazard Map", window.hazard_map_toggle),
+        8,
+        1,
+    )
+    window.fire_markers_toggle = ToggleSwitch(False)
+    window.fire_markers_toggle.setToolTip(
+        "Show all fire sources. Discovered sources remain visible when off."
+    )
+    options_grid.addWidget(
+        labeled_toggle("Fire Markers", window.fire_markers_toggle),
+        9,
+        0,
+    )
+
     # "Navigation Debug" is controlled solely by the Navigation switch in
     # main_window._build_navigation_snapshot_bar() (docked above the canvas
     # header), not by a side-panel control -- a single, always-visible
@@ -684,6 +714,8 @@ def build_config_panel(window):
     window.safety_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
     window.grid_resolution_input.valueChanged.connect(window.on_grid_resolution_control_changed)
     window.grid_overlay_toggle.toggled.connect(window.on_grid_overlay_toggled)
+    window.hazard_map_toggle.toggled.connect(window.on_hazard_map_toggled)
+    window.fire_markers_toggle.toggled.connect(window.on_fire_markers_toggled)
     window.top_bar.mode_selector.currentTextChanged.connect(window.on_agent_mode_changed)
     window.robot_count_input.valueChanged.connect(window.on_robot_count_changed)
     window.same_config_switch.toggled.connect(window.on_same_config_toggled)

@@ -101,6 +101,37 @@ class ThemeColors:
     input_background: str
     menu_background: str
     scrollbar: str
+    # Hazard/fire tokens -- a deliberate, explicitly-requested exception to
+    # this module's own "simulated-world semantics live in simulation.
+    # config, theme switching never touches them" rule (see the module
+    # docstring above): unlike the rest of the simulated-world palette,
+    # these are meant to actually change look between LIGHT/DARK (see
+    # SimulationCanvas.draw_ground_truth_hazard_map()/draw_discovered_
+    # hazard()/draw_fire_markers()). Opaque hex only, same as every other
+    # field here -- per-layer alpha is applied by the canvas at paint time
+    # via QColor.setAlpha(), never baked into the token.
+    #
+    # Full ground-truth HazardField inspection heatmap (Hazard Map toggle,
+    # default OFF) -- a cold blue palette, deliberately never the warm
+    # discovered-hazard one, so the two layers never read as the same
+    # information source even when both are visible together.
+    hazard_map_low: str
+    hazard_map_mid: str
+    hazard_map_high: str
+    # Team-discovered hazard belief heatmap (always visible) -- warm amber
+    # -> orange -> coral-red -> light core.
+    discovered_hazard_low: str
+    discovered_hazard_mid: str
+    discovered_hazard_high: str
+    discovered_hazard_core: str
+    # Fire source beacon (SimulationCanvas.draw_fire_markers()). A
+    # DISCOVERED source (center cell observed=True, always drawn) uses the
+    # warm ring/core; an UNDISCOVERED source (only ever drawn while Fire
+    # Markers is ON) uses the tenue-blue ring/core.
+    fire_discovered_ring: str
+    fire_discovered_core: str
+    fire_undiscovered_ring: str
+    fire_undiscovered_core: str
 
 
 # Light is the original, already-shipped palette (see robotics_sim.
@@ -125,6 +156,23 @@ LIGHT_THEME = ThemeColors(
     input_background="#FFFFFF",
     menu_background="#FFFFFF",
     scrollbar="#C7CCD6",
+    # Ground-truth blue inspection map -- deep tenue -> real blue -> a
+    # luminous cyan/indigo top end.
+    hazard_map_low="#1B3A6B",
+    hazard_map_mid="#2F6FE0",
+    hazard_map_high="#3FD1E0",
+    # Discovered hazard: amber -> orange -> coral-red, with a light core
+    # only the hottest cells actually reach.
+    discovered_hazard_low="#E8B23D",
+    discovered_hazard_mid="#E8641F",
+    discovered_hazard_high="#FF5A45",
+    discovered_hazard_core="#FFF1C2",
+    # Fire beacon: warm ring/core for a discovered source, tenue blue for
+    # an undiscovered one shown only via the Fire Markers toggle.
+    fire_discovered_ring="#D8481C",
+    fire_discovered_core="#FFE29A",
+    fire_undiscovered_ring="#5B8DEF",
+    fire_undiscovered_core="#BBD3FF",
 )
 
 # Dark: every background/text pair below was chosen to keep readable
@@ -150,6 +198,26 @@ DARK_THEME = ThemeColors(
     input_background="#282C33",
     menu_background="#22262C",
     scrollbar="#454B54",
+    # Ground-truth blue inspection map -- still legible against the near-
+    # black app background; the low-alpha applied at paint time keeps it
+    # semi-transparent regardless.
+    hazard_map_low="#274B85",
+    hazard_map_mid="#4C86F0",
+    hazard_map_high="#5DE3EF",
+    # Discovered hazard -- never dark red here, it would vanish against the
+    # dark background (see the module's own dark-palette design note
+    # above); core is more luminous than LIGHT_THEME's.
+    discovered_hazard_low="#F0BF5C",
+    discovered_hazard_mid="#F2823D",
+    discovered_hazard_high="#FF7A63",
+    discovered_hazard_core="#FFF6DE",
+    # Fire beacon -- brighter warm ring/core and brighter blue ring than
+    # LIGHT_THEME's, same "never dark red" rule, see test_theme_palette.py
+    # for the luminance assertion.
+    fire_discovered_ring="#FF8F5C",
+    fire_discovered_core="#FFF3D2",
+    fire_undiscovered_ring="#7FB3FF",
+    fire_undiscovered_core="#D6E6FF",
 )
 
 _PALETTES: dict[ThemeMode, ThemeColors] = {

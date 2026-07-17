@@ -323,12 +323,17 @@ def test_changing_viewport_does_not_rebuild_the_cache():
 
 
 # ---------------------------------------------------------------------------
-# 13. Theme changes never alter hazard semantics -- the cache is not even
-# theme-keyed, so it survives a theme switch untouched.
+# 13. Theme changes correctly re-key the hazard heatmap cache -- see the
+# hazard-overlay-controls task's explicit "improve the warm palette,
+# LIGHT/DARK must differ" requirement. Both revision AND ThemeMode are
+# part of the pixmap cache key now (theme.ThemeColors.discovered_hazard_*),
+# so a pixmap built with one palette is never reused after switching to
+# the other -- see test_hazard_overlay_controls.py's own theme-token/
+# cache-invalidation tests for the fuller coverage of this rule.
 # ---------------------------------------------------------------------------
 
 
-def test_theme_change_preserves_hazard_semantics():
+def test_theme_change_rebuilds_the_hazard_pixmap_with_the_new_palette():
     canvas = _make_canvas()
     belief = _make_belief()
     belief.observe_cells([2], [2], [0.8], robot_index=0)
@@ -340,11 +345,11 @@ def test_theme_change_preserves_hazard_semantics():
     canvas.set_theme_mode(ThemeMode.DARK)
     _draw_once(canvas)
 
-    assert canvas._discovered_hazard_pixmap_cache is cache_before, (
-        "the hazard heatmap cache must not be theme-keyed -- these are "
-        "semantic, theme-independent colors"
+    assert canvas._discovered_hazard_pixmap_cache is not cache_before, (
+        "a pixmap built with the LIGHT palette must never be reused after "
+        "switching to DARK -- ThemeMode is part of the cache key"
     )
-    assert _pixel_rgb(canvas._discovered_hazard_pixmap_cache, 2, 2) == rgb_before
+    assert _pixel_rgb(canvas._discovered_hazard_pixmap_cache, 2, 2) != rgb_before
 
 
 # ---------------------------------------------------------------------------

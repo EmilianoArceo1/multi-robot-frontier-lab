@@ -121,13 +121,20 @@ def test_canvas_semantic_colors_are_not_theme_dependent():
 
     # robot_color() takes no theme argument at all -- confirm the semantic
     # draw methods that call it/BLUE/GREEN/ORANGE/RED never touch theme.py.
+    #
+    # draw_discovered_hazard() and draw_ground_truth_hazard_map() are
+    # deliberately NOT in this list: both now read theme_colors() (via
+    # _build_discovered_hazard_pixmap()/_build_ground_truth_hazard_pixmap()
+    # respectively) -- an explicitly-requested exception, see theme.
+    # ThemeColors' own hazard/fire token comments. draw_fires() (the
+    # unrelated legacy ground-truth yellow/red renderer) stays in this list
+    # -- it was never asked to become theme-dependent.
     semantic_methods = (
         SimulationCanvas.draw_sensor_range,
         SimulationCanvas.draw_planned_route,
         SimulationCanvas.draw_multi_planned_routes,
         SimulationCanvas.draw_goal_and_robot,
         SimulationCanvas.draw_fires,
-        SimulationCanvas.draw_discovered_hazard,
     )
     for method in semantic_methods:
         source = inspect.getsource(method)

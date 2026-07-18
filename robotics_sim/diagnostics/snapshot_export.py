@@ -8,6 +8,12 @@ The `Snapshots` sheet contains exactly one row per NavigationDebugEvent.  Large
 or nested values (paths and hazard sources) are represented as compact JSON so
 the workbook stays flat and easy to analyze with filters, formulas, Python, R,
 or another ChatGPT session.
+
+The `Hazard Belief Cells` sheet is a normalized detail table: one row per
+(snapshot, observed cell) for the team's discovered HazardBelief -- see
+hazard_belief_cell_rows(). It is independent of the `Snapshots` sheet's own
+hazard_* columns (ground-truth FireSource) and hazard_belief_* summary
+columns; neither sheet nor column set is derived from the other.
 """
 from __future__ import annotations
 
@@ -427,9 +433,185 @@ def select_navigation_snapshot_events(
     raise ValueError(f"Unknown navigation snapshot export mode: {mode!r}")
 
 
-def snapshot_row(event: NavigationDebugEvent, event_index: int, *, belief_cache=None) -> dict[str, object]:
+def _hazard_belief_decode_error(step: str, exc: Exception) -> str:
+    """Short, stable one-line message -- never a full traceback in a cell."""
+    return f"{step}: {type(exc).__name__}: {exc}"
+
+
+def _decode_hazard_belief(frame) -> dict[str, object]:
+    """Pure, Qt-free decode of one HazardBeliefDebug frame.
+
+    Reads ONLY the fields already present on `frame` itself (shape,
+    robot_count, revision, values_zlib, observed_packbits_zlib,
+    observed_by_robot_packbits_zlib) -- same zlib + unpackbits(bitorder=
+    "little") pairing used by capture (engine._navigation_debug_hazard_
+    belief_frame()) and by restore/canvas replay. Never reads
+    RuntimeHazardService, HazardField, the canvas, or engine: the exported
+    NavigationDebugSnapshot is the only source of truth, mirroring
+    _belief_values() above for BeliefMapDebug.
+
+    `shape`/`robot_count`/`revision` are plain (uncompressed) fields, so
+    they are validated and reported independently of the compressed arrays
+    below -- a frame with valid metadata but a corrupt byte payload still
+    reports its real shape/robot_count/revision, it just has no values/
+    observed/observed_by_robot and a non-empty `error`. Any failure --
+    invalid metadata, a zlib error, a byte/bit count that does not exactly
+    match what shape/robot_count imply -- returns a short, stable `error`
+    string instead of raising, so one corrupt snapshot can never abort the
+    whole export.
+    """
+    result: dict[str, object] = {
+        "error": "",
+        "shape": None,
+        "robot_count": None,
+        "revision": None,
+        "values": None,
+        "observed": None,
+        "observed_by_robot": None,
+    }
+
+    try:
+        shape = (int(frame.shape[0]), int(frame.shape[1]))
+        robot_count = int(frame.robot_count)
+        revision = int(frame.revision)
+    except (TypeError, ValueError, IndexError) as exc:
+        result["error"] = _hazard_belief_decode_error("shape/robot_count/revision", exc)
+        return result
+    if shape[0] <= 0 or shape[1] <= 0:
+        result["error"] = f"shape: non-positive shape {shape!r}"
+        return result
+    if robot_count < 1:
+        result["error"] = f"robot_count: must be >= 1, got {robot_count}"
+        return result
+
+    result["shape"] = shape
+    result["robot_count"] = robot_count
+    result["revision"] = revision
+
+    height, width = shape
+    total_cells = height * width
+
+    try:
+        values_bytes = zlib.decompress(frame.values_zlib)
+    except zlib.error as exc:
+        result["error"] = _hazard_belief_decode_error("values_zlib", exc)
+        return result
+    expected_values_bytes = total_cells * 4  # float32
+    if len(values_bytes) != expected_values_bytes:
+        result["error"] = f"values: expected {expected_values_bytes} bytes, got {len(values_bytes)}"
+        return result
+    values = np.frombuffer(values_bytes, dtype=np.float32).reshape(shape)
+
+    try:
+        observed_packed = zlib.decompress(frame.observed_packbits_zlib)
+    except zlib.error as exc:
+        result["error"] = _hazard_belief_decode_error("observed_packbits_zlib", exc)
+        return result
+    if len(observed_packed) * 8 < total_cells:
+        result["error"] = "observed_packbits_zlib: packed payload truncated"
+        return result
+    observed = np.unpackbits(
+        np.frombuffer(observed_packed, dtype=np.uint8), bitorder="little", count=total_cells
+    ).reshape(shape).astype(bool)
+
+    try:
+        observed_by_robot_packed = zlib.decompress(frame.observed_by_robot_packbits_zlib)
+    except zlib.error as exc:
+        result["error"] = _hazard_belief_decode_error("observed_by_robot_packbits_zlib", exc)
+        return result
+    total_robot_cells = robot_count * total_cells
+    if len(observed_by_robot_packed) * 8 < total_robot_cells:
+        result["error"] = "observed_by_robot_packbits_zlib: packed payload truncated"
+        return result
+    observed_by_robot = np.unpackbits(
+        np.frombuffer(observed_by_robot_packed, dtype=np.uint8), bitorder="little", count=total_robot_cells
+    ).reshape((robot_count,) + shape).astype(bool)
+
+    result["values"] = values
+    result["observed"] = observed
+    result["observed_by_robot"] = observed_by_robot
+    return result
+
+
+def _get_decoded_hazard_belief(frame, cache: dict[int, dict[str, object]]) -> dict[str, object]:
+    """id(frame)-keyed decode cache -- consecutive ticks sharing the same
+    (revision-unchanged) HazardBeliefDebug object decode exactly once, same
+    rationale as _belief_values()'s cache above."""
+    key = id(frame)
+    decoded = cache.get(key)
+    if decoded is None:
+        decoded = _decode_hazard_belief(frame)
+        cache[key] = decoded
+    return decoded
+
+
+def _hazard_belief_summary(frame, cache: dict[int, dict[str, object]]) -> dict[str, object]:
+    """Summary columns for the Snapshots sheet -- see the hazard_belief_*
+    column docstrings in snapshot_row() for exact semantics."""
+    if frame is None:
+        return {
+            "available": False,
+            "revision": None,
+            "height": None,
+            "width": None,
+            "robot_count": None,
+            "observed_cell_count": 0,
+            "observed_fraction": 0.0,
+            "nonzero_observed_cell_count": 0,
+            "max_observed_value": 0.0,
+            "mean_observed_value": 0.0,
+            "decode_error": "",
+        }
+
+    decoded = _get_decoded_hazard_belief(frame, cache)
+    shape = decoded["shape"]
+    height, width = shape if shape is not None else (None, None)
+
+    if decoded["error"]:
+        return {
+            "available": True,
+            "revision": decoded["revision"],
+            "height": height,
+            "width": width,
+            "robot_count": decoded["robot_count"],
+            "observed_cell_count": 0,
+            "observed_fraction": 0.0,
+            "nonzero_observed_cell_count": 0,
+            "max_observed_value": 0.0,
+            "mean_observed_value": 0.0,
+            "decode_error": decoded["error"],
+        }
+
+    values = decoded["values"]
+    observed = decoded["observed"]
+    total_cells = height * width
+    observed_cell_count = int(np.count_nonzero(observed))
+    observed_values = values[observed]
+    nonzero_observed_cell_count = int(np.count_nonzero(observed_values > 0.0))
+    max_observed_value = float(observed_values.max()) if observed_cell_count else 0.0
+    mean_observed_value = float(observed_values.mean()) if observed_cell_count else 0.0
+
+    return {
+        "available": True,
+        "revision": decoded["revision"],
+        "height": height,
+        "width": width,
+        "robot_count": decoded["robot_count"],
+        "observed_cell_count": observed_cell_count,
+        "observed_fraction": (observed_cell_count / total_cells) if total_cells else 0.0,
+        "nonzero_observed_cell_count": nonzero_observed_cell_count,
+        "max_observed_value": max_observed_value,
+        "mean_observed_value": mean_observed_value,
+        "decode_error": "",
+    }
+
+
+def snapshot_row(
+    event: NavigationDebugEvent, event_index: int, *, belief_cache=None, hazard_belief_cache=None
+) -> dict[str, object]:
     """Flatten one event into a stable, analysis-friendly row."""
     belief_cache = belief_cache if belief_cache is not None else {}
+    hazard_belief_cache = hazard_belief_cache if hazard_belief_cache is not None else {}
     snapshot = event.snapshot
     path = snapshot.path
     controller = snapshot.controller
@@ -462,6 +644,13 @@ def snapshot_row(event: NavigationDebugEvent, event_index: int, *, belief_cache=
 
     belief_frame = _maybe_value(snapshot.belief_map)
     belief = _belief_values(belief_frame, belief_cache)
+
+    # Team HazardBelief (discovered-only) -- deliberately independent of
+    # `hazard`/`hazard_sources` below (ground-truth FireSource set). Never
+    # reuses those columns: see the hazard_belief_* columns' own comment
+    # near their assignment in `row` below.
+    hazard_belief_frame = _maybe_value(snapshot.hazard_belief)
+    hazard_belief = _hazard_belief_summary(hazard_belief_frame, hazard_belief_cache)
 
     hazard = _maybe_value(snapshot.hazard)
     hazard_sources = []
@@ -629,6 +818,27 @@ def snapshot_row(event: NavigationDebugEvent, event_index: int, *, belief_cache=
         "exploration_replan_count": getattr(metrics, "exploration_replan_count", None),
         "planner_jobs_started": getattr(metrics, "planner_jobs_started", None),
         "planner_jobs_completed": getattr(metrics, "planner_jobs_completed", None),
+        # Team HazardBelief (discovered-only) summary -- appended at the end
+        # so every pre-existing column keeps its name, meaning, and position
+        # (see hazard_available/hazard_version/hazard_source_count etc.
+        # above, which stay exactly as they were: ground-truth FireSource,
+        # never reused for this). "available" here means the snapshot HAS a
+        # HazardBeliefDebug at all (Maybe.of(...), not Maybe.missing()) --
+        # independent of whether its payload decoded successfully; a
+        # decode failure is reported via hazard_belief_decode_error, with
+        # every count/fraction column reset to 0/0.0, never fabricated from
+        # HazardField.
+        "hazard_belief_available": hazard_belief["available"],
+        "hazard_belief_revision": hazard_belief["revision"],
+        "hazard_belief_height": hazard_belief["height"],
+        "hazard_belief_width": hazard_belief["width"],
+        "hazard_belief_robot_count": hazard_belief["robot_count"],
+        "hazard_observed_cell_count": hazard_belief["observed_cell_count"],
+        "hazard_observed_fraction": hazard_belief["observed_fraction"],
+        "hazard_nonzero_observed_cell_count": hazard_belief["nonzero_observed_cell_count"],
+        "hazard_max_observed_value": hazard_belief["max_observed_value"],
+        "hazard_mean_observed_value": hazard_belief["mean_observed_value"],
+        "hazard_belief_decode_error": hazard_belief["decode_error"],
     }
     return row
 
@@ -656,8 +866,9 @@ def snapshot_rows(events, *, event_indices=None) -> tuple[list[str], list[list[o
                 raise ValueError(f"event_indices must contain positive integers, got {index!r}.")
 
     belief_cache: dict[int, dict[str, object]] = {}
+    hazard_belief_cache: dict[int, dict[str, object]] = {}
     dict_rows = [
-        snapshot_row(event, index, belief_cache=belief_cache)
+        snapshot_row(event, index, belief_cache=belief_cache, hazard_belief_cache=hazard_belief_cache)
         for index, event in zip(indices, events)
     ]
     if not dict_rows:
@@ -665,6 +876,60 @@ def snapshot_rows(events, *, event_indices=None) -> tuple[list[str], list[list[o
         return list(snapshot_row.__annotations__.keys())[:0], []
     headers = list(dict_rows[0].keys())
     return headers, [[row.get(header) for header in headers] for row in dict_rows]
+
+
+def hazard_belief_cell_rows(events) -> tuple[list[str], list[list[object]]]:
+    """One row per (snapshot, observed cell) -- the "Hazard Belief Cells"
+    sheet. Deterministic order: current snapshot/event order (never re-
+    sorted), then row ascending, then col ascending within a snapshot --
+    never a set/dict iteration order (see np.lexsort below, not a Python
+    set of (row, col) pairs).
+
+    Skips a snapshot entirely when it has no HazardBeliefDebug at all (an
+    old capture -- see hazard_belief_available=False on the Snapshots
+    sheet) or when its payload failed to decode (see hazard_belief_
+    decode_error on the Snapshots sheet for the reason) -- never fabricates
+    cell data for either case. Only observed=True cells are ever emitted;
+    an unobserved cell is not "zero", it is absent.
+    """
+    cache: dict[int, dict[str, object]] = {}
+    headers = ["snapshot_id", "simulation_time", "row", "col", "value", "observed_by_robots"]
+    rows: list[list[object]] = []
+    for event in events:
+        snapshot = event.snapshot
+        frame = _maybe_value(snapshot.hazard_belief)
+        if frame is None:
+            continue
+        decoded = _get_decoded_hazard_belief(frame, cache)
+        if decoded["error"]:
+            continue
+
+        observed = decoded["observed"]
+        values = decoded["values"]
+        observed_by_robot = decoded["observed_by_robot"]
+        obs_rows, obs_cols = np.nonzero(observed)
+        if obs_rows.size == 0:
+            continue
+        # lexsort's LAST key is the primary sort key: row ascending first,
+        # col ascending second -- np.nonzero() already returns cells in
+        # row-major order, but this makes the ordering an explicit contract
+        # rather than an incidental consequence of nonzero()'s scan order.
+        order = np.lexsort((obs_cols, obs_rows))
+        for index in order:
+            r = int(obs_rows[index])
+            c = int(obs_cols[index])
+            robots = sorted(int(i) for i in np.nonzero(observed_by_robot[:, r, c])[0])
+            rows.append(
+                [
+                    int(snapshot.snapshot_id),
+                    float(snapshot.simulation_time),
+                    r,
+                    c,
+                    float(values[r, c]),
+                    _json_value(robots),
+                ]
+            )
+    return headers, rows
 
 
 def _column_name(index: int) -> str:
@@ -770,6 +1035,7 @@ def export_navigation_snapshots_xlsx(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     headers, rows = snapshot_rows(events, event_indices=source_indices)
+    hazard_belief_cell_headers, hazard_belief_cell_data = hazard_belief_cell_rows(events)
 
     exported_count = len(events)
     resolved_source_count = int(source_count) if source_count is not None else exported_count
@@ -815,6 +1081,7 @@ def export_navigation_snapshots_xlsx(
                 '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
                 '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
                 '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                '<Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
                 '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
                 '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
                 '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
@@ -835,7 +1102,8 @@ def export_navigation_snapshots_xlsx(
                 '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
                 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
                 '<sheets><sheet name="Snapshots" sheetId="1" r:id="rId1"/>'
-                '<sheet name="Metadata" sheetId="2" r:id="rId2"/></sheets></workbook>',
+                '<sheet name="Metadata" sheetId="2" r:id="rId2"/>'
+                '<sheet name="Hazard Belief Cells" sheetId="3" r:id="rId4"/></sheets></workbook>',
             )
             workbook.writestr(
                 "xl/_rels/workbook.xml.rels",
@@ -844,6 +1112,7 @@ def export_navigation_snapshots_xlsx(
                 '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
                 '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
                 '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                '<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>'
                 '</Relationships>',
             )
             workbook.writestr(
@@ -881,6 +1150,7 @@ def export_navigation_snapshots_xlsx(
             )
             _write_sheet(workbook, "xl/worksheets/sheet1.xml", headers, rows)
             _write_sheet(workbook, "xl/worksheets/sheet2.xml", metadata_headers, metadata_rows)
+            _write_sheet(workbook, "xl/worksheets/sheet3.xml", hazard_belief_cell_headers, hazard_belief_cell_data)
     except (OSError, ValueError, TypeError, zlib.error) as exc:
         raise SnapshotExportError(str(exc)) from exc
 

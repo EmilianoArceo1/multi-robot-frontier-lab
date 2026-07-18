@@ -55,9 +55,10 @@ from robotics_sim.diagnostics.snapshot_export import (
     export_navigation_snapshots_xlsx,
     select_navigation_snapshot_events,
 )
-from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
+from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
+from robotics_sim.simulation.hazard_safety_runtime import HazardSafetyRuntime
 from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
@@ -117,6 +118,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
+    HazardBeliefDebug,
     HazardDebug,
     HazardSourceDebug,
     Maybe,
@@ -130,6 +132,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     SafetyDebug,
     SensorDebug,
 )
+from robotics_sim.environment.hazard_belief import HazardBeliefFrame
 from robotics_sim.environment.hazard_field import FireSource
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
@@ -697,6 +700,7 @@ class SimulationControllerMixin:
         self.hazard_service = RuntimeHazardService(
             bounds=self.belief_map.bounds,
             resolution=self.belief_map.resolution,
+            robot_count=self.belief_map.robot_count,
             default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
             default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
             selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
@@ -711,6 +715,10 @@ class SimulationControllerMixin:
         canvas = getattr(self, "canvas", None)
         if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
             canvas.set_hazard_snapshot(self.hazard_service.snapshot())
+        # Push the fresh (empty) discovered-hazard frame once, then clear
+        # dirty -- there is nothing pending to flush right after a reset.
+        self.push_discovered_hazard_frame()
+        self._discovered_hazard_render_dirty = False
 
     def ensure_belief_map(self) -> BeliefMap:
         """Return the active belief map, creating it if needed."""
@@ -728,10 +736,12 @@ class SimulationControllerMixin:
             or service.field.shape != belief.grid.shape
             or abs(service.field.resolution - belief.resolution) > 1e-9
             or service.field.bounds != belief.bounds
+            or service.belief.robot_count != belief.robot_count
         ):
             self.hazard_service = RuntimeHazardService(
                 bounds=belief.bounds,
                 resolution=belief.resolution,
+                robot_count=belief.robot_count,
                 default_intensity=float(getattr(self.config, "default_fire_intensity", 1.0)),
                 default_radius=float(getattr(self.config, "default_fire_radius", 2.0)),
                 selection_radius=float(getattr(self.config, "fire_selection_radius", 0.6)),
@@ -739,10 +749,130 @@ class SimulationControllerMixin:
             )
         return self.hazard_service
 
+    def ensure_hazard_safety_runtime(self) -> HazardSafetyRuntime:
+        """Return the cached HazardSafetyRuntime, (re)creating it whenever
+        any hazard_cbf_* config parameter changes -- mirrors ensure_hazard_
+        service()'s cache-invalidation-by-key pattern. One shared instance
+        serves every robot: the team HazardBelief (and therefore the
+        distance field built from it) is the same for all robots, only the
+        per-robot state/limits/safety radius passed to filter_control()
+        differ."""
+        config = self.config
+        key = (
+            float(getattr(config, "hazard_cbf_margin", 0.20)),
+            float(getattr(config, "hazard_cbf_activation_distance", 1.50)),
+            float(getattr(config, "hazard_cbf_k1", 2.0)),
+            float(getattr(config, "hazard_cbf_k2", 2.0)),
+            int(getattr(config, "hazard_cbf_pyramid_levels", 1)),
+            float(getattr(config, "hazard_cbf_sdf_smoothing_sigma_cells", 0.75)),
+            float(getattr(config, "hazard_cbf_acceleration_weight", 1.0)),
+            float(getattr(config, "hazard_cbf_angular_weight", 0.35)),
+            float(getattr(config, "hazard_block_threshold", 0.55)),
+        )
+        runtime = getattr(self, "_hazard_safety_runtime", None)
+        if runtime is None or getattr(self, "_hazard_safety_runtime_key", None) != key:
+            runtime = HazardSafetyRuntime(
+                block_threshold=key[8],
+                margin=key[0],
+                activation_distance=key[1],
+                k1=key[2],
+                k2=key[3],
+                pyramid_levels=key[4],
+                smoothing_sigma_cells=key[5],
+                acceleration_weight=key[6],
+                angular_weight=key[7],
+            )
+            self._hazard_safety_runtime = runtime
+            self._hazard_safety_runtime_key = key
+        return runtime
+
+    def apply_hazard_safety_filter(self, robot, control: np.ndarray) -> np.ndarray:
+        """Filter one robot's proposed control through the Observed Hazard
+        OGM-HOCBF safety filter.
+
+        Pure wiring: gathers the team's observed HazardBelief snapshot, the
+        robot's own state/limits/safety radius, and delegates to
+        HazardSafetyRuntime -- no SDF construction, no gradients/Hessians,
+        no HOCBF equations, and no QP solving live here (see
+        hazard_safety_runtime.py / hazard_hocbf_filter.py /
+        hazard_distance_field.py).
+
+        Must be called AFTER the nominal control is decided (nominal_
+        control_safe() for single-robot, select_runtime_control_source() for
+        multi-robot, so a CONTROL-owning plugin cannot skip it) and BEFORE
+        predicted_motion_report() -- see the call sites in simulation_step()
+        and simulation_step_multi() for the exact ordering.
+        """
+        if not bool(getattr(self.config, "hazard_cbf_enabled", True)):
+            return control
+
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is None or robot is None:
+            return control
+
+        runtime = self.ensure_hazard_safety_runtime()
+        result = runtime.filter_control(
+            belief_frame=hazard_service.belief.snapshot(),
+            geometry=hazard_service.belief.geometry,
+            state=robot.state,
+            limits=robot.limits,
+            nominal_control=control,
+            safety_radius=self.safety_radius_for_robot(robot),
+        )
+        return result.control
+
     def push_hazard_snapshot(self) -> None:
+        """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
+        potential editor use (see SimulationCanvas.draw_fires(), no longer
+        called from the live paint loop) -- never confuse this with
+        push_discovered_hazard_frame(), which is what runtime actually
+        renders."""
         canvas = getattr(self, "canvas", None)
         if canvas is not None and hasattr(canvas, "set_hazard_snapshot"):
             canvas.set_hazard_snapshot(self.ensure_hazard_service().snapshot())
+
+    def push_discovered_hazard_frame(self) -> None:
+        """Push the team's DISCOVERED hazard belief -- the only hazard layer
+        live simulation renders (see SimulationCanvas.draw_discovered_
+        hazard()). Independent of push_hazard_snapshot() (ground truth):
+        the canvas must never receive both bundled into one ambiguous
+        payload, so this uses its own explicit setter/dict shape.
+
+        Uses HazardBelief.snapshot() (one full-grid copy) -- O(robots*
+        height*width), not the narrow read_cells()/blocked_cells() the
+        sensor-update/planning hot paths use. Callers must not invoke this
+        per robot per tick: see _flush_discovered_hazard_render(), the only
+        caller besides reset_belief_map()'s own initial empty-frame push,
+        which collapses however many robots' FoV updates happened this
+        step into at most one push.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None or not hasattr(canvas, "set_discovered_hazard_frame"):
+            return
+        service = self.ensure_hazard_service()
+        canvas.set_discovered_hazard_frame(
+            {
+                "frame": service.belief.snapshot(),
+                "bounds": service.field.bounds,
+                "resolution": service.field.resolution,
+            }
+        )
+
+    def _flush_discovered_hazard_render(self) -> None:
+        """Push at most one discovered-hazard render frame per simulation
+        step, regardless of how many robots' FoV updates marked the render
+        dirty this tick (see update_explored_free_points_from_polygon()).
+
+        Called once, after every robot due for a sensor update this tick has
+        already run it -- see simulation_step()/simulation_step_multi()'s
+        own call sites, right after their sensor-update block/loop.
+        Reads only the dirty flag and HazardBelief (via push_discovered_
+        hazard_frame()) -- never HazardField/FireSource.
+        """
+        if not getattr(self, "_discovered_hazard_render_dirty", False):
+            return
+        self._discovered_hazard_render_dirty = False
+        self.push_discovered_hazard_frame()
 
     def occupancy_grid_snapshot(self) -> dict | None:
         """Read-only snapshot of the current belief/occupancy grid, for the
@@ -1381,13 +1511,14 @@ class SimulationControllerMixin:
         if obstacle_points:
             planning_grid.add_obstacle_points(obstacle_points, padding=max(0.0, radius))
 
-        # Project the independent continuous hazard layer into this derived
-        # binary planning grid. BeliefMap.grid is never modified.
+        # Project the team's DISCOVERED hazard belief into this derived
+        # binary planning grid -- never the omniscient ground-truth
+        # HazardField. BeliefMap.grid is never modified either way.
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            apply_hazard_to_planning_grid(
+            apply_hazard_belief_to_planning_grid(
                 planning_grid,
-                hazard_service.field,
+                hazard_service.belief,
                 block_threshold=hazard_service.block_threshold,
                 inflate_radius=max(0.0, radius),
             )
@@ -2331,7 +2462,7 @@ class SimulationControllerMixin:
         points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            points_for_clearance.extend(hazard_service.blocked_world_points())
+            points_for_clearance.extend(hazard_service.observed_blocked_world_points())
 
         # Runtime invariant: if the final target is directly safe from the
         # robot's CURRENT pose, never execute an older/grid-artifact detour.
@@ -2428,7 +2559,9 @@ class SimulationControllerMixin:
         This is intentionally checked against mapped_obstacle_points, not the
         ground-truth rectangles. The robot should be allowed to plan through
         unknown space; if a hidden obstacle is discovered later, the safety
-        layer will trigger replanning.
+        layer will trigger replanning. Hazard is held to the same rule: only
+        observed_blocked_world_points() (discovered), never the omniscient
+        ground-truth HazardField.
         """
         if self.collision_checker is None:
             return True
@@ -2436,7 +2569,7 @@ class SimulationControllerMixin:
         obstacle_points = list(self.mapped_obstacle_points)
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None:
-            obstacle_points.extend(hazard_service.blocked_world_points())
+            obstacle_points.extend(hazard_service.observed_blocked_world_points())
 
         report = self.collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
@@ -2906,6 +3039,52 @@ class SimulationControllerMixin:
             )
         )
 
+    def _navigation_debug_hazard_belief_frame(self) -> Maybe[HazardBeliefDebug]:
+        """Return a compact immutable Team HazardBelief frame, reusing it
+        until the belief actually changes -- same revision-keyed cache
+        pattern as _navigation_debug_belief_frame() (BeliefMapDebug).
+
+        Never reads HazardField/FireSource -- only HazardBelief.snapshot(),
+        deliberately separate from _navigation_debug_hazard_frame() above
+        (ground truth). The cache key includes id(belief) and shape/
+        robot_count (not just revision) so a reset that recreates the
+        RuntimeHazardService/HazardBelief, or a grid-resolution/robot-count
+        change, invalidates it even on the rare chance a fresh belief's
+        revision coincides with the previous one's.
+        """
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is None:
+            return Maybe.missing()
+        belief = hazard_service.belief
+
+        revision = int(belief.revision)
+        shape = (int(belief.shape[0]), int(belief.shape[1]))
+        robot_count = int(belief.robot_count)
+        cache_key = (id(belief), revision, shape, robot_count)
+        cached_key = getattr(self, "_nav_debug_hazard_belief_frame_key", None)
+        cached_frame = getattr(self, "_nav_debug_hazard_belief_frame_cache", None)
+        if cached_key == cache_key and cached_frame is not None:
+            return Maybe.of(cached_frame)
+
+        frame = belief.snapshot()
+        values = np.ascontiguousarray(frame.values, dtype=np.float32)
+        observed = np.ascontiguousarray(frame.observed, dtype=bool)
+        observed_by_robot = np.ascontiguousarray(frame.observed_by_robot, dtype=bool)
+        packed_observed = np.packbits(observed.reshape(-1), bitorder="little")
+        packed_observed_by_robot = np.packbits(observed_by_robot.reshape(-1), bitorder="little")
+
+        debug_frame = HazardBeliefDebug(
+            shape=shape,
+            robot_count=robot_count,
+            revision=revision,
+            values_zlib=zlib.compress(values.tobytes(order="C"), level=1),
+            observed_packbits_zlib=zlib.compress(packed_observed.tobytes(), level=1),
+            observed_by_robot_packbits_zlib=zlib.compress(packed_observed_by_robot.tobytes(), level=1),
+        )
+        self._nav_debug_hazard_belief_frame_key = cache_key
+        self._nav_debug_hazard_belief_frame_cache = debug_frame
+        return Maybe.of(debug_frame)
+
     def _navigation_debug_agent_state_frame(self, agent) -> Maybe[AgentStateDebug]:
         """Freeze the RobotAgent fields restore needs explicitly -- see
         AgentStateDebug's docstring for exactly what is and is not included
@@ -3150,6 +3329,7 @@ class SimulationControllerMixin:
         )
         belief_map_debug = self._navigation_debug_belief_frame()
         hazard_debug = self._navigation_debug_hazard_frame()
+        hazard_belief_debug = self._navigation_debug_hazard_belief_frame()
         agent_state_debug = self._navigation_debug_agent_state_frame(agent)
         metrics_debug = self._navigation_debug_metrics_frame()
 
@@ -3176,6 +3356,7 @@ class SimulationControllerMixin:
             sensor=sensor,
             belief_map=belief_map_debug,
             hazard=hazard_debug,
+            hazard_belief=hazard_belief_debug,
             agent_state=agent_state_debug,
             metrics=metrics_debug,
         )
@@ -4295,6 +4476,39 @@ class SimulationControllerMixin:
             return False, "Select a historical snapshot to resume from."
         return True, ""
 
+    def _restore_empty_hazard_belief(self, hazard_service: RuntimeHazardService) -> None:
+        """Reset hazard_service.belief to a deterministic empty state:
+        revision EXACTLY 0, not whatever HazardBelief.clear() would leave
+        behind.
+
+        HazardBelief.clear() is a no-op (keeps the current revision) when
+        the belief was already empty, and otherwise bumps the revision by
+        exactly 1 -- so restoring the SAME historical snapshot from two
+        different "future" live states could clear() into two different
+        revisions. That would be a nondeterministic result for a restore
+        that is supposed to reproduce one frozen moment exactly, and would
+        confuse the (id(belief), revision, ...) cache in _navigation_debug_
+        hazard_belief_frame() and anything else that trusts revision as a
+        change signal.
+
+        Used for every fallback case in restore_navigation_debug_snapshot()
+        (missing HazardBeliefDebug, corrupt payload, shape/robot_count
+        mismatch) -- explicit HazardBelief.restore() with all-zero arrays,
+        never HazardBelief.clear(). Never derives state from HazardField,
+        never re-runs a sensor; the RuntimeHazardService instance itself is
+        left exactly as it is.
+        """
+        belief = hazard_service.belief
+        height, width = belief.shape
+        belief.restore(
+            HazardBeliefFrame(
+                values=np.zeros((height, width), dtype=np.float32),
+                observed=np.zeros((height, width), dtype=bool),
+                observed_by_robot=np.zeros((belief.robot_count, height, width), dtype=bool),
+                revision=0,
+            )
+        )
+
     def restore_navigation_debug_snapshot(self, index: int | None = None) -> bool:
         """Roll the live simulation back to the frozen state at history
         `index` (defaults to the currently viewed HISTORY position), then
@@ -4423,14 +4637,15 @@ class SimulationControllerMixin:
 
         # 4b. Hazards -- a layer fully separate from occupancy (see
         # HazardField's module docstring); this never touches belief.grid
-        # above. apply_hazard_to_planning_grid() recomputes fresh from
-        # hazard_service.field on every planning call (no separate costmap
-        # cache to invalidate), and the canvas's heatmap pixmap is keyed on
-        # HazardField.version, so push_hazard_snapshot() below is sufficient
-        # to invalidate the render cache too.
+        # above. Ground-truth FireSources and the team's discovered
+        # HazardBelief are restored independently of each other (see
+        # HazardBeliefDebug's own docstring) -- a fire that was never
+        # observed before capture stays unobserved after restore, exactly
+        # as it was; HazardBelief is never derived from FireSource/
+        # HazardField here.
+        hazard_service = self.ensure_hazard_service()
         if not snapshot.hazard.unavailable and snapshot.hazard.value is not None:
             hazard_frame = snapshot.hazard.value
-            hazard_service = self.ensure_hazard_service()
             restored_sources = tuple(
                 FireSource(
                     fire_id=source.fire_id,
@@ -4441,7 +4656,72 @@ class SimulationControllerMixin:
                 for source in hazard_frame.sources
             )
             hazard_service.field.restore_sources(restored_sources, next_fire_id=hazard_frame.next_fire_id)
-            self.push_hazard_snapshot()
+
+        # HazardBelief -- discovered-only. A snapshot captured before this
+        # field existed (hazard_belief.unavailable), a shape/robot_count
+        # mismatch (geometry changed since capture), or a corrupt/empty
+        # byte payload all fall back to the SAME safe, DETERMINISTIC result:
+        # an empty HazardBelief at revision exactly 0 (see _restore_empty_
+        # hazard_belief() -- never HazardBelief.clear(), whose resulting
+        # revision depends on whatever state existed before the restore).
+        # Never HazardField as a stand-in for "observed" -- that is exactly
+        # the omniscience leak this whole feature exists to prevent. No
+        # sensor re-run, no marking every ground-truth cell observed.
+        hazard_belief_maybe = snapshot.hazard_belief
+        restored_belief = False
+        if not hazard_belief_maybe.unavailable and hazard_belief_maybe.value is not None:
+            belief_debug = hazard_belief_maybe.value
+            try:
+                values = (
+                    np.frombuffer(zlib.decompress(belief_debug.values_zlib), dtype=np.float32)
+                    .reshape(belief_debug.shape)
+                    .copy()
+                )
+                observed_packed = np.frombuffer(
+                    zlib.decompress(belief_debug.observed_packbits_zlib), dtype=np.uint8
+                )
+                observed = np.unpackbits(
+                    observed_packed, bitorder="little", count=int(np.prod(belief_debug.shape))
+                ).reshape(belief_debug.shape).astype(bool, copy=False)
+                observed_by_robot_shape = (belief_debug.robot_count,) + tuple(belief_debug.shape)
+                observed_by_robot_packed = np.frombuffer(
+                    zlib.decompress(belief_debug.observed_by_robot_packbits_zlib), dtype=np.uint8
+                )
+                observed_by_robot = np.unpackbits(
+                    observed_by_robot_packed, bitorder="little", count=int(np.prod(observed_by_robot_shape))
+                ).reshape(observed_by_robot_shape).astype(bool, copy=False)
+
+                # HazardBelief.restore() itself validates shape/dtype
+                # against this instance's own geometry/robot_count and
+                # raises ValueError on mismatch -- caught below, same
+                # fallback as a snapshot with no hazard_belief at all.
+                hazard_service.belief.restore(
+                    HazardBeliefFrame(
+                        values=values,
+                        observed=observed,
+                        observed_by_robot=observed_by_robot,
+                        revision=int(belief_debug.revision),
+                    )
+                )
+                restored_belief = True
+            except (ValueError, zlib.error):
+                restored_belief = False
+
+        if not restored_belief:
+            self._restore_empty_hazard_belief(hazard_service)
+
+        # Any cached hazard-belief debug frame keyed on the now-discarded
+        # future is stale.
+        self._nav_debug_hazard_belief_frame_key = None
+        self._nav_debug_hazard_belief_frame_cache = None
+
+        self.push_hazard_snapshot()
+        # Push the just-restored belief to the canvas exactly once. Hazard
+        # observation runs synchronously inside record_explored_area() (no
+        # in-flight async worker can land later and overwrite this), so
+        # there is nothing else that could race this push.
+        self.push_discovered_hazard_frame()
+        self._discovered_hazard_render_dirty = False
 
         # 5. mapped_obstacle_points is append-only at runtime (see
         # update_sensed_obstacles()), so truncating to the snapshot's own
@@ -5605,12 +5885,13 @@ class SimulationControllerMixin:
         return False
 
     def _replan_routes_affected_by_hazard(self) -> None:
-        """Replan only active routes that now cross blocked thermal cells."""
+        """Replan only active routes that now cross a blocked, OBSERVED
+        thermal cell -- never the omniscient ground-truth HazardField."""
         if not getattr(self, "running", False):
             return
 
         service = self.ensure_hazard_service()
-        hazard_points = service.blocked_world_points()
+        hazard_points = service.observed_blocked_world_points()
         if not hazard_points:
             return
 
@@ -5691,7 +5972,11 @@ class SimulationControllerMixin:
             f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
             f"radius={source.radius:.2f}m."
         )
-        self._replan_routes_affected_by_hazard()
+        # No replan here: creating a FireSource only changes ground truth.
+        # Route repair is driven by _replan_routes_affected_by_hazard() being
+        # called after a sensor update actually OBSERVES a newly-blocked
+        # cell (see update_explored_free_points_from_polygon()) -- never by
+        # the omniscient act of a fire existing somewhere on the map.
         return True
 
     def remove_fire_near(self, x: float, y: float) -> bool:
@@ -5729,7 +6014,7 @@ class SimulationControllerMixin:
                 f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
                 f"radius={source.radius:.2f}m."
             )
-            self._replan_routes_affected_by_hazard()
+            # No replan here either -- see add_fire()'s comment.
 
     def body_radius_for_robot(self, robot=None) -> float:
         """Return physical body radius for a runtime robot or the global config."""
@@ -6069,6 +6354,39 @@ class SimulationControllerMixin:
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
         self.explored_free_points = belief.explored_points()
+
+        # Same sensor update, same polygon: fuse ground-truth hazard into
+        # the team HazardBelief for exactly the cells this FoV covers. Never
+        # pass robot_index=None here -- HazardBelief requires a concrete
+        # attribution index (see belief_robot_index's own None->0 mapping
+        # above for single-robot).
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None and belief_robot_index is not None:
+            observation = hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
+            # Route repair is gated on a real threshold CROSSING newly
+            # discovered by this observation -- never on `changed` alone,
+            # which is also True for e.g. a new robot merely attributing an
+            # already-known, already-blocked cell, or a newly observed but
+            # safe cell. Creating/removing a FireSource never reaches here
+            # at all (see add_fire()/on_fire_toggle_requested()).
+            if observation.newly_blocked_cells > 0:
+                self._replan_routes_affected_by_hazard()
+            # Mark the render dirty only on an actual VISUAL change -- new
+            # cells becoming observed, or an already-observed cell's value
+            # changing. Deliberately NOT observation.changed: that is also
+            # True for a newly_attributed_cells-only change (another robot
+            # attributing an already-known, already-blocked cell), which
+            # never alters what the heatmap looks like. The actual push is
+            # collapsed to at most one per simulation step by
+            # _flush_discovered_hazard_render(), called once after every
+            # robot due this tick has run its sensor update -- never here,
+            # which runs once per robot.
+            visual_changed = (
+                observation.newly_observed_cells > 0
+                or observation.changed_value_cells > 0
+            )
+            if visual_changed:
+                self._discovered_hazard_render_dirty = True
 
     def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
         """
@@ -6507,6 +6825,11 @@ class SimulationControllerMixin:
 
             self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
 
+            # All robots due this tick have run their sensor update above --
+            # collapse however many of them marked the discovered-hazard
+            # render dirty into at most one push.
+            self._flush_discovered_hazard_render()
+
             if newly_discovered_all:
                 self.mapping_update_count += 1
                 replanned = self.replan_multi_robots_affected_by_points(
@@ -6604,6 +6927,7 @@ class SimulationControllerMixin:
             if control_profile.owns_control:
                 _LOGGER.debug("R%d control source: %s", index + 1, control_reason)
             control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
+            control = self.apply_hazard_safety_filter(robot, control)
 
             prediction_report = self.predicted_motion_report(
                 control=control,
@@ -6812,6 +7136,10 @@ class SimulationControllerMixin:
             _explored_update_perf_start = time.perf_counter()
             self.record_explored_area(force=False)
             _record_perf(self, "explored_update", time.perf_counter() - _explored_update_perf_start)
+            # The single robot due this tick has run its sensor update
+            # above -- collapse whatever it marked dirty into at most one
+            # push (see simulation_step_multi()'s equivalent call site).
+            self._flush_discovered_hazard_render()
             # update_sensed_obstacles() times its own obstacle_extract/
             # belief_update sub-sections internally (see its body) --
             # finer-grained than the old combined "sensor_update" figure,
@@ -7040,6 +7368,7 @@ class SimulationControllerMixin:
             self.last_control = self.nominal_control_safe(
                 blocked=obs.active_segment_blocked, capture=nav_debug_capture
             )
+            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,
@@ -7124,6 +7453,7 @@ class SimulationControllerMixin:
                 return
 
             self.last_control = self.nominal_control_safe(blocked=False)
+            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,

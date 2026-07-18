@@ -56,6 +56,7 @@ from robotics_sim.diagnostics.snapshot_export import (
 from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
+from robotics_sim.simulation.hazard_safety_runtime import HazardSafetyRuntime
 from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
@@ -745,6 +746,78 @@ class SimulationControllerMixin:
                 block_threshold=float(getattr(self.config, "hazard_block_threshold", 0.55)),
             )
         return self.hazard_service
+
+    def ensure_hazard_safety_runtime(self) -> HazardSafetyRuntime:
+        """Return the cached HazardSafetyRuntime, (re)creating it whenever
+        any hazard_cbf_* config parameter changes -- mirrors ensure_hazard_
+        service()'s cache-invalidation-by-key pattern. One shared instance
+        serves every robot: the team HazardBelief (and therefore the
+        distance field built from it) is the same for all robots, only the
+        per-robot state/limits/safety radius passed to filter_control()
+        differ."""
+        config = self.config
+        key = (
+            float(getattr(config, "hazard_cbf_margin", 0.20)),
+            float(getattr(config, "hazard_cbf_activation_distance", 1.50)),
+            float(getattr(config, "hazard_cbf_k1", 2.0)),
+            float(getattr(config, "hazard_cbf_k2", 2.0)),
+            int(getattr(config, "hazard_cbf_pyramid_levels", 1)),
+            float(getattr(config, "hazard_cbf_sdf_smoothing_sigma_cells", 0.75)),
+            float(getattr(config, "hazard_cbf_acceleration_weight", 1.0)),
+            float(getattr(config, "hazard_cbf_angular_weight", 0.35)),
+            float(getattr(config, "hazard_block_threshold", 0.55)),
+        )
+        runtime = getattr(self, "_hazard_safety_runtime", None)
+        if runtime is None or getattr(self, "_hazard_safety_runtime_key", None) != key:
+            runtime = HazardSafetyRuntime(
+                block_threshold=key[8],
+                margin=key[0],
+                activation_distance=key[1],
+                k1=key[2],
+                k2=key[3],
+                pyramid_levels=key[4],
+                smoothing_sigma_cells=key[5],
+                acceleration_weight=key[6],
+                angular_weight=key[7],
+            )
+            self._hazard_safety_runtime = runtime
+            self._hazard_safety_runtime_key = key
+        return runtime
+
+    def apply_hazard_safety_filter(self, robot, control: np.ndarray) -> np.ndarray:
+        """Filter one robot's proposed control through the Observed Hazard
+        OGM-HOCBF safety filter.
+
+        Pure wiring: gathers the team's observed HazardBelief snapshot, the
+        robot's own state/limits/safety radius, and delegates to
+        HazardSafetyRuntime -- no SDF construction, no gradients/Hessians,
+        no HOCBF equations, and no QP solving live here (see
+        hazard_safety_runtime.py / hazard_hocbf_filter.py /
+        hazard_distance_field.py).
+
+        Must be called AFTER the nominal control is decided (nominal_
+        control_safe() for single-robot, select_runtime_control_source() for
+        multi-robot, so a CONTROL-owning plugin cannot skip it) and BEFORE
+        predicted_motion_report() -- see the call sites in simulation_step()
+        and simulation_step_multi() for the exact ordering.
+        """
+        if not bool(getattr(self.config, "hazard_cbf_enabled", True)):
+            return control
+
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is None or robot is None:
+            return control
+
+        runtime = self.ensure_hazard_safety_runtime()
+        result = runtime.filter_control(
+            belief_frame=hazard_service.belief.snapshot(),
+            geometry=hazard_service.belief.geometry,
+            state=robot.state,
+            limits=robot.limits,
+            nominal_control=control,
+            safety_radius=self.safety_radius_for_robot(robot),
+        )
+        return result.control
 
     def push_hazard_snapshot(self) -> None:
         """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
@@ -6671,6 +6744,7 @@ class SimulationControllerMixin:
             if control_profile.owns_control:
                 _LOGGER.debug("R%d control source: %s", index + 1, control_reason)
             control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
+            control = self.apply_hazard_safety_filter(robot, control)
 
             prediction_report = self.predicted_motion_report(
                 control=control,
@@ -7108,6 +7182,7 @@ class SimulationControllerMixin:
             self.last_control = self.nominal_control_safe(
                 blocked=obs.active_segment_blocked, capture=nav_debug_capture
             )
+            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,
@@ -7192,6 +7267,7 @@ class SimulationControllerMixin:
                 return
 
             self.last_control = self.nominal_control_safe(blocked=False)
+            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QObject, QRunnable
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 from robot import Robot
 
@@ -50,8 +50,10 @@ from robotics_sim.simulation.robot_trace import (
 )
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
 from robotics_sim.diagnostics.snapshot_export import (
+    DEFAULT_AUTO_TARGET_ROWS,
     SnapshotExportError,
     export_navigation_snapshots_xlsx,
+    select_navigation_snapshot_events,
 )
 from robotics_sim.planning.planning_costmap import apply_hazard_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
@@ -968,11 +970,18 @@ class SimulationControllerMixin:
         self.canvas.set_status(f"Loaded scenario: {os.path.basename(path)}")
 
     def export_navigation_snapshots(self) -> None:
-        """Export the immutable in-memory navigation history to one XLSX row per snapshot.
+        """Export the immutable in-memory navigation history to one XLSX row
+        per SELECTED snapshot.
 
-        The exporter is dependency-free and copies the current ring-buffer contents
-        before writing, so the workbook is internally consistent even if a live run
-        continues producing new snapshots while the save dialog is open.
+        The exporter is dependency-free and copies the current ring-buffer
+        contents before writing, so the workbook is internally consistent
+        even if a live run continues producing new snapshots while the save
+        dialog is open. The full in-memory history (navigation_debug_log's
+        bounded ring buffer, the </> step buttons, rollback) is never
+        reduced by any of this -- only which rows land in the exported
+        workbook is selected, via select_navigation_snapshot_events() (see
+        robotics_sim/diagnostics/snapshot_export.py), and that selection
+        always runs BEFORE any row is flattened.
         """
         log = getattr(self, "navigation_debug_log", None)
         events = tuple(log.events()) if log is not None else ()
@@ -984,25 +993,90 @@ class SimulationControllerMixin:
             )
             return
 
+        automatic_label = f"Automatic filtered (~{DEFAULT_AUTO_TARGET_ROWS} rows, recommended)"
+        raw_label = f"Raw (all {len(events)} snapshots, slower/larger)"
+        stride2_label = "Every 2nd routine snapshot"
+        stride3_label = "Every 3rd routine snapshot"
+        stride5_label = "Every 5th routine snapshot"
+        custom_label = "Custom stride..."
+
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "Export navigation snapshots",
+            "Choose how many snapshots to export:",
+            [automatic_label, raw_label, stride2_label, stride3_label, stride5_label, custom_label],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+
+        if choice == raw_label:
+            selection = select_navigation_snapshot_events(events, mode="raw")
+        elif choice == stride2_label:
+            selection = select_navigation_snapshot_events(events, mode="custom_stride", routine_stride=2)
+        elif choice == stride3_label:
+            selection = select_navigation_snapshot_events(events, mode="custom_stride", routine_stride=3)
+        elif choice == stride5_label:
+            selection = select_navigation_snapshot_events(events, mode="custom_stride", routine_stride=5)
+        elif choice == custom_label:
+            stride, accepted = QInputDialog.getInt(
+                self,
+                "Custom stride",
+                "Export every Nth routine snapshot:",
+                2,
+                2,
+                100,
+            )
+            if not accepted:
+                return
+            selection = select_navigation_snapshot_events(events, mode="custom_stride", routine_stride=stride)
+        else:
+            selection = select_navigation_snapshot_events(
+                events, mode="automatic_filtered", target_rows=DEFAULT_AUTO_TARGET_ROWS
+            )
+
         stamp = time.strftime("%Y%m%d_%H%M%S")
+        if selection.mode == "raw":
+            suggested_name = f"navigation_snapshots_raw_{stamp}.xlsx"
+        elif selection.mode == "custom_stride":
+            suggested_name = f"navigation_snapshots_stride_{selection.routine_stride}_{stamp}.xlsx"
+        else:
+            suggested_name = f"navigation_snapshots_filtered_{stamp}.xlsx"
+
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export navigation snapshots",
-            f"navigation_snapshots_{stamp}.xlsx",
+            suggested_name,
             "Excel workbooks (*.xlsx);;All files (*)",
         )
         if not path:
             return
 
         try:
-            count = export_navigation_snapshots_xlsx(events, path)
+            count = export_navigation_snapshots_xlsx(
+                selection.events,
+                path,
+                source_indices=selection.source_indices,
+                source_count=selection.source_count,
+                export_mode=selection.mode,
+                routine_stride=selection.routine_stride,
+                target_rows=selection.target_rows,
+                semantic_events_preserved=selection.semantic_events_preserved,
+            )
         except SnapshotExportError as exc:
             QMessageBox.critical(self, "Snapshot export failed", str(exc))
             return
 
         final_path = path if path.lower().endswith(".xlsx") else f"{path}.xlsx"
+        mode_label = {
+            "raw": "raw",
+            "automatic_filtered": "automatic filtered",
+            "custom_stride": "custom stride",
+        }.get(selection.mode, selection.mode)
         self.canvas.set_status(
-            f"Exported {count} navigation snapshots: {os.path.basename(final_path)}"
+            f"Exported {count:,} of {selection.source_count:,} navigation snapshots "
+            f"({mode_label}, routine stride {selection.routine_stride}): {os.path.basename(final_path)}"
         )
 
     def final_goal_xy(self) -> tuple[float, float]:

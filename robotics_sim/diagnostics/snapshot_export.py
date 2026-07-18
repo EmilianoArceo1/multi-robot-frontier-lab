@@ -11,6 +11,7 @@ or another ChatGPT session.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -24,10 +25,30 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import numpy as np
 
 from robotics_sim.diagnostics.event_log import NavigationDebugEvent
+from robotics_sim.diagnostics.navigation_snapshot import NavigationDebugEventKind
 from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN
 
 SCHEMA_VERSION = "1.0"
 _EXCEL_TEXT_LIMIT = 32767
+
+# Soft target for "automatic_filtered" mode -- see select_navigation_snapshot_
+# events(). ~4,500 snapshots is roughly what a 150s run at ~30Hz produces
+# (see this module's own docstring / the export UI in engine.py); 1500 keeps
+# the workbook fast to open while still showing multiple samples per minute.
+DEFAULT_AUTO_TARGET_ROWS = 1500
+
+# Event kinds that always survive filtering, regardless of routine_stride --
+# these mark discrete route-acceptance/safety decisions, never a routine
+# per-tick sample, so thinning them out would hide the exact moments an
+# analyst most needs to see.
+_MANDATORY_EVENT_KINDS = frozenset(
+    {
+        NavigationDebugEventKind.PLAN_ACCEPTED.value,
+        NavigationDebugEventKind.PATH_SIMPLIFIED.value,
+        NavigationDebugEventKind.ROUTE_REJECTED.value,
+        NavigationDebugEventKind.SAFETY_REPLAN.value,
+    }
+)
 
 
 class SnapshotExportError(RuntimeError):
@@ -178,6 +199,232 @@ def _belief_values(frame, cache: dict[int, dict[str, object]]) -> dict[str, obje
     }
     cache[key] = cached
     return cached
+
+
+# ============================================================
+# EXPORT SELECTION
+#
+# Pure, Qt-free, unit-testable logic deciding WHICH events get exported --
+# entirely separate from snapshot_row()/snapshot_rows() (which only flatten
+# whatever events they are given). Selection must run BEFORE flattening:
+# building a full row (JSON paths/hazards, belief-grid stats) for a
+# snapshot that will just be discarded is exactly the cost this exists to
+# avoid, so nothing below ever calls snapshot_row()/snapshot_rows().
+# ============================================================
+
+
+@dataclass(frozen=True)
+class SnapshotExportSelection:
+    """Result of selecting which NavigationDebugEvents to export.
+
+    ``source_indices`` are 1-based positions in the ORIGINAL (unfiltered)
+    event sequence passed to ``select_navigation_snapshot_events()`` --
+    ``events[i]`` was originally at ``source_indices[i]``. Filtering never
+    renumbers: a filtered export can have source_indices like
+    ``(1, 4, 7, 10, ...)`` with gaps showing exactly what was skipped.
+    """
+
+    events: tuple[NavigationDebugEvent, ...]
+    source_indices: tuple[int, ...]
+    source_count: int
+    exported_count: int
+    mode: str
+    routine_stride: int
+    target_rows: int | None
+    semantic_events_preserved: int
+
+
+def _semantic_signature(event) -> tuple:
+    """A small, cheap-to-compare signature of "what kind of moment is this".
+
+    Deliberately excludes anything that changes every tick (pose, velocity,
+    time, belief revision, cumulative metrics) -- including any of those
+    would make every event's signature unique and defeat streak-collapsing
+    entirely. Two events with the same signature are treated as "the same
+    routine situation continuing", not compared by deep/array equality.
+    """
+    snapshot = event.snapshot
+    agent = _maybe_value(getattr(snapshot, "agent_state", None))
+    return (
+        _enum_value(event.event_kind),
+        snapshot.navigation_state,
+        snapshot.tracking_mode,
+        snapshot.decision_kind,
+        getattr(agent, "active_path_mode", None),
+        getattr(agent, "route_generation", None),
+    )
+
+
+def _select_indices_for_events(events, *, routine_stride: int) -> tuple[set[int], int]:
+    """Return (1-based indices to keep, count of mandatory events kept).
+
+    Selection runs independently PER ROBOT (grouped by snapshot.robot_id,
+    preserving each robot's own relative order) so a robot that happens to
+    log fewer events, or appear later in interleaved multi-robot ticks,
+    still keeps its own first/last event and its own periodic samples --
+    sampling never simply takes events[::stride] on the global sequence,
+    which would silently favor whichever robot appears first each tick.
+    """
+    stride = max(1, int(routine_stride))
+
+    robot_order: list[str] = []
+    robot_buckets: dict[str, list[tuple[int, object]]] = {}
+    for original_index, event in enumerate(events, start=1):
+        robot_id = event.snapshot.robot_id
+        bucket = robot_buckets.get(robot_id)
+        if bucket is None:
+            bucket = []
+            robot_buckets[robot_id] = bucket
+            robot_order.append(robot_id)
+        bucket.append((original_index, event))
+
+    keep: set[int] = set()
+    mandatory_kept = 0
+
+    for robot_id in robot_order:
+        bucket = robot_buckets[robot_id]
+        keep.add(bucket[0][0])  # first event of this robot
+        keep.add(bucket[-1][0])  # last event of this robot
+
+        previous_signature = None
+        for position, (original_index, event) in enumerate(bucket, start=1):
+            signature = _semantic_signature(event)
+            is_mandatory = signature[0] in _MANDATORY_EVENT_KINDS
+            is_transition = signature != previous_signature
+            is_periodic_sample = stride <= 1 or position % stride == 0
+
+            if is_mandatory:
+                keep.add(original_index)
+                mandatory_kept += 1
+            elif is_transition or is_periodic_sample:
+                # A transition is the start of a new streak (routine or
+                # not); a periodic sample is one routine snapshot kept
+                # every `routine_stride`-th position so a long unchanging
+                # streak (e.g. 500 identical HOLD events) does not produce
+                # 500 rows.
+                keep.add(original_index)
+
+            previous_signature = signature
+
+    return keep, mandatory_kept
+
+
+def _selection_from_indices(events, keep: set[int], *, mode: str, routine_stride: int, target_rows: int | None, semantic_events_preserved: int) -> SnapshotExportSelection:
+    sorted_indices = tuple(sorted(keep))
+    kept_events = tuple(events[index - 1] for index in sorted_indices)
+    return SnapshotExportSelection(
+        events=kept_events,
+        source_indices=sorted_indices,
+        source_count=len(events),
+        exported_count=len(kept_events),
+        mode=mode,
+        routine_stride=routine_stride,
+        target_rows=target_rows,
+        semantic_events_preserved=semantic_events_preserved,
+    )
+
+
+def _smallest_stride_within_target(events, target_rows: int) -> int:
+    """Smallest routine_stride whose resulting export count is <= target_rows.
+
+    exported_count(stride) is non-increasing in stride (a larger stride can
+    only keep fewer or equal periodic samples per streak; mandatory/first/
+    last/transition events are kept regardless of stride), so a boolean
+    binary search over stride is valid -- not just a heuristic. The log's
+    length is bounded (DEFAULT_MAX_EVENTS), so this is at most ~O(log N)
+    O(N) passes -- no need for anything fancier.
+    """
+    total = len(events)
+    if total == 0:
+        return 1
+
+    def count_for(stride: int) -> int:
+        kept, _ = _select_indices_for_events(events, routine_stride=stride)
+        return len(kept)
+
+    if count_for(1) <= target_rows:
+        return 1
+
+    low, high = 2, max(2, total)
+    if count_for(high) > target_rows:
+        # Soft target: even the coarsest stride still exceeds target_rows
+        # (the mandatory/transition/first/last events alone dominate) --
+        # accept that rather than ever dropping a mandatory event to force
+        # the count under the target.
+        return high
+
+    while low < high:
+        mid = (low + high) // 2
+        if count_for(mid) <= target_rows:
+            high = mid
+        else:
+            low = mid + 1
+    return low
+
+
+def select_navigation_snapshot_events(
+    events,
+    *,
+    mode: str,
+    routine_stride: int | None = None,
+    target_rows: int = DEFAULT_AUTO_TARGET_ROWS,
+) -> SnapshotExportSelection:
+    """Decide which events to export -- BEFORE any row is ever flattened.
+
+    mode="raw": every event, original order, source_indices=1..N,
+        routine_stride=1 -- identical to the pre-existing (unfiltered)
+        export behavior.
+
+    mode="custom_stride": routine_stride must be >= 2. Sampling is done per
+        robot_id (see _select_indices_for_events()), preserving global
+        order afterward; first/last event of each robot and every
+        mandatory event are always kept regardless of stride.
+
+    mode="automatic_filtered": searches for the smallest routine_stride
+        that brings the exported count to approximately <= target_rows
+        (soft target -- mandatory events are never dropped just to hit it
+        exactly; see _smallest_stride_within_target()).
+    """
+    events = tuple(events)
+    total = len(events)
+
+    if mode == "raw":
+        mandatory_kept = sum(
+            1 for event in events if _enum_value(event.event_kind) in _MANDATORY_EVENT_KINDS
+        )
+        return SnapshotExportSelection(
+            events=events,
+            source_indices=tuple(range(1, total + 1)),
+            source_count=total,
+            exported_count=total,
+            mode="raw",
+            routine_stride=1,
+            target_rows=None,
+            semantic_events_preserved=mandatory_kept,
+        )
+
+    if mode == "custom_stride":
+        if routine_stride is None:
+            raise ValueError("routine_stride is required for custom_stride mode.")
+        stride = int(routine_stride)
+        if stride < 2:
+            raise ValueError(f"routine_stride must be >= 2 for custom_stride, got {stride}.")
+        keep, mandatory_kept = _select_indices_for_events(events, routine_stride=stride)
+        return _selection_from_indices(
+            events, keep, mode="custom_stride", routine_stride=stride, target_rows=None,
+            semantic_events_preserved=mandatory_kept,
+        )
+
+    if mode == "automatic_filtered":
+        target = max(1, int(target_rows))
+        stride = _smallest_stride_within_target(events, target)
+        keep, mandatory_kept = _select_indices_for_events(events, routine_stride=stride)
+        return _selection_from_indices(
+            events, keep, mode="automatic_filtered", routine_stride=stride, target_rows=target,
+            semantic_events_preserved=mandatory_kept,
+        )
+
+    raise ValueError(f"Unknown navigation snapshot export mode: {mode!r}")
 
 
 def snapshot_row(event: NavigationDebugEvent, event_index: int, *, belief_cache=None) -> dict[str, object]:
@@ -386,13 +633,32 @@ def snapshot_row(event: NavigationDebugEvent, event_index: int, *, belief_cache=
     return row
 
 
-def snapshot_rows(events) -> tuple[list[str], list[list[object]]]:
-    """Return stable headers and one flat row per event."""
+def snapshot_rows(events, *, event_indices=None) -> tuple[list[str], list[list[object]]]:
+    """Return stable headers and one flat row per event.
+
+    event_indices: when None (default), rows are numbered 1..N -- the
+    pre-existing behavior. When provided, it must be the same length as
+    events and gives the event_index each row actually uses (positive
+    integers) -- this is how a filtered SnapshotExportSelection's original
+    source_indices reach the Snapshots sheet without renumbering.
+    """
     events = tuple(events)
+    if event_indices is None:
+        indices = tuple(range(1, len(events) + 1))
+    else:
+        indices = tuple(event_indices)
+        if len(indices) != len(events):
+            raise ValueError(
+                f"event_indices length {len(indices)} does not match events length {len(events)}."
+            )
+        for index in indices:
+            if not isinstance(index, int) or isinstance(index, bool) or index <= 0:
+                raise ValueError(f"event_indices must contain positive integers, got {index!r}.")
+
     belief_cache: dict[int, dict[str, object]] = {}
     dict_rows = [
         snapshot_row(event, index, belief_cache=belief_cache)
-        for index, event in enumerate(events, start=1)
+        for index, event in zip(indices, events)
     ]
     if not dict_rows:
         # Keep a deterministic schema even for an empty history.
@@ -472,8 +738,28 @@ def _write_sheet(zip_file: ZipFile, path: str, headers: list[str], rows: list[li
         write('</worksheet>')
 
 
-def export_navigation_snapshots_xlsx(events, output_path: str | os.PathLike[str]) -> int:
-    """Write one row per event and return the number of exported snapshots."""
+def export_navigation_snapshots_xlsx(
+    events,
+    output_path: str | os.PathLike[str],
+    *,
+    source_indices=None,
+    source_count: int | None = None,
+    export_mode: str = "raw",
+    routine_stride: int = 1,
+    target_rows: int | None = None,
+    semantic_events_preserved: int | None = None,
+) -> int:
+    """Write one row per event and return the number of exported snapshots.
+
+    Backward compatible: called as export_navigation_snapshots_xlsx(events,
+    path) with no further arguments, this behaves exactly as before -- one
+    row per event in order, "raw" metadata. A caller that already built a
+    SnapshotExportSelection (see select_navigation_snapshot_events()) passes
+    its fields through so the Metadata sheet reflects the real selection;
+    `events` here must already be the FILTERED subset (selection.events),
+    and `source_indices` its ORIGINAL 1-based positions (selection.
+    source_indices) -- this function does no filtering of its own.
+    """
     events = tuple(events)
     if not events:
         raise SnapshotExportError("There are no navigation snapshots to export.")
@@ -483,15 +769,39 @@ def export_navigation_snapshots_xlsx(events, output_path: str | os.PathLike[str]
         output = output.with_suffix(".xlsx")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    headers, rows = snapshot_rows(events)
+    headers, rows = snapshot_rows(events, event_indices=source_indices)
+
+    exported_count = len(events)
+    resolved_source_count = int(source_count) if source_count is not None else exported_count
+    resolved_semantic = int(semantic_events_preserved) if semantic_events_preserved is not None else 0
+    # This function never receives the ORIGINAL unfiltered event list, only
+    # the (possibly filtered) `events` it was handed -- so "source" time
+    # here is read off the exported list's own first/last event. This is
+    # exact, not an approximation: select_navigation_snapshot_events()
+    # always preserves each robot's first/last event, and the globally
+    # first/last source event is, by construction, also the first/last
+    # event of whichever robot produced it -- so it is never filtered out.
+    first_time = float(events[0].snapshot.simulation_time)
+    last_time = float(events[-1].snapshot.simulation_time)
     metadata_headers = ["field", "value"]
     metadata_rows = [
         ["schema_version", SCHEMA_VERSION],
         ["exported_at_utc", datetime.now(timezone.utc).isoformat()],
-        ["snapshot_count", len(events)],
-        ["first_simulation_time_s", float(events[0].snapshot.simulation_time)],
-        ["last_simulation_time_s", float(events[-1].snapshot.simulation_time)],
-        ["note", "Each row in Snapshots is one immutable NavigationDebugEvent/NavigationDebugSnapshot."],
+        ["export_mode", str(export_mode)],
+        ["source_snapshot_count", resolved_source_count],
+        ["exported_snapshot_count", exported_count],
+        ["snapshot_count", exported_count],  # compatibility alias
+        ["routine_stride", int(routine_stride)],
+        ["automatic_target_rows", int(target_rows) if target_rows is not None else None],
+        ["semantic_events_preserved", resolved_semantic],
+        ["first_source_simulation_time_s", first_time],
+        ["last_source_simulation_time_s", last_time],
+        ["first_exported_simulation_time_s", first_time],
+        ["last_exported_simulation_time_s", last_time],
+        [
+            "event_index_note",
+            "Original 1-based source-history position; gaps indicate export filtering.",
+        ],
     ]
 
     try:

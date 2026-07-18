@@ -216,7 +216,12 @@ def _build_fake_engine(*, position=(0.0, 0.0), goal_tolerance=0.25) -> SimpleNam
 
     fake.build_planner_kwargs_for_goal = _spy_build_planner_kwargs_for_goal
 
-    for name in ("apply_navigation_decision", "apply_route_result", "request_route_async"):
+    for name in (
+        "apply_navigation_decision",
+        "apply_route_result",
+        "request_route_async",
+        "_invalidate_prefetch_request",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
     return fake

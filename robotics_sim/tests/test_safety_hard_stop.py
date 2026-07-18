@@ -114,6 +114,7 @@ def _build_fake_engine(*, position=(5.60, -4.13), v=0.47, goal_tolerance=0.25) -
     fake.replan_after_new_information = lambda reason: fake.replan_calls.append(reason) or False
 
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 

@@ -316,6 +316,7 @@ def test_first_segment_blocked_route_is_rejected_before_acceptance():
         robot=_FakeRobot(x=0.0, y=0.0),
         prefetch_workers={0: object()},
         prefetch_request_ids={0: 1},
+        prefetch_targets={0: (5.0, 0.0)},
         mapped_obstacle_points=[(1.0, 0.0)],  # sits directly on the first segment
         config=SimpleNamespace(goal_tolerance=0.25),
         simulation_time=1.0,
@@ -324,6 +325,7 @@ def test_first_segment_blocked_route_is_rejected_before_acceptance():
     fake.runtime_agent = lambda robot_index=None: agent
     fake.safety_radius = lambda: 0.3
     fake.log_console_message = lambda msg: console_logs.append(msg)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
 
     SimulationControllerMixin.on_prefetch_route_ready(
         fake,
@@ -350,6 +352,7 @@ def test_first_segment_clear_route_is_accepted_as_pending():
         robot=_FakeRobot(x=0.0, y=0.0),
         prefetch_workers={0: object()},
         prefetch_request_ids={0: 1},
+        prefetch_targets={0: (5.0, 0.0)},
         mapped_obstacle_points=[],  # no obstacles at all
         config=SimpleNamespace(goal_tolerance=0.25),
         simulation_time=1.0,
@@ -358,6 +361,7 @@ def test_first_segment_clear_route_is_accepted_as_pending():
     fake.runtime_agent = lambda robot_index=None: agent
     fake.safety_radius = lambda: 0.3
     fake.log_console_message = lambda msg: None
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
 
     SimulationControllerMixin.on_prefetch_route_ready(
         fake,

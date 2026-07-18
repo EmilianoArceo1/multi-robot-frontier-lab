@@ -127,6 +127,7 @@ def _build_fake_engine(tmp_path, *, robot_xy=(6.57, 3.58)) -> SimpleNamespace:
     fake.replan_after_new_information = _spy_replan_after_new_information
     fake.safety_replan_cooldown_seconds = lambda: 1.5
     fake.apply_navigation_decision = SimulationControllerMixin.apply_navigation_decision.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 
@@ -170,6 +171,7 @@ def _build_fake_engine_for_route_result(tmp_path, *, robot_xy=(0.0, 0.0)) -> Sim
     fake.clean_waypoints_for_current_start = SimulationControllerMixin.clean_waypoints_for_current_start.__get__(fake)
     fake.log_route_assignment = SimulationControllerMixin.log_route_assignment.__get__(fake)
     fake.apply_route_result = SimulationControllerMixin.apply_route_result.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 

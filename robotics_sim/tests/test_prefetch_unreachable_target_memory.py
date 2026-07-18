@@ -77,12 +77,18 @@ def _build_fake_engine(*, position=(0.0, -3.5), goal_tolerance=0.25) -> SimpleNa
         console_logs=[],
         prefetch_workers={},
         prefetch_request_ids={0: 1},
+        # The target request_id=1 was launched for -- on_prefetch_route_
+        # ready() now validates against this captured target, not against
+        # agent.pending_target_xy directly (see _invalidate_prefetch_
+        # request()'s docstring).
+        prefetch_targets={0: REJECTED_TARGET},
     )
     fake.telemetry = TelemetryLogger(sink=fake.console_logs.append)
     fake.log_console_message = lambda message, **kwargs: fake.console_logs.append(message)
     fake.runtime_agent = lambda robot_index=None: fake.agent
 
     fake.on_prefetch_route_ready = SimulationControllerMixin.on_prefetch_route_ready.__get__(fake)
+    fake._invalidate_prefetch_request = SimulationControllerMixin._invalidate_prefetch_request.__get__(fake)
     return fake
 
 

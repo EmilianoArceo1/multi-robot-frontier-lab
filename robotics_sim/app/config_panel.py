@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from robotics_sim.simulation.config import *
+from robotics_sim.app.theme import ThemeMode, dropdown_popup_stylesheet, theme_colors
 from robotics_sim.app.widgets import (
     HeroHeader,
     NumericStepper,
@@ -51,30 +52,41 @@ class BrushSizePreview(QWidget):
         self.brush_size = float(brush_size)
         self.setMinimumHeight(46)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # Starts light, corrected by MainWindow._apply_theme() (which finds
+        # every BrushSizePreview via findChildren()) once the saved theme is
+        # known -- same pattern as ToggleSwitch.set_theme_mode().
+        self._theme_mode = ThemeMode.LIGHT
 
     def set_brush_size(self, brush_size: float) -> None:
         self.brush_size = max(0.05, float(brush_size))
         self.update()
 
+    def set_theme_mode(self, mode) -> None:
+        self._theme_mode = ThemeMode(mode)
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        colors = theme_colors(self._theme_mode)
 
         rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
-        painter.setPen(QPen(QColor(BORDER), 1.0))
-        painter.setBrush(QBrush(QColor("#FFFFFF")))
+        painter.setPen(QPen(QColor(colors.border), 1.0))
+        painter.setBrush(QBrush(QColor(colors.card_background)))
         painter.drawRoundedRect(rect, 8.0, 8.0)
 
         center_x = rect.left() + 32.0
         center_y = rect.center().y()
         radius = max(4.0, min(19.0, 4.0 + self.brush_size * 8.0))
 
+        # The brush swatch itself stays the brand maroon in both themes --
+        # it previews a paint/erase brush color choice, not app chrome.
         painter.setPen(QPen(QColor(MAROON), 1.6))
         painter.setBrush(QBrush(QColor(122, 0, 25, 48)))
         painter.drawEllipse(QRectF(center_x - radius, center_y - radius, radius * 2.0, radius * 2.0))
 
         painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.setPen(QColor(TEXT))
+        painter.setPen(QColor(colors.text_primary))
         painter.drawText(
             QRectF(center_x + 30.0, rect.top(), rect.width() - 68.0, rect.height()),
             Qt.AlignVCenter | Qt.AlignLeft,
@@ -113,7 +125,11 @@ def labeled_combo(label: str, combo: QComboBox):
 
     The popup style is applied directly to the combo view because, on some
     Windows themes, the dropdown list ignores part of the global QSS and can
-    show unreadable white text.
+    show unreadable white text. Built light here (matches the app's own
+    light-first default -- see MainWindow._load_saved_theme()); `combo` is
+    tagged themedDropdownPopup=True so MainWindow._apply_theme() can find
+    and re-style every such popup when the theme changes (its own
+    setStyleSheet() is not reachable by the ordinary app-level QSS cascade).
     """
     box = QWidget()
 
@@ -127,35 +143,8 @@ def labeled_combo(label: str, combo: QComboBox):
     combo.setMinimumHeight(34)
     combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    combo.view().setStyleSheet(f"""
-        QListView {{
-            background-color: #FFFFFF;
-            color: #111827;
-            border: 1px solid {BORDER};
-            border-radius: 6px;
-            padding: 4px;
-            outline: 0px;
-            selection-background-color: #F4EAEA;
-            selection-color: {MAROON};
-        }}
-
-        QListView::item {{
-            min-height: 28px;
-            padding: 6px 8px;
-            color: #111827;
-            background-color: #FFFFFF;
-        }}
-
-        QListView::item:selected {{
-            color: {MAROON};
-            background-color: #F4EAEA;
-        }}
-
-        QListView::item:hover {{
-            color: {MAROON};
-            background-color: #FAF2F2;
-        }}
-    """)
+    combo.setProperty("themedDropdownPopup", True)
+    combo.view().setStyleSheet(dropdown_popup_stylesheet(ThemeMode.LIGHT))
 
     layout.addWidget(lbl)
     layout.addWidget(combo)
@@ -805,9 +794,13 @@ def build_editor_panel(window):
     editor_grid.setVerticalSpacing(7)
 
     window.editor_status_label = QLabel("Editor disabled")
-    window.editor_status_label.setObjectName("fieldLabel")
+    # Its own object name (not the generic "fieldLabel") because it wants a
+    # larger font-size/line-height for its longer wrapped sentence -- styled
+    # via the global stylesheet's QLabel#editorStatusLabel rule (see
+    # theme.py) so it stays correctly themed after a theme toggle without
+    # its own propagation call.
+    window.editor_status_label.setObjectName("editorStatusLabel")
     window.editor_status_label.setWordWrap(True)
-    window.editor_status_label.setStyleSheet("font-size: 11px; color: #4B5563; line-height: 1.35;")
 
     window.editor_tool_combo = QComboBox()
     window.editor_tool_combo.addItems(["Rectangles", "Squares", "Free draw", "Erase", "Camera view"])

@@ -80,7 +80,13 @@ class BeliefMapDebug:
     Arrays are compressed bytes rather than live NumPy references, so a
     historical snapshot cannot be changed by later mapping updates. Multiple
     navigation snapshots may share the same BeliefMapDebug object when the
-    map revision did not change.
+    map revision did not change -- grid_zlib/explored_packbits_zlib only
+    change with revision, so this sharing is safe for them. visit_count_zlib/
+    last_seen_zlib do NOT follow revision (BeliefMap.revision explicitly
+    excludes visit-count/last-seen changes, see its own docstring), so the
+    producer must compress those two fresh on every capture rather than
+    reusing a revision-keyed cache, or a later tick's revisit would silently
+    restore an earlier tick's visit_count/last_seen.
     """
 
     revision: int
@@ -90,6 +96,12 @@ class BeliefMapDebug:
     grid_zlib: bytes
     explored_shape: tuple[int, int, int]
     explored_packbits_zlib: bytes
+    # uint16 [height, width] / float32 [height, width] -- same shape as
+    # grid_shape. Empty bytes for a frame captured before this field existed;
+    # restore falls back to BeliefMap's own zero-state defaults for that case
+    # (see restore_navigation_debug_snapshot()).
+    visit_count_zlib: bytes = b""
+    last_seen_zlib: bytes = b""
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,7 @@ import math
 import os
 import time
 import zlib
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QSize, QTimer
@@ -114,6 +115,100 @@ class RenderThrottler:
         return False
 
 
+def _visible_fire_sources(sources, observed, *, bounds, resolution):
+    """Pure anti-omniscience filter for fire markers: keep only the
+    `sources` whose CENTER cell -- the cell containing `source.position`,
+    computed with the exact same floor-division convention GridGeometry.
+    world_to_grid() uses -- is observed=True in `observed`.
+
+    No Qt, no engine, no HazardField/RuntimeHazardService: `sources` (any
+    objects exposing `.position`), `observed` (a 2D bool array), `bounds`,
+    and `resolution` are the only inputs, so this is directly unit-testable
+    with plain data. Never infers a marker from the source's radius and
+    never marks a source visible because only part of its thermal halo was
+    observed -- only the single center cell matters, matching the spec's
+    own "no infieras el marker desde el radius" rule.
+    """
+    if observed is None or getattr(observed, "size", 0) == 0:
+        return []
+
+    x_min, x_max, y_min, y_max = (float(v) for v in bounds)
+    resolution = float(resolution)
+    height, width = observed.shape[0], observed.shape[1]
+
+    visible = []
+    for source in sources:
+        x, y = float(source.position[0]), float(source.position[1])
+        if not (x_min <= x < x_max and y_min <= y < y_max):
+            continue
+        col = int(math.floor((x - x_min) / resolution))
+        row = int(math.floor((y - y_min) / resolution))
+        if not (0 <= row < height and 0 <= col < width):
+            continue
+        if observed[row, col]:
+            visible.append(source)
+    return visible
+
+
+def _draw_fire_beacon(painter: QPainter, cx: float, cy: float, colors, *, discovered: bool) -> None:
+    """Draw one minimalist vectorial source beacon centered at screen
+    position (cx, cy) -- constant ~16px screen-space size regardless of
+    zoom (every shape below is a fixed pixel offset from (cx, cy), never
+    scaled by pixels_per_meter()).
+
+    Deliberately NOT a flame silhouette (see the removed _fire_marker_
+    flame_path()/_draw_fire_marker() this replaces) -- three simple
+    circular layers back to front: halo, thin outer ring, core. No
+    QPainterPath, no images, emoji, blur, particles, animation, or timers.
+
+    `discovered` selects the palette and weight, never the shape: a
+    discovered source (its center cell is observed=True) gets a warm ring
+    and a solid, fully opaque core; an undiscovered source -- only ever
+    drawn at all while Fire Markers is ON, see draw_fire_markers() -- gets
+    a tenue blue ring, a tiny near-transparent core, and lower opacity
+    throughout, reading clearly as "ground-truth debug info", not
+    something the team has actually detected.
+
+    `colors` is a theme.ThemeColors -- callers read it once per paint via
+    theme_colors(self._theme_mode) and pass it in, so this function itself
+    never imports/calls theme_colors directly.
+    """
+    ring_hex = colors.fire_discovered_ring if discovered else colors.fire_undiscovered_ring
+    core_hex = colors.fire_discovered_core if discovered else colors.fire_undiscovered_core
+    halo_alpha = 55 if discovered else 26
+    ring_alpha = 235 if discovered else 130
+    core_alpha = 235 if discovered else 70
+    core_radius = 3.2 if discovered else 1.6
+
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.translate(cx, cy)
+
+    # 1. Halo -- small, soft, low-alpha circle behind everything else.
+    halo_color = QColor(ring_hex)
+    halo_color.setAlpha(halo_alpha)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(halo_color))
+    painter.drawEllipse(QRectF(-8.0, -8.0, 16.0, 16.0))
+
+    # 2. Thin outer ring.
+    ring_color = QColor(ring_hex)
+    ring_color.setAlpha(ring_alpha)
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QPen(ring_color, 1.6))
+    painter.drawEllipse(QRectF(-5.0, -5.0, 10.0, 10.0))
+
+    # 3. Core circle -- solid/luminous when discovered, tiny/near-
+    # transparent otherwise.
+    core_color = QColor(core_hex)
+    core_color.setAlpha(core_alpha)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(core_color))
+    painter.drawEllipse(QRectF(-core_radius, -core_radius, 2 * core_radius, 2 * core_radius))
+
+    painter.restore()
+
+
 class SimulationCanvas(QWidget):
     goalClicked = Signal(float, float)
     robotDragged = Signal(int, float, float)
@@ -148,11 +243,42 @@ class SimulationCanvas(QWidget):
         self.multi_path_points: list[list[tuple[float, float]]] = []
         self.multi_last_controls: list[np.ndarray] = []
         self.planned_path_points: list[tuple[float, float]] = []
-        # Read-only snapshot of the independent continuous hazard field.
+        # Read-only snapshot of the independent continuous hazard field
+        # (GROUND TRUTH -- kept for legacy/potential editor use only; see
+        # draw_fires(), no longer called from the live paint loop).
         # The canvas never owns fire sources and never writes occupancy.
         self._hazard_snapshot: dict | None = None
         self._hazard_pixmap_cache: QPixmap | None = None
         self._hazard_pixmap_cache_key: tuple | None = None
+        # Separate pixmap cache for the full ground-truth BLUE inspection
+        # heatmap (see draw_ground_truth_hazard_map()/set_hazard_map_
+        # enabled()) -- entirely independent of _hazard_pixmap_cache above
+        # (draw_fires(), a different legacy yellow/red palette, unrelated
+        # to this toggle) and of the warm discovered-hazard caches below.
+        self._ground_truth_hazard_pixmap_cache: QPixmap | None = None
+        self._ground_truth_hazard_pixmap_cache_key: tuple | None = None
+        # Read-only frame of the team's DISCOVERED hazard belief -- what
+        # live simulation actually renders (see draw_discovered_hazard()).
+        # {"frame": HazardBeliefFrame, "bounds": ..., "resolution": ...}.
+        self._discovered_hazard_frame: dict | None = None
+        self._discovered_hazard_pixmap_cache: QPixmap | None = None
+        self._discovered_hazard_pixmap_cache_key: tuple | None = None
+        # Separate pixmap cache for the HISTORICAL discovered-hazard frame
+        # (see _decoded_navigation_debug_hazard_belief()) -- kept distinct
+        # from the live cache above so toggling between LIVE and HISTORY
+        # repeatedly never thrashes either one.
+        self._discovered_hazard_history_pixmap_cache: QPixmap | None = None
+        self._discovered_hazard_history_pixmap_cache_key: tuple | None = None
+        # Two independent rendering-only toggles, both OFF by default: the
+        # discovered hazard belief and its discovered fire sources are
+        # ALWAYS shown regardless of these -- they only ever ADD
+        # ground-truth debug information on top (see draw_ground_truth_
+        # hazard_map()/draw_fire_markers()'s own docstrings). Never
+        # persisted, never touch SimulationConfig/HazardBelief/planning,
+        # and safe to flip while a simulation is running, same contract as
+        # grid_overlay_enabled below.
+        self.show_hazard_map = False
+        self.show_fire_markers = False
         self.exploration_target_xy: tuple[float, float] | None = None
         self.multi_exploration_targets: list[tuple[float, float] | None] = []
         self.multi_invalidated_exploration_targets: list[list[tuple[float, float]]] = []
@@ -303,6 +429,12 @@ class SimulationCanvas(QWidget):
         self._nav_debug_environment_decoded: dict | None = None
         self._nav_debug_explored_cache: QPixmap | None = None
         self._nav_debug_explored_cache_key: tuple | None = None
+        # Decoded historical HazardBelief state (values/observed/bounds/
+        # resolution) -- same one-decode-per-(frame, revision) pattern as
+        # _nav_debug_environment_decode_key above, see
+        # _decoded_navigation_debug_hazard_belief().
+        self._nav_debug_hazard_belief_decode_key: tuple | None = None
+        self._nav_debug_hazard_belief_decoded: dict | None = None
         # Optional docked panel the full field breakdown is forwarded
         # to -- see set_navigation_reasoning_window(). None until
         # main_window.py registers one.
@@ -640,10 +772,24 @@ class SimulationCanvas(QWidget):
         self.update()
 
     def set_hazard_snapshot(self, snapshot: dict | None) -> None:
-        """Store a read-only hazard snapshot pushed by the runtime service."""
+        """Store a read-only GROUND-TRUTH hazard snapshot. Kept for legacy/
+        potential editor use -- draw_fires() (the only consumer) is no
+        longer called from the live paint loop; runtime rendering uses
+        set_discovered_hazard_frame() instead. Never mix the two payload
+        shapes into one ambiguous dict."""
         self._hazard_snapshot = snapshot
         self._hazard_pixmap_cache = None
         self._hazard_pixmap_cache_key = None
+        self.update()
+
+    def set_discovered_hazard_frame(self, payload: dict | None) -> None:
+        """Store a read-only frame of the team's DISCOVERED hazard belief --
+        {"frame": HazardBeliefFrame, "bounds": ..., "resolution": ...}. This
+        is what live simulation actually renders (see draw_discovered_
+        hazard()); the frame's arrays are already immutable copies (see
+        HazardBelief.snapshot()), so this never stores a mutable reference
+        the runtime could later change out from under a paint call."""
+        self._discovered_hazard_frame = payload
         self.update()
 
     def set_fires(self, fires) -> None:
@@ -2073,7 +2219,20 @@ class SimulationCanvas(QWidget):
             (time.perf_counter() - _mapped_obstacle_points_start) * 1000.0
         )
 
-        self.draw_fires(painter)
+        # Ground-truth debug overlay (Hazard Map toggle, default OFF) --
+        # BELOW the discovered layer so the warm discovered heatmap always
+        # reads on top of the cold ground-truth one (draw_fires(), the
+        # unrelated legacy yellow/red ground-truth renderer, is still not
+        # called here).
+        self.draw_ground_truth_hazard_map(painter)
+        # Live simulation ALWAYS renders what the team has actually
+        # discovered -- see draw_discovered_hazard()'s own docstring; no
+        # toggle can hide this layer, only add to it.
+        self.draw_discovered_hazard(painter)
+        # Independent of both heatmaps above -- its own anti-omniscience
+        # source filter, no shared cache (see draw_fire_markers()'s own
+        # docstring).
+        self.draw_fire_markers(painter)
         self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 
         # Robot-related layers, broken down into named sub-buckets for the
@@ -2355,6 +2514,34 @@ class SimulationCanvas(QWidget):
         return bool(self.grid_overlay_enabled)
 
     # ------------------------------------------------------------------
+    # Hazard Map / Fire Markers toggles. Independent of each other and of
+    # grid_overlay_enabled above -- same "rendering-only, never touches
+    # SimulationConfig/HazardBelief/planning, safe to flip mid-run" contract.
+    # ------------------------------------------------------------------
+
+    def set_hazard_map_enabled(self, enabled: bool) -> None:
+        """Toggle draw_ground_truth_hazard_map() (the full ground-truth
+        blue debug heatmap) only -- draw_discovered_hazard() is unaffected
+        and always renders. Disabling never drops the underlying frame/
+        cache -- re-enabling shows the current frame immediately on the
+        next paint, with no re-decode."""
+        self.show_hazard_map = bool(enabled)
+        self.update()
+
+    def is_hazard_map_enabled(self) -> bool:
+        return bool(self.show_hazard_map)
+
+    def set_fire_markers_enabled(self, enabled: bool) -> None:
+        """Toggle whether draw_fire_markers() also draws UNDISCOVERED
+        sources -- independent of show_hazard_map. Discovered sources are
+        always drawn by draw_fire_markers() regardless of this flag."""
+        self.show_fire_markers = bool(enabled)
+        self.update()
+
+    def is_fire_markers_enabled(self) -> bool:
+        return bool(self.show_fire_markers)
+
+    # ------------------------------------------------------------------
     # Navigation debug overlay. _nav_debug_snapshot is an immutable
     # NavigationDebugSnapshot pushed in from engine.py -- the canvas never
     # constructs, mutates, or recomputes any part of it.
@@ -2414,6 +2601,58 @@ class SimulationCanvas(QWidget):
         self._nav_debug_environment_decoded = decoded
         return decoded
 
+    def _decoded_navigation_debug_hazard_belief(self) -> dict | None:
+        """Decode the selected historical snapshot's HazardBeliefDebug
+        exactly once per (frame identity, revision) -- same pattern as
+        _decoded_navigation_debug_environment() for BeliefMapDebug.
+
+        Returns None when the selected snapshot has no hazard_belief field
+        at all (an older snapshot captured before this existed) -- callers
+        must hide the hazard layer entirely in that case, never fall back
+        to the live frame or ground truth.
+
+        bounds/resolution are read from the SAME snapshot's belief_map
+        frame rather than duplicated into HazardBeliefDebug -- both are
+        captured from the same tick's BeliefMap/HazardBelief, which always
+        share one GridGeometry (see hazard_service.RuntimeHazardService).
+        """
+        snapshot = self._navigation_debug_history_snapshot()
+        if snapshot is None:
+            return None
+        maybe_hazard_belief = getattr(snapshot, "hazard_belief", None)
+        if maybe_hazard_belief is None or maybe_hazard_belief.unavailable or maybe_hazard_belief.value is None:
+            return None
+        maybe_belief_map = getattr(snapshot, "belief_map", None)
+        if maybe_belief_map is None or maybe_belief_map.unavailable or maybe_belief_map.value is None:
+            return None
+
+        frame = maybe_hazard_belief.value
+        belief_map_frame = maybe_belief_map.value
+        key = (id(frame), int(frame.revision))
+        if self._nav_debug_hazard_belief_decode_key == key:
+            return self._nav_debug_hazard_belief_decoded
+
+        values = (
+            np.frombuffer(zlib.decompress(frame.values_zlib), dtype=np.float32)
+            .reshape(frame.shape)
+            .copy()
+        )
+        observed_packed = np.frombuffer(zlib.decompress(frame.observed_packbits_zlib), dtype=np.uint8)
+        observed = np.unpackbits(
+            observed_packed, bitorder="little", count=int(np.prod(frame.shape))
+        ).reshape(frame.shape).astype(bool, copy=False)
+
+        decoded = {
+            "values": values,
+            "observed": observed,
+            "revision": int(frame.revision),
+            "bounds": tuple(belief_map_frame.bounds),
+            "resolution": float(belief_map_frame.resolution),
+        }
+        self._nav_debug_hazard_belief_decode_key = key
+        self._nav_debug_hazard_belief_decoded = decoded
+        return decoded
+
     def set_navigation_reasoning_window(self, window) -> None:
         """Register the docked NavigationReasoningWindow so the 3
         setters below can forward pushes to it too. Optional -- None (the
@@ -2438,6 +2677,8 @@ class SimulationCanvas(QWidget):
             self._nav_debug_environment_decoded = None
             self._nav_debug_explored_cache = None
             self._nav_debug_explored_cache_key = None
+            self._nav_debug_hazard_belief_decode_key = None
+            self._nav_debug_hazard_belief_decoded = None
         self._refresh_navigation_reasoning_window()
         self.update()
 
@@ -3650,6 +3891,385 @@ class SimulationCanvas(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(target, self._hazard_pixmap_cache, QRectF(self._hazard_pixmap_cache.rect()))
         painter.restore()
+
+    def _build_ground_truth_hazard_pixmap(self, grid) -> QPixmap | None:
+        """Full ground-truth HazardField as a semi-transparent BLUE
+        inspection heatmap -- deliberately a cold palette (theme.
+        hazard_map_low/mid/high), never the warm discovered-hazard palette,
+        so the two layers never look like the same information source even
+        when both are visible at once (see draw_ground_truth_hazard_map()
+        drawing this BELOW draw_discovered_hazard()).
+
+        Reads theme_colors(self._theme_mode) -- unlike draw_fires()'s own
+        _build_hazard_pixmap() above (kept theme-independent, see test_
+        theme_palette.py), this palette is intentionally theme-dependent;
+        callers must key their cache on ThemeMode too (see draw_ground_
+        truth_hazard_map()'s own cache_key).
+        """
+        grid = np.asarray(grid, dtype=np.float32)
+        if grid.ndim != 2 or grid.size == 0:
+            return None
+
+        heat = np.clip(grid, 0.0, 1.0)
+        height, width = heat.shape
+
+        colors = theme_colors(self._theme_mode)
+        low_rgb = QColor(colors.hazard_map_low).getRgb()[:3]
+        mid_rgb = QColor(colors.hazard_map_mid).getRgb()[:3]
+        high_rgb = QColor(colors.hazard_map_high).getRgb()[:3]
+
+        is_low = heat <= 0.5
+        t_low = np.clip(heat * 2.0, 0.0, 1.0)
+        t_high = np.clip((heat - 0.5) * 2.0, 0.0, 1.0)
+
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        for channel in range(3):
+            low_v, mid_v, high_v = low_rgb[channel], mid_rgb[channel], high_rgb[channel]
+            rgba[..., channel] = np.where(
+                is_low,
+                low_v + (mid_v - low_v) * t_low,
+                mid_v + (high_v - mid_v) * t_high,
+            ).astype(np.uint8)
+        # Semi-transparent throughout (capped well below the warm
+        # discovered layer's own alpha) -- that layer draws on top of this
+        # one and must always read clearly above it.
+        rgba[..., 3] = np.where(
+            heat > 0.0,
+            20.0 + 100.0 * np.power(heat, 0.6),
+            0.0,
+        ).astype(np.uint8)
+
+        rgba = np.ascontiguousarray(np.flipud(rgba))
+        image = QImage(
+            rgba.data,
+            width,
+            height,
+            int(rgba.strides[0]),
+            QImage.Format_RGBA8888,
+        ).copy()
+        return QPixmap.fromImage(image)
+
+    def draw_ground_truth_hazard_map(self, painter: QPainter):
+        """Full ground-truth HazardField as a semi-transparent BLUE
+        inspection heatmap -- gated on show_hazard_map (default False; a
+        debug/inspection overlay, never required to see what the team has
+        actually discovered). Drawn BELOW draw_discovered_hazard() in the
+        paint pipeline (see paintEvent()) so the warm discovered layer
+        always reads on top.
+
+        LIVE only: uses _hazard_snapshot["grid"] (RuntimeHazardService.
+        snapshot()'s own continuous field). HISTORY has nothing safe to
+        render here -- HazardDebug (the historical ground-truth contract,
+        see navigation_snapshot.py) stores only discrete FireSource points,
+        never a full continuous grid -- so this hides entirely while
+        browsing history rather than inventing a grid or reusing the live
+        one; draw_discovered_hazard()'s own historical replay is
+        unaffected and keeps working normally.
+        """
+        if not self.show_hazard_map:
+            return
+        if self._navigation_debug_history_snapshot() is not None:
+            return
+
+        snapshot = self._hazard_snapshot
+        if not snapshot:
+            return
+        grid = snapshot.get("grid")
+        if grid is None or not np.any(grid):
+            return
+
+        cache_key = (
+            int(snapshot.get("version", 0)),
+            tuple(snapshot.get("bounds", ())),
+            float(snapshot.get("resolution", 0.0)),
+            str(self._theme_mode),
+        )
+        if (
+            self._ground_truth_hazard_pixmap_cache is None
+            or self._ground_truth_hazard_pixmap_cache_key != cache_key
+        ):
+            self._ground_truth_hazard_pixmap_cache = self._build_ground_truth_hazard_pixmap(grid)
+            self._ground_truth_hazard_pixmap_cache_key = cache_key
+        pixmap = self._ground_truth_hazard_pixmap_cache
+        if pixmap is None:
+            return
+
+        x_min, x_max, y_min, y_max = map(float, snapshot["bounds"])
+        left, top = self.world_to_screen(x_min, y_max)
+        right, bottom = self.world_to_screen(x_max, y_min)
+        target = QRectF(
+            min(left, right),
+            min(top, bottom),
+            abs(right - left),
+            abs(bottom - top),
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+        painter.restore()
+
+    def _build_discovered_hazard_pixmap(self, frame) -> QPixmap | None:
+        """Warm amber -> orange -> coral-red -> light-core gradient (theme.
+        discovered_hazard_low/mid/high/core) -- deliberately theme-
+        dependent now (see test_theme_palette.py's semantic_methods list,
+        which no longer includes draw_discovered_hazard()) -- but gated on
+        observed=True per cell. An unobserved cell gets alpha=0 regardless
+        of its (always 0.0, by HazardBelief's own contract) value: this is
+        the actual omniscience guard, not an incidental byproduct of
+        unobserved cells already being zero.
+
+        Three color segments -- [0, 0.5] low->mid, (0.5, 0.85] mid->high,
+        (0.85, 1] high->core -- so only the hottest handful of cells ever
+        reach the bright core color, and a steeper (>1) alpha exponent
+        keeps low/peripheral values much more transparent than the old
+        formula did: a small, well-defined hot spot instead of one uniform
+        blurry blob.
+        """
+        values = np.asarray(frame.values, dtype=np.float32)
+        observed = np.asarray(frame.observed, dtype=bool)
+        if values.ndim != 2 or values.size == 0:
+            return None
+
+        heat = np.clip(values, 0.0, 1.0)
+        height, width = heat.shape
+
+        colors = theme_colors(self._theme_mode)
+        low_rgb = QColor(colors.discovered_hazard_low).getRgb()[:3]
+        mid_rgb = QColor(colors.discovered_hazard_mid).getRgb()[:3]
+        high_rgb = QColor(colors.discovered_hazard_high).getRgb()[:3]
+        core_rgb = QColor(colors.discovered_hazard_core).getRgb()[:3]
+
+        seg1 = heat <= 0.5
+        seg2 = (heat > 0.5) & (heat <= 0.85)
+        seg3 = heat > 0.85
+        t1 = np.clip(heat / 0.5, 0.0, 1.0)
+        t2 = np.clip((heat - 0.5) / 0.35, 0.0, 1.0)
+        t3 = np.clip((heat - 0.85) / 0.15, 0.0, 1.0)
+
+        rgba = np.zeros((height, width, 4), dtype=np.uint8)
+        for channel in range(3):
+            low_v, mid_v, high_v, core_v = (
+                low_rgb[channel], mid_rgb[channel], high_rgb[channel], core_rgb[channel]
+            )
+            stage1 = low_v + (mid_v - low_v) * t1
+            stage2 = mid_v + (high_v - mid_v) * t2
+            stage3 = high_v + (core_v - high_v) * t3
+            rgba[..., channel] = np.select(
+                [seg1, seg2, seg3], [stage1, stage2, stage3], default=stage1
+            ).astype(np.uint8)
+
+        rgba[..., 3] = np.where(
+            observed & (heat > 0.0),
+            18.0 + 190.0 * np.power(heat, 1.15),
+            0.0,
+        ).astype(np.uint8)
+
+        # Grid row 0 is the world's lower edge; QImage row 0 is the top.
+        rgba = np.ascontiguousarray(np.flipud(rgba))
+        image = QImage(
+            rgba.data,
+            width,
+            height,
+            int(rgba.strides[0]),
+            QImage.Format_RGBA8888,
+        ).copy()
+        return QPixmap.fromImage(image)
+
+    def draw_discovered_hazard(self, painter: QPainter):
+        """Draw the TEAM's DISCOVERED hazard belief -- observed=True cells
+        only. Never the omniscient ground-truth HazardField (see draw_
+        ground_truth_hazard_map() for that, drawn as a separate BELOW
+        layer, gated on show_hazard_map): no FireSource, no real fire
+        radius/center, ever read for this.
+
+        ALWAYS drawn (no toggle gate here at all -- see paintEvent()):
+        what the team has actually discovered must never be hideable, only
+        ADDED to via show_hazard_map/show_fire_markers.
+
+        Browsing HISTORY renders the SELECTED snapshot's own historical
+        HazardBelief frame (via _decoded_navigation_debug_hazard_belief(),
+        decoded/cached separately from the live pixmap so toggling between
+        LIVE and HISTORY never thrashes either cache) -- never the live
+        frame, never ground truth. A historical snapshot with no
+        HazardBeliefDebug at all (captured before this existed) hides the
+        layer entirely rather than falling back to anything else.
+
+        Both pixmap caches are keyed on (revision, bounds, resolution,
+        ThemeMode) -- never viewport/zoom (the pixmap is built in grid-
+        aligned pixel space; world_to_screen() below repositions it per
+        paint call cheaply, exactly like draw_fires()). ThemeMode IS part
+        of the key now (see _build_discovered_hazard_pixmap()'s own
+        docstring for why): a pixmap built with the LIGHT palette must
+        never be reused after switching to DARK. Both reuse the same
+        _build_discovered_hazard_pixmap() color formula -- no second copy
+        of it here.
+        """
+        if self._navigation_debug_history_snapshot() is not None:
+            historical = self._decoded_navigation_debug_hazard_belief()
+            if historical is None:
+                return
+            if not np.any(historical["observed"]):
+                return
+
+            cache_key = (
+                int(historical["revision"]),
+                tuple(historical["bounds"]),
+                float(historical["resolution"]),
+                str(self._theme_mode),
+            )
+            if (
+                self._discovered_hazard_history_pixmap_cache is None
+                or self._discovered_hazard_history_pixmap_cache_key != cache_key
+            ):
+                frame_like = SimpleNamespace(values=historical["values"], observed=historical["observed"])
+                self._discovered_hazard_history_pixmap_cache = self._build_discovered_hazard_pixmap(frame_like)
+                self._discovered_hazard_history_pixmap_cache_key = cache_key
+            pixmap = self._discovered_hazard_history_pixmap_cache
+            if pixmap is None:
+                return
+
+            x_min, x_max, y_min, y_max = map(float, historical["bounds"])
+            left, top = self.world_to_screen(x_min, y_max)
+            right, bottom = self.world_to_screen(x_max, y_min)
+            target = QRectF(
+                min(left, right),
+                min(top, bottom),
+                abs(right - left),
+                abs(bottom - top),
+            )
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(target, pixmap, QRectF(pixmap.rect()))
+            painter.restore()
+            return
+
+        payload = self._discovered_hazard_frame
+        if not payload:
+            return
+        frame = payload.get("frame")
+        if frame is None or not np.any(frame.observed):
+            return
+
+        cache_key = (
+            int(getattr(frame, "revision", 0)),
+            tuple(payload.get("bounds", ())),
+            float(payload.get("resolution", 0.0)),
+            str(self._theme_mode),
+        )
+        if (
+            self._discovered_hazard_pixmap_cache is None
+            or self._discovered_hazard_pixmap_cache_key != cache_key
+        ):
+            self._discovered_hazard_pixmap_cache = self._build_discovered_hazard_pixmap(frame)
+            self._discovered_hazard_pixmap_cache_key = cache_key
+        if self._discovered_hazard_pixmap_cache is None:
+            return
+
+        x_min, x_max, y_min, y_max = map(float, payload["bounds"])
+        left, top = self.world_to_screen(x_min, y_max)
+        right, bottom = self.world_to_screen(x_max, y_min)
+        target = QRectF(
+            min(left, right),
+            min(top, bottom),
+            abs(right - left),
+            abs(bottom - top),
+        )
+
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(
+            target, self._discovered_hazard_pixmap_cache, QRectF(self._discovered_hazard_pixmap_cache.rect())
+        )
+        painter.restore()
+
+    def _current_fire_marker_context(self):
+        """Resolve (sources, observed, bounds, resolution) for fire
+        markers from EXACTLY one source of truth, matching draw_
+        discovered_hazard()'s own LIVE/HISTORY split -- never mixing the
+        two, never falling back to ground truth alone when no belief
+        exists for the current view.
+
+        Returns None when there is nothing safe to draw from: HISTORY with
+        no HazardBeliefDebug, HISTORY with no HazardDebug (ground-truth
+        sources) on that same snapshot, or LIVE with either the discovered
+        frame or the ground-truth snapshot not yet pushed.
+        """
+        if self._navigation_debug_history_snapshot() is not None:
+            historical = self._decoded_navigation_debug_hazard_belief()
+            if historical is None:
+                return None
+            snapshot = self._navigation_debug_history_snapshot()
+            maybe_hazard = getattr(snapshot, "hazard", None)
+            if maybe_hazard is None or maybe_hazard.unavailable or maybe_hazard.value is None:
+                return None
+            return (
+                maybe_hazard.value.sources,
+                historical["observed"],
+                historical["bounds"],
+                historical["resolution"],
+            )
+
+        payload = self._discovered_hazard_frame
+        if not payload:
+            return None
+        frame = payload.get("frame")
+        if frame is None:
+            return None
+        hazard_snapshot = self._hazard_snapshot
+        if not hazard_snapshot:
+            return None
+        return (
+            hazard_snapshot.get("sources", ()),
+            frame.observed,
+            payload.get("bounds", ()),
+            payload.get("resolution", 0.0),
+        )
+
+    def draw_fire_markers(self, painter: QPainter):
+        """Draw one vectorial beacon per fire source -- DISCOVERED sources
+        (center cell observed=True) are ALWAYS drawn, with the warm
+        "discovered" style; show_fire_markers additionally draws every
+        remaining UNDISCOVERED source with the tenue-blue "undiscovered"
+        style (default OFF -- see set_fire_markers_enabled()). Never the
+        reverse: this never hides a discovered source, only adds ground-
+        truth ones on top of it.
+
+            show_fire_markers=False -> render_sources = discovered_sources
+            show_fire_markers=True  -> render_sources = all sources
+                (each one still individually styled "discovered" or
+                "undiscovered" -- a discovered source is drawn exactly
+                once, never twice/duplicated with both styles.)
+
+        Completely independent of draw_discovered_hazard()/draw_ground_
+        truth_hazard_map() (the heatmaps): no shared cache or gate. Builds
+        no pixmap/cache of its own -- the number of sources is small, so
+        every rendered beacon is drawn directly each paint (see _draw_
+        fire_beacon()).
+
+        LIVE and HISTORY each read their own single source of truth via
+        _current_fire_marker_context() (never mixed); _visible_fire_
+        sources() determines which sources are "discovered" -- only by
+        their center cell's observed=True, never by radius (see its own
+        docstring for the exact anti-omniscience rule) -- regardless of
+        show_fire_markers.
+        """
+        context = self._current_fire_marker_context()
+        if context is None:
+            return
+        sources, observed, bounds, resolution = context
+        if observed is None or getattr(observed, "size", 0) == 0:
+            return
+
+        discovered_sources = _visible_fire_sources(sources, observed, bounds=bounds, resolution=resolution)
+        discovered_ids = {id(source) for source in discovered_sources}
+        render_sources = sources if self.show_fire_markers else discovered_sources
+        if not render_sources:
+            return
+
+        colors = theme_colors(self._theme_mode)
+        for source in render_sources:
+            sx, sy = self.world_to_screen(float(source.position[0]), float(source.position[1]))
+            _draw_fire_beacon(painter, sx, sy, colors, discovered=(id(source) in discovered_ids))
 
     @staticmethod
     def _active_route_index(robot, route: list[tuple[float, float]]) -> int:

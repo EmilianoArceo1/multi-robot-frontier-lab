@@ -87,6 +87,7 @@ def _build_fake_engine() -> SimpleNamespace:
         "log_route_assignment",
         "_navigation_debug_belief_frame",
         "_navigation_debug_hazard_frame",
+        "_navigation_debug_hazard_belief_frame",
         "_navigation_debug_agent_state_frame",
         "_navigation_debug_metrics_frame",
     ):

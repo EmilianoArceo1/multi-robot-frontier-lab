@@ -17,6 +17,7 @@ against a hand-built fixture.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 import zlib
 from types import SimpleNamespace
@@ -39,6 +40,7 @@ from robotics_sim.diagnostics.navigation_snapshot import (
     BeliefMapDebug,
     ControllerDebug,
     FrontierDebug,
+    HazardBeliefDebug,
     HazardDebug,
     HazardSourceDebug,
     Maybe,
@@ -54,7 +56,11 @@ from robotics_sim.diagnostics.navigation_snapshot import (
 )
 from robotics_sim.app.main_window import MainWindow
 from robotics_sim.environment.belief_map import BeliefMap, FREE, OCCUPIED, UNKNOWN
+from robotics_sim.environment.grid_geometry import GridCell
+from robotics_sim.environment.hazard_belief import HazardBeliefFrame
 from robotics_sim.environment.hazard_field import FireSource
+from robotics_sim.environment.occupancy_grid import OccupancyGrid
+from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.simulation.config import SimulationConfig
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
@@ -98,6 +104,24 @@ def _make_belief_frame(
 
 def _make_hazard_frame(sources: tuple[HazardSourceDebug, ...] = (), *, next_fire_id: int = 1, version: int = 0) -> HazardDebug:
     return HazardDebug(version=version, next_fire_id=next_fire_id, sources=sources)
+
+
+def _make_hazard_belief_frame(
+    values: np.ndarray, observed: np.ndarray, observed_by_robot: np.ndarray, *, revision: int
+) -> HazardBeliefDebug:
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    observed = np.ascontiguousarray(observed, dtype=bool)
+    observed_by_robot = np.ascontiguousarray(observed_by_robot, dtype=bool)
+    packed_observed = np.packbits(observed.reshape(-1), bitorder="little")
+    packed_observed_by_robot = np.packbits(observed_by_robot.reshape(-1), bitorder="little")
+    return HazardBeliefDebug(
+        shape=(int(values.shape[0]), int(values.shape[1])),
+        robot_count=int(observed_by_robot.shape[0]),
+        revision=revision,
+        values_zlib=zlib.compress(values.tobytes(order="C"), level=1),
+        observed_packbits_zlib=zlib.compress(packed_observed.tobytes(), level=1),
+        observed_by_robot_packbits_zlib=zlib.compress(packed_observed_by_robot.tobytes(), level=1),
+    )
 
 
 def _make_agent_state(
@@ -169,6 +193,7 @@ def _make_snapshot(
     mapped_obstacle_points_count: int = 0,
     belief_frame: BeliefMapDebug | None = None,
     hazard_frame: HazardDebug | None = None,
+    hazard_belief_frame: HazardBeliefDebug | None = None,
     agent_state: AgentStateDebug | None = None,
     metrics: RuntimeMetricsDebug | None = None,
     tracking_mode: str = "",
@@ -217,6 +242,7 @@ def _make_snapshot(
         sensor=SensorDebug(),
         belief_map=Maybe.of(belief_frame) if belief_frame is not None else Maybe.missing(),
         hazard=Maybe.of(hazard_frame) if hazard_frame is not None else Maybe.missing(),
+        hazard_belief=Maybe.of(hazard_belief_frame) if hazard_belief_frame is not None else Maybe.missing(),
         agent_state=Maybe.of(agent_state) if agent_state is not None else Maybe.missing(),
         metrics=Maybe.of(metrics) if metrics is not None else Maybe.missing(),
     )
@@ -233,6 +259,7 @@ class _FakeCanvas:
         self.path = None
         self.planned_path = None
         self.hazard_snapshots: list = []
+        self.discovered_hazard_frames: list = []
         self.exploration_target = "unset"
         self.explored_area_seed = None
 
@@ -271,6 +298,9 @@ class _FakeCanvas:
 
     def set_hazard_snapshot(self, snapshot):
         self.hazard_snapshots.append(snapshot)
+
+    def set_discovered_hazard_frame(self, payload):
+        self.discovered_hazard_frames.append(payload)
 
     def set_exploration_target(self, target):
         self.exploration_target = target
@@ -312,6 +342,7 @@ def _build_fake_engine(
     history_index: int | None,
     agent_mode: str = "Single Robot Mode",
     live_fire_at: tuple[float, float] | None = None,
+    robot_count: int = 1,
 ):
     log = NavigationDebugEventLog(max_size=50)
     for snap in snapshots:
@@ -320,8 +351,8 @@ def _build_fake_engine(
     robot = Robot(x=0.0, y=0.0, theta=0.0, v=0.0)
     agent = RobotAgent(robot_id=0, position=(0.0, 0.0), planner_mode="FoV-aware directional frontier")
 
-    belief = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1)
-    hazard_service = RuntimeHazardService(bounds=_BOUNDS, resolution=_RESOLUTION)
+    belief = BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=robot_count)
+    hazard_service = RuntimeHazardService(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=robot_count)
     if live_fire_at is not None:
         # Represents a fire that only exists in the "future" relative to the
         # snapshot being restored to -- set up before restore_navigation_
@@ -362,6 +393,9 @@ def _build_fake_engine(
         _nav_debug_seq=999,
         _nav_debug_belief_frame_key=("stale",),
         _nav_debug_belief_frame_cache=object(),
+        _nav_debug_hazard_belief_frame_key=("stale",),
+        _nav_debug_hazard_belief_frame_cache=object(),
+        _discovered_hazard_render_dirty=True,
         _nav_debug_pending_plan_capture_by_robot={0: object()},
         _nav_debug_last_plan_capture=object(),
         _nav_debug_last_accepted_plan=object(),
@@ -385,6 +419,9 @@ def _build_fake_engine(
         "ensure_belief_map",
         "ensure_hazard_service",
         "push_hazard_snapshot",
+        "push_discovered_hazard_frame",
+        "_navigation_debug_hazard_belief_frame",
+        "_restore_empty_hazard_belief",
         "sync_legacy_map_views_from_belief",
         "update_navigation_debug_step_buttons",
         "update_start_pause_button",
@@ -811,6 +848,709 @@ def test_restore_sets_next_fire_id_from_the_snapshot():
 
     new_fire = fake.hazard_service.add_fire((1.0, 1.0))
     assert new_fire.source.fire_id == 41
+
+
+# ---------------------------------------------------------------------------
+# engine._navigation_debug_hazard_belief_frame() -- Team HazardBelief capture.
+# Bound directly onto the fake engine (see _build_fake_engine's bound-method
+# list) so these exercise the real capture/cache logic against a real
+# HazardBelief, independent of restore. Deliberately separate from the
+# ground-truth _navigation_debug_hazard_frame() capture -- never reads
+# HazardField/FireSource (see test_capture_never_reads_hazard_field below).
+# ---------------------------------------------------------------------------
+
+# Deliberately kept strictly inside a single cell's bounds (never landing on
+# a cell corner/center exactly) so each polygon rasterizes to exactly one
+# unambiguous cell -- (0, 0) and (2, 2) respectively, in the 4x4 grid that
+# _BOUNDS/_RESOLUTION produce.
+_VISIBLE_POLYGON_A = [(-1.9, -1.9), (-1.1, -1.9), (-1.1, -1.1), (-1.9, -1.1)]  # -> cell (0, 0)
+_VISIBLE_POLYGON_B = [(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]  # -> cell (2, 2)
+
+
+def test_capture_preserves_values_exactly():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    expected = fake.hazard_service.belief.snapshot()
+
+    debug = fake._navigation_debug_hazard_belief_frame().value
+
+    decoded_values = np.frombuffer(zlib.decompress(debug.values_zlib), dtype=np.float32).reshape(debug.shape)
+    assert decoded_values.dtype == np.float32
+    assert np.array_equal(decoded_values, expected.values)
+
+
+def test_capture_preserves_observed_exactly():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    expected = fake.hazard_service.belief.snapshot()
+
+    debug = fake._navigation_debug_hazard_belief_frame().value
+
+    decoded_observed = np.unpackbits(
+        np.frombuffer(zlib.decompress(debug.observed_packbits_zlib), dtype=np.uint8),
+        bitorder="little",
+        count=int(np.prod(debug.shape)),
+    ).reshape(debug.shape).astype(bool)
+    assert np.array_equal(decoded_observed, expected.observed)
+
+
+def test_capture_preserves_observed_by_robot_exactly():
+    fake = _build_fake_engine(snapshots=[], history_index=None, robot_count=2)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=1)
+    expected = fake.hazard_service.belief.snapshot()
+
+    debug = fake._navigation_debug_hazard_belief_frame().value
+
+    observed_by_robot_shape = (debug.robot_count,) + debug.shape
+    decoded = np.unpackbits(
+        np.frombuffer(zlib.decompress(debug.observed_by_robot_packbits_zlib), dtype=np.uint8),
+        bitorder="little",
+        count=int(np.prod(observed_by_robot_shape)),
+    ).reshape(observed_by_robot_shape).astype(bool)
+    assert debug.robot_count == 2
+    assert np.array_equal(decoded, expected.observed_by_robot)
+
+
+def test_capture_preserves_shape_and_robot_count():
+    fake = _build_fake_engine(snapshots=[], history_index=None, robot_count=2)
+    debug = fake._navigation_debug_hazard_belief_frame().value
+    assert debug.shape == fake.hazard_service.belief.shape
+    assert debug.robot_count == fake.hazard_service.belief.robot_count
+
+
+def test_capture_revision_matches_belief_revision():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    debug = fake._navigation_debug_hazard_belief_frame().value
+    assert debug.revision == fake.hazard_service.belief.revision
+
+
+def test_capture_reuses_cached_frame_when_revision_unchanged():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+
+    first = fake._navigation_debug_hazard_belief_frame().value
+    second = fake._navigation_debug_hazard_belief_frame().value
+
+    assert second is first
+
+
+def test_capture_invalidates_cache_on_new_revision():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    first = fake._navigation_debug_hazard_belief_frame().value
+
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=0)
+    second = fake._navigation_debug_hazard_belief_frame().value
+
+    assert second is not first
+    assert second.revision > first.revision
+
+
+def test_capture_invalidates_cache_on_new_belief_instance():
+    fake = _build_fake_engine(snapshots=[], history_index=None)
+    first = fake._navigation_debug_hazard_belief_frame().value
+
+    # Simulate a reset that recreates the RuntimeHazardService/HazardBelief:
+    # revision starts back at 0, coinciding with the first capture's
+    # revision, but the cache key also includes id(belief) so this must
+    # still miss.
+    fake.hazard_service = RuntimeHazardService(bounds=_BOUNDS, resolution=_RESOLUTION)
+    second = fake._navigation_debug_hazard_belief_frame().value
+
+    assert second is not first
+
+
+def test_capture_returns_missing_when_no_hazard_service():
+    fake = SimpleNamespace()
+    fake._navigation_debug_hazard_belief_frame = (
+        SimulationControllerMixin._navigation_debug_hazard_belief_frame.__get__(fake)
+    )
+
+    result = fake._navigation_debug_hazard_belief_frame()
+
+    assert result.unavailable is True
+
+
+def test_capture_never_reads_hazard_field():
+    source = inspect.getsource(SimulationControllerMixin._navigation_debug_hazard_belief_frame)
+    for forbidden in ("hazard_service.field", "FireSource("):
+        assert forbidden not in source, (
+            f"_navigation_debug_hazard_belief_frame() must never contain {forbidden!r} -- "
+            "capture must read only HazardBelief, never ground truth"
+        )
+
+
+# ---------------------------------------------------------------------------
+# restore_navigation_debug_snapshot() -- Team HazardBelief. Restored
+# independently of ground-truth FireSource/HazardField above (see
+# HazardBeliefDebug's own docstring); a couple of cases below deliberately
+# combine both to prove that independence rather than testing HazardBelief
+# alone.
+# ---------------------------------------------------------------------------
+
+
+def _hazard_shape() -> tuple[int, int]:
+    return BeliefMap(bounds=_BOUNDS, resolution=_RESOLUTION, robot_count=1).grid.shape
+
+
+def _default_belief_frame(*, robot_count: int = 1) -> BeliefMapDebug:
+    """A minimal valid BeliefMapDebug -- restore_navigation_debug_snapshot()
+    is a no-op whenever belief_map itself is missing (see test_restore_is_a_
+    noop_when_the_snapshot_has_no_belief_map()), so every test below that
+    wants to reach the (independent) HazardBelief-restore logic needs one of
+    these even though it never asserts anything about occupancy itself.
+    robot_count must match the fake engine's own belief_map.explored_by_
+    robot.shape[0] -- a mismatch there makes restore's own occupancy-gate
+    return False before ever reaching the hazard-belief section (see the
+    grid.shape/explored.shape check early in restore_navigation_debug_
+    snapshot())."""
+    shape = _hazard_shape()
+    return _make_belief_frame(
+        np.full(shape, UNKNOWN, dtype=np.int8), np.zeros((robot_count,) + shape, dtype=bool),
+        revision=1, resolution=_RESOLUTION, bounds=_BOUNDS,
+    )
+
+
+def test_restore_restores_hazard_belief_values_and_observed_exactly():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[0, 0] = 0.9
+    observed = np.zeros(shape, dtype=bool)
+    observed[0, 0] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=5
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert restored.values.dtype == np.float32
+    assert np.array_equal(restored.values, values)
+    assert np.array_equal(restored.observed, observed)
+
+
+def test_restore_restores_hazard_belief_observed_by_robot_exactly():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    observed = np.zeros(shape, dtype=bool)
+    observed[1, 1] = True
+    observed_by_robot = np.zeros((2,) + shape, dtype=bool)
+    observed_by_robot[1, 1, 1] = True  # robot 1 attributed it; robot 0 did not
+    hazard_belief_frame = _make_hazard_belief_frame(values, observed, observed_by_robot, revision=3)
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(robot_count=2),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0, robot_count=2)
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert np.array_equal(restored.observed_by_robot, observed_by_robot)
+
+
+def test_restore_restores_hazard_belief_revision_exactly():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    observed = np.zeros(shape, dtype=bool)
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=17
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.hazard_service.belief.revision == 17
+
+
+def test_restore_discards_future_observations_not_in_the_snapshot():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[0, 0] = 0.8
+    observed = np.zeros(shape, dtype=bool)
+    observed[0, 0] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    # A "future" observation relative to the snapshot -- a different cell
+    # observed live after the snapshot was captured.
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=0)
+    assert fake.hazard_service.belief.snapshot().observed[2, 2]
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert np.array_equal(restored.values, values)
+    assert np.array_equal(restored.observed, observed)
+    assert not restored.observed[2, 2], "the future observation must not survive restore"
+
+
+def test_restore_restores_fire_source_and_hazard_belief_independently_in_one_snapshot():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[3, 3] = 0.7
+    observed = np.zeros(shape, dtype=bool)
+    observed[3, 3] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=2
+    )
+    # A fire that exists in ground truth but was NEVER observed -- restore
+    # must bring back the fire without marking it as observed in the belief.
+    fire_source = HazardSourceDebug(fire_id=1, position=(-1.5, -1.5), intensity=1.0, radius=1.0)
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_frame=_make_hazard_frame((fire_source,), next_fire_id=2),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert len(fake.hazard_service.field.sources()) == 1
+    restored_source = fake.hazard_service.field.sources()[0]
+    assert restored_source.position == fire_source.position
+    # The belief is the exact captured frame -- only cell (3, 3) was ever
+    # observed, regardless of where the (independently restored) fire sits.
+    restored = fake.hazard_service.belief.snapshot()
+    assert np.array_equal(restored.values, values)
+    assert np.array_equal(restored.observed, observed)
+
+
+def test_restore_invalidates_the_capture_cache():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    observed = np.zeros(shape, dtype=bool)
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    assert fake._nav_debug_hazard_belief_frame_key == ("stale",)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake._nav_debug_hazard_belief_frame_key is None
+    assert fake._nav_debug_hazard_belief_frame_cache is None
+
+
+def test_restore_pushes_the_restored_belief_to_canvas_exactly_once():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[0, 0] = 0.9
+    observed = np.zeros(shape, dtype=bool)
+    observed[0, 0] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert len(fake.canvas.discovered_hazard_frames) == 1
+    pushed = fake.canvas.discovered_hazard_frames[0]
+    assert np.array_equal(pushed["frame"].values, values)
+    assert np.array_equal(pushed["frame"].observed, observed)
+
+
+def test_restore_clears_the_discovered_hazard_render_dirty_flag():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    observed = np.zeros(shape, dtype=bool)
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    assert fake._discovered_hazard_render_dirty is True
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake._discovered_hazard_render_dirty is False
+
+
+def test_restore_falls_back_to_an_empty_belief_when_the_field_is_missing():
+    """Old snapshot captured before HazardBeliefDebug existed (Maybe.
+    missing()) -- the documented safe fallback: an empty HazardBelief, never
+    derived from HazardField/ground truth. A belief_map IS provided (restore
+    is only a no-op with no belief_map at all -- see test_restore_is_a_noop_
+    when_the_snapshot_has_no_belief_map()); hazard_belief_frame is the one
+    field deliberately left out here."""
+    shape = _hazard_shape()
+    belief_frame = _make_belief_frame(
+        np.full(shape, UNKNOWN, dtype=np.int8), np.zeros((1,) + shape, dtype=bool),
+        revision=1, resolution=_RESOLUTION, bounds=_BOUNDS,
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=belief_frame
+    )
+    assert snapshot.hazard_belief.unavailable is True
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    assert np.any(fake.hazard_service.belief.snapshot().observed)
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert not np.any(restored.observed)
+    assert not np.any(restored.values)
+    assert restored.revision == 0, (
+        "the fallback must be HazardBelief.restore() to an explicit revision "
+        "0 frame, never HazardBelief.clear() (whose resulting revision "
+        "depends on whatever state existed before the restore)"
+    )
+
+
+def test_restore_falls_back_to_an_empty_belief_on_shape_mismatch():
+    mismatched_shape = (2, 2)  # deliberately does not match the engine's real geometry
+    values = np.zeros(mismatched_shape, dtype=np.float32)
+    observed = np.ones(mismatched_shape, dtype=bool)
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + mismatched_shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+
+    result = fake.restore_navigation_debug_snapshot()  # must not raise
+
+    assert result is True  # the rest of the restore (pose/time/...) still succeeds
+    restored = fake.hazard_service.belief.snapshot()
+    assert not np.any(restored.observed), "a shape mismatch must fall back to empty, never crash or half-apply"
+    assert restored.revision == 0
+
+
+def test_restore_falls_back_to_an_empty_belief_on_corrupt_bytes():
+    shape = _hazard_shape()
+    corrupt_frame = HazardBeliefDebug(
+        shape=shape, robot_count=1, revision=1,
+        values_zlib=b"not-valid-zlib-data",
+        observed_packbits_zlib=b"not-valid-zlib-data",
+        observed_by_robot_packbits_zlib=b"not-valid-zlib-data",
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=corrupt_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+
+    result = fake.restore_navigation_debug_snapshot()  # must not raise zlib.error
+
+    assert result is True
+    restored = fake.hazard_service.belief.snapshot()
+    assert not np.any(restored.observed)
+    assert restored.revision == 0
+
+
+# ---------------------------------------------------------------------------
+# Determinism of the empty-HazardBelief fallback (_restore_empty_hazard_
+# belief()). HazardBelief.clear() is NOT used for these cases precisely
+# because its resulting revision depends on whatever "future" state existed
+# before the restore -- these tests set up different such "future" states
+# and prove the fallback result is always identical: revision exactly 0.
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_from_a_belief_with_data_and_a_future_revision_lands_on_revision_zero():
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=_default_belief_frame()
+    )
+    assert snapshot.hazard_belief.unavailable is True  # "old" snapshot -- no HazardBeliefDebug at all
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    # A "future" belief with real observed data -- HazardBelief.clear() would
+    # bump this to some nonzero revision like 1, not necessarily 0.
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=0)
+    assert fake.hazard_service.belief.revision >= 2
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert restored.revision == 0
+    assert not np.any(restored.observed)
+    assert not np.any(restored.values)
+
+
+def test_fallback_from_an_already_empty_belief_with_a_future_revision_lands_on_revision_zero():
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=_default_belief_frame()
+    )
+    assert snapshot.hazard_belief.unavailable is True
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    shape = _hazard_shape()
+    # A "future" belief that is empty (no observed cells) but whose revision
+    # counter has already advanced -- e.g. from an earlier restore/clear in
+    # the same run. HazardBelief.clear() would be a no-op here and leave
+    # this nonzero revision untouched.
+    fake.hazard_service.belief.restore(
+        HazardBeliefFrame(
+            values=np.zeros(shape, dtype=np.float32),
+            observed=np.zeros(shape, dtype=bool),
+            observed_by_robot=np.zeros((1,) + shape, dtype=bool),
+            revision=42,
+        )
+    )
+    assert fake.hazard_service.belief.revision == 42
+    assert not np.any(fake.hazard_service.belief.snapshot().observed)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert fake.hazard_service.belief.revision == 0
+
+
+def test_fallback_on_corrupt_payload_from_a_belief_with_data_lands_on_revision_zero():
+    corrupt_frame = HazardBeliefDebug(
+        shape=_hazard_shape(), robot_count=1, revision=1,
+        values_zlib=b"not-valid-zlib-data",
+        observed_packbits_zlib=b"not-valid-zlib-data",
+        observed_by_robot_packbits_zlib=b"not-valid-zlib-data",
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(), hazard_belief_frame=corrupt_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=0)
+    assert fake.hazard_service.belief.revision >= 2
+
+    fake.restore_navigation_debug_snapshot()
+
+    restored = fake.hazard_service.belief.snapshot()
+    assert restored.revision == 0
+    assert not np.any(restored.observed)
+
+
+def test_restoring_the_same_old_snapshot_from_different_future_states_is_byte_for_byte_equivalent():
+    """The literal failure mode this fix addresses: two restores of the
+    exact same historical (fieldless) snapshot, but starting from two
+    different "future" live states, must land on an identical HazardBelief
+    -- not just equal content but the same revision too, so downstream
+    caches (keyed on revision) treat them as the same frame."""
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=_default_belief_frame()
+    )
+    shape = _hazard_shape()
+
+    fake_a = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake_a.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    fake_a.restore_navigation_debug_snapshot()
+
+    fake_b = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake_b.hazard_service.belief.restore(
+        HazardBeliefFrame(
+            values=np.zeros(shape, dtype=np.float32),
+            observed=np.zeros(shape, dtype=bool),
+            observed_by_robot=np.zeros((1,) + shape, dtype=bool),
+            revision=99,
+        )
+    )
+    fake_b.restore_navigation_debug_snapshot()
+
+    frame_a = fake_a.hazard_service.belief.snapshot()
+    frame_b = fake_b.hazard_service.belief.snapshot()
+    assert frame_a.revision == frame_b.revision == 0
+    assert np.array_equal(frame_a.values, frame_b.values)
+    assert np.array_equal(frame_a.observed, frame_b.observed)
+    assert np.array_equal(frame_a.observed_by_robot, frame_b.observed_by_robot)
+
+
+def test_first_observation_after_the_fallback_bumps_revision_from_zero_to_one():
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0), belief_frame=_default_belief_frame()
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+    fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_B, robot_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+    assert fake.hazard_service.belief.revision == 0
+
+    result = fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+
+    assert result.changed is True
+    assert fake.hazard_service.belief.revision == 1
+
+
+def test_restore_belief_matches_observed_blocked_world_points_after_restore():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[0, 0] = 0.9  # above the default block_threshold
+    observed = np.zeros(shape, dtype=bool)
+    observed[0, 0] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    geometry = fake.hazard_service.belief.geometry
+    expected_point = geometry.grid_to_world(GridCell(row=0, col=0))
+    assert fake.hazard_service.observed_blocked_world_points() == (expected_point,)
+
+
+def test_restore_belief_feeds_the_planning_costmap_correctly():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[1, 2] = 0.95
+    observed = np.zeros(shape, dtype=bool)
+    observed[1, 2] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=1
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    planning_grid = OccupancyGrid.from_bounds(*_BOUNDS, _RESOLUTION)
+    apply_hazard_belief_to_planning_grid(
+        planning_grid, fake.hazard_service.belief, block_threshold=fake.hazard_service.block_threshold
+    )
+    assert planning_grid.data[1, 2] == OCCUPIED
+    assert planning_grid.data[0, 0] == UNKNOWN
+
+
+def test_restore_allows_normal_observation_to_continue_afterward():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    observed = np.zeros(shape, dtype=bool)
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=9
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+    assert fake.hazard_service.belief.revision == 9
+
+    result = fake.hazard_service.observe_visible_polygon(_VISIBLE_POLYGON_A, robot_index=0)
+
+    assert result.changed is True
+    assert fake.hazard_service.belief.revision == 10
+
+
+def test_restoring_the_same_snapshot_twice_is_idempotent():
+    shape = _hazard_shape()
+    values = np.zeros(shape, dtype=np.float32)
+    values[2, 2] = 0.6
+    observed = np.zeros(shape, dtype=bool)
+    observed[2, 2] = True
+    hazard_belief_frame = _make_hazard_belief_frame(
+        values, observed, observed.reshape((1,) + shape), revision=4
+    )
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=_default_belief_frame(),
+        hazard_belief_frame=hazard_belief_frame,
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+    first = fake.hazard_service.belief.snapshot()
+    fake.restore_navigation_debug_snapshot()
+    second = fake.hazard_service.belief.snapshot()
+
+    assert np.array_equal(first.values, second.values)
+    assert np.array_equal(first.observed, second.observed)
+    assert first.revision == second.revision == 4
+
+
+# ---------------------------------------------------------------------------
+# Compatibility with pre-Phase-5 snapshots (captured before HazardBeliefDebug
+# existed). test_restore_falls_back_to_an_empty_belief_when_the_field_is_
+# missing() above already covers the HazardBelief-specific fallback; these
+# two prove the REST of restore (ground truth, occupancy, pose, metrics --
+# all pre-existing Phase-1..4 behavior) is completely unaffected by the new
+# field's presence/absence.
+# ---------------------------------------------------------------------------
+
+
+def test_old_format_snapshot_without_hazard_belief_still_restores_everything_else():
+    snapshots = _make_ten_snapshots()  # built without hazard_belief_frame -- Maybe.missing()
+    assert snapshots[2].hazard_belief.unavailable is True
+    fake = _build_fake_engine(snapshots=snapshots, history_index=2)
+
+    result = fake.restore_navigation_debug_snapshot()
+
+    assert result is True
+    target = snapshots[2]
+    assert fake.simulation_time == target.simulation_time
+    assert fake.robot.x == target.robot_pose.x
+    assert not np.any(fake.hazard_service.belief.snapshot().observed)
+
+
+def test_old_format_snapshot_with_ground_truth_fire_but_no_hazard_belief_restores_fire_and_empty_belief():
+    belief_shape = _hazard_shape()
+    grid = np.full(belief_shape, UNKNOWN, dtype=np.int8)
+    explored = np.zeros((1,) + belief_shape, dtype=bool)
+    frame = _make_belief_frame(grid, explored, revision=1, resolution=_RESOLUTION, bounds=_BOUNDS)
+    fire_source = HazardSourceDebug(fire_id=1, position=(0.5, 0.5), intensity=1.0, radius=2.0)
+    snapshot = _make_snapshot(
+        snapshot_id=1, simulation_time=1.0, pose=(0.0, 0.0, 0.0, 0.0),
+        belief_frame=frame, hazard_frame=_make_hazard_frame((fire_source,), next_fire_id=2),
+        # hazard_belief_frame intentionally omitted -- Maybe.missing(), as a
+        # real pre-Phase-5 capture would have.
+    )
+    fake = _build_fake_engine(snapshots=[snapshot], history_index=0)
+
+    fake.restore_navigation_debug_snapshot()
+
+    assert len(fake.hazard_service.field.sources()) == 1  # ground truth restored as before
+    assert not np.any(fake.hazard_service.belief.snapshot().observed)  # belief safely empty
 
 
 # ---------------------------------------------------------------------------

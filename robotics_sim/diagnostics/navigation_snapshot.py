@@ -117,6 +117,43 @@ class HazardSourceDebug:
 
 
 @dataclass(frozen=True)
+class HazardBeliefDebug:
+    """Compact immutable Team HazardBelief frame for in-memory replay --
+    the discovered-only counterpart to BeliefMapDebug/HazardDebug.
+
+    Deliberately its own dataclass, not folded into HazardDebug: HazardDebug
+    represents the omniscient ground-truth FireSource set, while this
+    represents only what the team has actually observed (see
+    environment.hazard_belief.HazardBelief's own module docstring) --
+    keeping them separate means a restore path can never accidentally mix
+    the two concepts by touching one field that means both things.
+
+    Arrays are compressed bytes rather than live NumPy references (same
+    zlib/packbits pattern as BeliefMapDebug), so a historical snapshot
+    cannot be changed by a later observation. Multiple navigation snapshots
+    may share the same HazardBeliefDebug object when the belief revision
+    did not change (see engine._navigation_debug_hazard_belief_frame()'s
+    cache). bounds/resolution are intentionally NOT duplicated here --
+    HazardBelief always shares one GridGeometry with the same tick's
+    BeliefMap (see hazard_service.RuntimeHazardService), so a consumer
+    reads those from the snapshot's own belief_map field instead.
+
+    values_zlib/observed_packbits_zlib/observed_by_robot_packbits_zlib are
+    empty bytes for a frame captured before this field existed -- restore
+    falls back to an empty HazardBelief for that case (see
+    engine.restore_navigation_debug_snapshot()'s docstring for why an empty
+    belief, never HazardField, is the only safe fallback).
+    """
+
+    shape: tuple[int, int]
+    robot_count: int
+    revision: int
+    values_zlib: bytes = b""
+    observed_packbits_zlib: bytes = b""
+    observed_by_robot_packbits_zlib: bytes = b""
+
+
+@dataclass(frozen=True)
 class HazardDebug:
     """Frozen hazard-field state for restore.
 
@@ -372,5 +409,10 @@ class NavigationDebugSnapshot:
     # Restore-only fields -- see the class docstring's "Restore contract"
     # paragraph and each dataclass's own docstring.
     hazard: Maybe[HazardDebug] = field(default_factory=Maybe.missing)
+    # Team HazardBelief -- discovered-only, deliberately separate from
+    # `hazard` (ground-truth FireSource set) above. Missing/unavailable for
+    # a snapshot captured before this field existed; restore treats that
+    # exactly like an empty belief (see HazardBeliefDebug's docstring).
+    hazard_belief: Maybe[HazardBeliefDebug] = field(default_factory=Maybe.missing)
     agent_state: Maybe[AgentStateDebug] = field(default_factory=Maybe.missing)
     metrics: Maybe[RuntimeMetricsDebug] = field(default_factory=Maybe.missing)

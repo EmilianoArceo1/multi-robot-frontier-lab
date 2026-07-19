@@ -329,6 +329,29 @@ class SimulationConfig:
     fire_selection_radius: float = 0.6
     hazard_block_threshold: float = 0.55
 
+    # Observed Hazard OGM-HOCBF safety filter (see
+    # robotics_sim/simulation/hazard_safety_runtime.py). Filters the nominal
+    # control using only OBSERVED hazard belief -- never ground truth -- and
+    # is disabled entirely by hazard_cbf_enabled=False.
+    hazard_cbf_enabled: bool = True
+    hazard_cbf_margin: float = 0.20
+    hazard_cbf_activation_distance: float = 1.50
+    hazard_cbf_k1: float = 2.0
+    hazard_cbf_k2: float = 2.0
+    # Level 0 (finest) alone is the production configuration. Values > 1
+    # remain loadable (1-4, see config_from_sim_payload's clamp) for
+    # research use only -- the CBF audit (see test_hazard_hocbf_filter.py's
+    # multiscale finding tests) found that imposing every pyramid level as
+    # simultaneous hard constraints is measurably MORE conservative and can
+    # make a level-0-feasible state infeasible (~1.4% of activated states in
+    # the audit's sample), for no demonstrated benefit (the coarse level
+    # never corrected the fine level's gradient direction in that sample).
+    # Do not use pyramid_levels > 1 in official experiments/demos.
+    hazard_cbf_pyramid_levels: int = 1
+    hazard_cbf_sdf_smoothing_sigma_cells: float = 0.75
+    hazard_cbf_acceleration_weight: float = 1.0
+    hazard_cbf_angular_weight: float = 0.35
+
     # Simulation camera/view rectangle. In editor mode this is shown as a
     # red adjustable frame. In simulation mode this rectangle is the world area
     # mapped to the canvas viewport.
@@ -545,6 +568,15 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "default_fire_radius": config.default_fire_radius,
             "fire_selection_radius": config.fire_selection_radius,
             "block_threshold": config.hazard_block_threshold,
+            "cbf_enabled": config.hazard_cbf_enabled,
+            "cbf_margin": config.hazard_cbf_margin,
+            "cbf_activation_distance": config.hazard_cbf_activation_distance,
+            "cbf_k1": config.hazard_cbf_k1,
+            "cbf_k2": config.hazard_cbf_k2,
+            "cbf_pyramid_levels": config.hazard_cbf_pyramid_levels,
+            "cbf_sdf_smoothing_sigma_cells": config.hazard_cbf_sdf_smoothing_sigma_cells,
+            "cbf_acceleration_weight": config.hazard_cbf_acceleration_weight,
+            "cbf_angular_weight": config.hazard_cbf_angular_weight,
         },
         "camera": {
             "center_x": config.camera_center_x,
@@ -767,6 +799,59 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
                     hazard.get("block_threshold", default.hazard_block_threshold),
                     default.hazard_block_threshold,
                 ),
+            ),
+        ),
+        hazard_cbf_enabled=bool(hazard.get("cbf_enabled", default.hazard_cbf_enabled)),
+        hazard_cbf_margin=max(
+            0.0,
+            _as_float(hazard.get("cbf_margin", default.hazard_cbf_margin), default.hazard_cbf_margin),
+        ),
+        hazard_cbf_activation_distance=max(
+            1e-6,
+            _as_float(
+                hazard.get("cbf_activation_distance", default.hazard_cbf_activation_distance),
+                default.hazard_cbf_activation_distance,
+            ),
+        ),
+        hazard_cbf_k1=max(
+            1e-6,
+            _as_float(hazard.get("cbf_k1", default.hazard_cbf_k1), default.hazard_cbf_k1),
+        ),
+        hazard_cbf_k2=max(
+            1e-6,
+            _as_float(hazard.get("cbf_k2", default.hazard_cbf_k2), default.hazard_cbf_k2),
+        ),
+        hazard_cbf_pyramid_levels=max(
+            1,
+            min(
+                4,
+                int(
+                    _as_float(
+                        hazard.get("cbf_pyramid_levels", default.hazard_cbf_pyramid_levels),
+                        default.hazard_cbf_pyramid_levels,
+                    )
+                ),
+            ),
+        ),
+        hazard_cbf_sdf_smoothing_sigma_cells=max(
+            0.0,
+            _as_float(
+                hazard.get("cbf_sdf_smoothing_sigma_cells", default.hazard_cbf_sdf_smoothing_sigma_cells),
+                default.hazard_cbf_sdf_smoothing_sigma_cells,
+            ),
+        ),
+        hazard_cbf_acceleration_weight=max(
+            1e-6,
+            _as_float(
+                hazard.get("cbf_acceleration_weight", default.hazard_cbf_acceleration_weight),
+                default.hazard_cbf_acceleration_weight,
+            ),
+        ),
+        hazard_cbf_angular_weight=max(
+            1e-6,
+            _as_float(
+                hazard.get("cbf_angular_weight", default.hazard_cbf_angular_weight),
+                default.hazard_cbf_angular_weight,
             ),
         ),
         camera_center_x=_as_float(camera.get("center_x", default.camera_center_x), default.camera_center_x),

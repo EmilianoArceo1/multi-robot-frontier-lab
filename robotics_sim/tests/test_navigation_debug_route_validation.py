@@ -96,9 +96,12 @@ def _build_fake_engine(*, navigation_debug_enabled: bool = True) -> SimpleNamesp
         "log_route_assignment",
         "_navigation_debug_belief_frame",
         "_navigation_debug_hazard_frame",
+        "_navigation_debug_hazard_belief_frame",
         "_navigation_debug_agent_state_frame",
         "_navigation_debug_metrics_frame",
         "_invalidate_prefetch_request",
+        "sanitize_planner_obstacle_points",
+        "obstacle_points_for_segment_safety_check",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
 
@@ -115,7 +118,14 @@ def test_blocked_first_segment_captures_real_clearance_terms():
     fake = _build_fake_engine()
     # Obstacle sample sits exactly on the segment (0,0) -> (1,0); safety
     # radius 0.2 -- distance from the point to the segment is 0.0 <= 0.2.
-    fake.mapped_obstacle_points = [(0.5, 0.0)]
+    # Placed at 0.8m (not e.g. 0.5m) so it survives apply_route_result()'s
+    # obstacle_points_for_segment_safety_check() sanitization -- with this
+    # fake's grid_resolution=0.5, the near-start exclusion disk has radius
+    # ~0.625m (see sanitize_planner_obstacle_points()'s own docstring/
+    # formula); a REAL on-path obstacle for this test must sit outside it,
+    # exactly like it would have to for active_segment_blocked, which has
+    # used this same sanitized set all along.
+    fake.mapped_obstacle_points = [(0.8, 0.0)]
 
     fake.apply_route_result(True, "path found with A*", [(1.0, 0.0)])
 
@@ -130,7 +140,7 @@ def test_blocked_first_segment_captures_real_clearance_terms():
     terms = first_segment.value
     assert terms.checker == "check_segment_points"
     assert terms.blocked is True
-    assert terms.blocking_point == (0.5, 0.0)
+    assert terms.blocking_point == (0.8, 0.0)
     assert terms.required_clearance == pytest.approx(0.2)
     # The exact boolean condition the real checker used: distance <= required_clearance.
     assert terms.distance.unavailable is False

@@ -92,6 +92,7 @@ def _make_engine_fake(
         "make_exploration_reachability_check",
         "reset_belief_map",
         "ensure_belief_map",
+        "push_discovered_hazard_frame",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     return fake

@@ -2700,12 +2700,18 @@ class SimulationControllerMixin:
             # -- blocking point, distance, reason -- survives for the
             # navigation debug snapshot below instead of being reduced to a
             # bare bool. Same single computation either way.
+            #
+            # obstacle_points_for_segment_safety_check() (not the raw
+            # mapped_obstacle_points list) so this agrees with what the
+            # planner already assumed about the robot's own immediate
+            # surroundings -- see that method's docstring for the root
+            # cause this closes.
             start_xy = (float(self.robot.x), float(self.robot.y))
             first_segment_report = _evaluate_route_first_segment(
                 self.collision_checker,
                 start_xy,
                 clean_waypoints[0] if clean_waypoints else None,
-                list(self.mapped_obstacle_points),
+                self.obstacle_points_for_segment_safety_check(start_xy, self.safety_radius()),
                 self.safety_radius(),
             )
             blocked_on_arrival = bool(clean_waypoints) and bool(
@@ -6867,10 +6873,14 @@ class SimulationControllerMixin:
             target = self.active_target_xy()
             if target is not None:
                 dynamic_points = self.dynamic_robot_obstacle_points_for_robot(index)
+                # obstacle_points_for_segment_safety_check() (not the raw
+                # mapped_obstacle_points list) -- see that method's
+                # docstring; single-robot's build_observation() already
+                # uses it for this exact check, multi-robot must agree.
                 active_segment_report = self.collision_checker.check_segment_points(
                     start=robot_position,
                     end=target,
-                    obstacle_points=list(self.mapped_obstacle_points) + dynamic_points,
+                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius) + dynamic_points,
                     robot_radius=robot_radius,
                 )
                 robot_obstacle_violation, robot_obstacle_message = self.segment_violates_other_robot_clearance(
@@ -6929,11 +6939,15 @@ class SimulationControllerMixin:
             control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
             control = self.apply_hazard_safety_filter(robot, control)
 
+            # obstacle_points_for_segment_safety_check() (not the raw
+            # mapped_obstacle_points list) -- matches the active-segment
+            # check above and single-robot's predicted_motion_report call.
             prediction_report = self.predicted_motion_report(
                 control=control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=list(self.mapped_obstacle_points) + self.dynamic_robot_obstacle_points_for_robot(index),
+                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius)
+                + self.dynamic_robot_obstacle_points_for_robot(index),
                 use_ground_truth=True,
             )
             if prediction_report is not None and getattr(prediction_report, "collision", False):
@@ -7436,7 +7450,7 @@ class SimulationControllerMixin:
             local_path_report = self.collision_checker.check_segment_points(
                 start=robot_position,
                 end=target,
-                obstacle_points=self.mapped_obstacle_points,
+                obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
                 robot_radius=robot_radius,
             )
 
@@ -7459,7 +7473,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=list(self.mapped_obstacle_points),
+                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
                 use_ground_truth=True,
             )
             if predicted_report is not None and getattr(predicted_report, "collision", False):
@@ -8421,13 +8435,17 @@ class SimulationControllerMixin:
             # route_first_segment_blocked() wrapper) so the full
             # CollisionReport survives for the navigation debug snapshot --
             # same single computation either way.
+            #
+            # obstacle_points_for_segment_safety_check(), matching the main
+            # route-acceptance path in apply_route_result() -- see that
+            # method's docstring for why the raw list must never be used here.
             robot_xy_now = (float(self.robot.x), float(self.robot.y)) if self.robot is not None else None
             first_segment_report = (
                 _evaluate_route_first_segment(
                     self.collision_checker,
                     robot_xy_now,
                     clean_waypoints[0],
-                    list(self.mapped_obstacle_points),
+                    self.obstacle_points_for_segment_safety_check(robot_xy_now, self.safety_radius()),
                     self.safety_radius(),
                 )
                 if robot_xy_now is not None

@@ -752,6 +752,28 @@ class SimulationControllerMixin:
         self.push_discovered_hazard_frame()
         self._discovered_hazard_render_dirty = False
 
+    def _publish_explored_area_source_to_canvas(self) -> None:
+        """Point the canvas at this run's live belief_map.explored_by_robot
+        mask -- the authoritative source rebuild_explored_area_cache() uses
+        to reconstruct the visible explored-area layer after any cache
+        invalidation (theme toggle/resize/pan-zoom), instead of the bounded
+        explored_area_polygons history (see EXPLORED_POLYGON_HISTORY_LIMIT).
+
+        Call once per fresh run, right after reset_belief_map() replaces
+        self.belief_map with a new instance, so the canvas is never left
+        pointing at a previous run's (already-replaced) BeliefMap -- see
+        this method's callers. canvas.set_explored_area_seed() keeps only
+        the ndarray reference (no copy), and belief_map's own mutating
+        methods write into it in place, so this needs calling only once per
+        BeliefMap instance, not once per tick. See canvas.
+        set_explored_area_seed()'s docstring for the full contract.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        belief = self.belief_map
+        canvas.set_explored_area_seed(belief.explored_by_robot, belief.resolution, belief.bounds)
+
     def ensure_belief_map(self) -> BeliefMap:
         """Return the active belief map, creating it if needed."""
         if not hasattr(self, "belief_map") or self.belief_map is None:
@@ -5834,9 +5856,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
@@ -5976,9 +5999,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.record_explored_area(force=True)
         self.update_sensed_obstacles(force_status=False)
         self.force_robot_pose_free_in_belief(None)
@@ -6078,9 +6102,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
 

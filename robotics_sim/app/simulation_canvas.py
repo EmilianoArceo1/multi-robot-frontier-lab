@@ -306,16 +306,24 @@ class SimulationCanvas(QWidget):
         self._explored_area_cached_count = 0
         self._explored_area_caches_by_robot: dict[int, QPixmap] = {}
         self._explored_area_cache_sizes_by_robot: dict[int, QSize] = {}
-        # A restored belief_map.explored_by_robot mask, replayed first
-        # whenever the live explored-area cache rebuilds (resize/pan/zoom/
-        # set_explored_area_polygons([])) -- see set_explored_area_seed() /
-        # engine.restore_navigation_debug_snapshot(). Without this, a
-        # restore's authoritative belief_map.explored_by_robot stays intact
-        # while the cosmetic explored-area trail (bounded to the last
+        # The authoritative source rebuild_explored_area_cache() replays
+        # whenever the live explored-area cache is invalidated (theme
+        # toggle/resize/pan-zoom/set_explored_area_polygons([])) -- see
+        # set_explored_area_seed(). Two lifecycles share this field:
+        # engine.py publishes the LIVE belief_map.explored_by_robot mask
+        # here once per fresh run (see engine._publish_explored_area_
+        # source_to_canvas()), so it always reflects current coverage with
+        # no copying; engine.restore_navigation_debug_snapshot() publishes
+        # the just-restored mask the same way. Without this, the
+        # authoritative belief_map.explored_by_robot stays correct while
+        # the cosmetic explored-area trail (bounded to the last
         # EXPLORED_POLYGON_HISTORY_LIMIT sensor sweeps) visibly resets to
-        # nothing, even though nothing was actually un-explored. None until
-        # a restore seeds it; cleared on a fresh run (start_simulation()/
-        # reset_simulation()/start_multi_robot_simulation()).
+        # nothing on the next rebuild, even though nothing was actually
+        # un-explored. Read-only -- the canvas never writes into this
+        # array. None until a run publishes one; reset to the new run's
+        # own (empty) mask on a fresh run (start_simulation()/reset_
+        # simulation()/start_multi_robot_simulation()) -- never left
+        # pointing at a previous run's replaced BeliefMap.
         self._explored_area_seed_mask: np.ndarray | None = None
         self._explored_area_seed_resolution: float | None = None
         self._explored_area_seed_bounds: tuple[float, float, float, float] | None = None
@@ -642,16 +650,42 @@ class SimulationCanvas(QWidget):
         resolution: float,
         bounds: tuple[float, float, float, float],
     ) -> None:
-        """Seed the live explored-area cache from a restored belief_map.
-        explored_by_robot mask -- see engine.restore_navigation_debug_
-        snapshot()'s docstring.
+        """Point the live explored-area cache at an authoritative
+        belief_map.explored_by_robot mask -- the source rebuild_explored_
+        area_cache() replays whenever the cache is invalidated (theme
+        toggle/resize/pan-zoom -- see invalidate_explored_area_cache()).
+
+        Not exclusively a restored-snapshot seed: engine.py calls this once
+        per fresh run too, right after (re)creating BeliefMap (see engine.
+        _publish_explored_area_source_to_canvas()), passing the run's LIVE,
+        continuously-updated mask -- not a one-shot snapshot. The canvas
+        keeps only this ndarray reference (never copies it -- see
+        clear_explored_area_seed()), and every mutating belief_map update
+        (mark_free_cell/mark_occupied_cell/mark_visible_polygon/etc.)
+        writes into it in place, so a later rebuild always sees current
+        coverage with no extra wiring per tick. engine.restore_navigation_
+        debug_snapshot() calls this too, with a just-restored mask, for the
+        same underlying reason: without it, the authoritative belief.
+        explored_by_robot stays correct while the cosmetic sensor-sweep
+        trail (explored_area_polygons, bounded to EXPLORED_POLYGON_
+        HISTORY_LIMIT entries) visibly resets to nothing on the next
+        rebuild, even though nothing was actually un-explored.
 
         Unlike painting a one-shot pixmap, this persists across cache
         rebuilds (resize/pan/zoom/set_explored_area_polygons([])):
         rebuild_explored_area_cache() replays this mask first, every time,
         exactly like the historical-replay view already replays a frozen
-        mask (see _draw_historical_explored_area()). Live sensor sweeps
-        recorded after the restore are then painted on top of it as usual.
+        mask (see _draw_historical_explored_area()). For a single-robot
+        mask (shape[0] == 1) this rebuilds the combined cache directly from
+        the mask -- explored_area_polygons is not replayed on top of it,
+        since the mask already is the complete authoritative state. For a
+        multi-robot mask (shape[0] > 1) each robot's slice rebuilds that
+        robot's own attributed cache (_explored_area_caches_by_robot), so
+        one robot's coverage never depends on another robot's cache already
+        existing. Live sensor sweeps recorded after this call are then
+        painted on top as usual (see append_explored_area_polygon()).
+
+        The canvas never writes into `mask` -- it is a read-only reference.
         """
         self._explored_area_seed_mask = mask
         self._explored_area_seed_resolution = float(resolution)
@@ -851,17 +885,22 @@ class SimulationCanvas(QWidget):
         if len(self.explored_area_polygons) > EXPLORED_POLYGON_HISTORY_LIMIT:
             self.explored_area_polygons = self.explored_area_polygons[-EXPLORED_POLYGON_HISTORY_LIMIT:]
 
+        # A stale cache (invalidate_explored_area_cache() -- theme toggle,
+        # resize, pan/zoom) means whatever is cached, combined or
+        # per-robot, no longer matches this canvas size and must be rebuilt
+        # from the authoritative source (the seed mask, if set -- see
+        # rebuild_explored_area_cache()) before this new footprint is
+        # painted on top. Without this, the FIRST append after an
+        # invalidation would create/paint only its own (this robot's)
+        # cache from scratch, and draw_explored_area_trace() would then
+        # show only that one cache -- silently hiding every other robot's,
+        # or the seed mask's, still-uncached coverage.
+        if self._explored_area_cache is None or self._explored_area_cache_size != self.size():
+            self.rebuild_explored_area_cache()
+
+        self.paint_explored_polygon_to_cache(polygon_copy, robot_index=robot_index)
         if robot_index is None:
-            if (
-                self._explored_area_cache is None
-                or self._explored_area_cache_size != self.size()
-            ):
-                self.rebuild_explored_area_cache()
-            else:
-                self.paint_explored_polygon_to_cache(polygon_copy, robot_index=None)
-                self._explored_area_cached_count = len(self.explored_area_polygons)
-        else:
-            self.paint_explored_polygon_to_cache(polygon_copy, robot_index=int(robot_index))
+            self._explored_area_cached_count = len(self.explored_area_polygons)
 
         self.update()
 
@@ -1990,6 +2029,41 @@ class SimulationCanvas(QWidget):
             return min(255, int(light_alpha * 2.8))
         return light_alpha
 
+    def _paint_explored_mask_layer_to_cache(
+        self,
+        cache_painter: QPainter,
+        layer: np.ndarray,
+        resolution: float,
+        bounds: tuple[float, float, float, float],
+        *,
+        color: QColor,
+        cell_bounds: tuple[int, int, int, int],
+    ) -> None:
+        """Rasterize one 2D boolean explored-mask layer (one robot's slice)
+        into screen space with an already-alpha'd color.
+
+        Shared by _paint_explored_mask_to_cache() (draws every robot layer
+        of a mask into the SAME pixmap -- historical replay / single-robot
+        seed) and _paint_explored_mask_robot_slice_to_cache() (draws one
+        robot's layer into that robot's own attributed cache -- live
+        multi-robot seed rebuild).
+        """
+        x_min, _x_max, y_min, _y_max = bounds
+        col_start, col_end, row_start, row_end = cell_bounds
+        cache_painter.setBrush(QBrush(color))
+        rows, cols = np.where(layer[row_start:row_end + 1, col_start:col_end + 1])
+        for local_row, local_col in zip(rows, cols):
+            row = row_start + int(local_row)
+            col = col_start + int(local_col)
+            x0 = x_min + col * resolution
+            y0 = y_min + row * resolution
+            sx0, sy0 = self.world_to_screen(x0, y0)
+            sx1, sy1 = self.world_to_screen(x0 + resolution, y0 + resolution)
+            cache_painter.drawRect(QRectF(
+                min(sx0, sx1), min(sy0, sy1),
+                abs(sx1 - sx0), abs(sy1 - sy0),
+            ))
+
     def _paint_explored_mask_to_cache(
         self,
         cache_painter: QPainter,
@@ -2000,35 +2074,53 @@ class SimulationCanvas(QWidget):
         alpha: int,
     ) -> None:
         """Per-cell rasterization of an explored_by_robot boolean mask into
-        screen space -- shared by _draw_historical_explored_area() (frozen
-        replay of a selected history snapshot) and rebuild_explored_area_
-        cache() (replaying a restored-run seed; see set_explored_area_seed()).
+        screen space, one robot layer at a time, all into the SAME pixmap
+        -- shared by _draw_historical_explored_area() (frozen replay of a
+        selected history snapshot) and rebuild_explored_area_cache()'s
+        single-robot branch (replaying the live seed; see
+        set_explored_area_seed()). For a live multi-robot mask that needs
+        per-robot attributed caches instead, see
+        _paint_explored_mask_robot_slice_to_cache().
         """
-        x_min, _x_max, y_min, _y_max = bounds
         cell_bounds = self._grid_overlay_cell_bounds(
             resolution, {"grid": mask[0], "bounds": bounds, "resolution": resolution}
         )
         if cell_bounds is None:
             return
-        col_start, col_end, row_start, row_end = cell_bounds
         cache_painter.setPen(Qt.NoPen)
         for robot_index in range(mask.shape[0]):
             color = QColor(BLUE) if mask.shape[0] == 1 else robot_color(robot_index)
             color.setAlpha(alpha)
-            cache_painter.setBrush(QBrush(color))
-            robot_mask = mask[robot_index]
-            rows, cols = np.where(robot_mask[row_start:row_end + 1, col_start:col_end + 1])
-            for local_row, local_col in zip(rows, cols):
-                row = row_start + int(local_row)
-                col = col_start + int(local_col)
-                x0 = x_min + col * resolution
-                y0 = y_min + row * resolution
-                sx0, sy0 = self.world_to_screen(x0, y0)
-                sx1, sy1 = self.world_to_screen(x0 + resolution, y0 + resolution)
-                cache_painter.drawRect(QRectF(
-                    min(sx0, sx1), min(sy0, sy1),
-                    abs(sx1 - sx0), abs(sy1 - sy0),
-                ))
+            self._paint_explored_mask_layer_to_cache(
+                cache_painter, mask[robot_index], resolution, bounds,
+                color=color, cell_bounds=cell_bounds,
+            )
+
+    def _paint_explored_mask_robot_slice_to_cache(
+        self,
+        cache_painter: QPainter,
+        mask: np.ndarray,
+        robot_index: int,
+        resolution: float,
+        bounds: tuple[float, float, float, float],
+        *,
+        alpha: int,
+    ) -> None:
+        """Rasterize a single robot's slice of a live multi-robot
+        explored_by_robot mask into that robot's own attributed cache --
+        see rebuild_explored_area_cache()'s multi-robot branch."""
+        cell_bounds = self._grid_overlay_cell_bounds(
+            resolution, {"grid": mask[0], "bounds": bounds, "resolution": resolution}
+        )
+        if cell_bounds is None:
+            return
+        color = robot_color(robot_index)
+        color.setAlpha(alpha)
+        cache_painter.setPen(Qt.NoPen)
+        self._paint_explored_mask_layer_to_cache(
+            cache_painter, mask[robot_index], resolution, bounds,
+            color=color, cell_bounds=cell_bounds,
+        )
 
     def rebuild_explored_area_cache(self):
         cache = QPixmap(self.size())
@@ -2036,24 +2128,68 @@ class SimulationCanvas(QWidget):
         self._explored_area_cache = cache
         self._explored_area_cache_size = QSize(self.size())
         self._explored_area_cached_count = 0
+        self._explored_area_caches_by_robot = {}
+        self._explored_area_cache_sizes_by_robot = {}
 
-        if self._explored_area_seed_mask is not None:
+        mask = self._explored_area_seed_mask
+
+        if mask is not None and mask.shape[0] > 1:
+            # Multi-robot: each robot gets its own attributed cache,
+            # rebuilt straight from its own slice of the live authoritative
+            # mask, so historical coverage never depends on the bounded
+            # explored_area_polygons history (see EXPLORED_POLYGON_
+            # HISTORY_LIMIT) or on another robot's cache already existing.
+            # explored_area_polygons is not replayed here -- it is not
+            # reliably attributable per robot, and the mask already is the
+            # complete authoritative state (new sweeps still paint on top
+            # afterwards -- see append_explored_area_polygon()).
+            for robot_index in range(mask.shape[0]):
+                robot_cache = QPixmap(self.size())
+                robot_cache.fill(Qt.transparent)
+                cache_painter = QPainter(robot_cache)
+                cache_painter.save()
+                cache_painter.setClipRect(self.plot_rect())
+                self._paint_explored_mask_robot_slice_to_cache(
+                    cache_painter,
+                    mask,
+                    robot_index,
+                    self._explored_area_seed_resolution,
+                    self._explored_area_seed_bounds,
+                    alpha=self._explored_area_alpha(24),
+                )
+                cache_painter.restore()
+                cache_painter.end()
+                self._explored_area_caches_by_robot[robot_index] = robot_cache
+                self._explored_area_cache_sizes_by_robot[robot_index] = QSize(self.size())
+            return
+
+        if mask is not None:
+            # Single-robot: the mask already represents the complete
+            # authoritative coverage, so it alone rebuilds the cache --
+            # explored_area_polygons (bounded to EXPLORED_POLYGON_HISTORY_
+            # LIMIT sweeps) is not replayed on top of it here, only
+            # afterwards for new sweeps (see append_explored_area_polygon()).
             cache_painter = QPainter(cache)
             cache_painter.save()
             cache_painter.setClipRect(self.plot_rect())
             self._paint_explored_mask_to_cache(
                 cache_painter,
-                self._explored_area_seed_mask,
+                mask,
                 self._explored_area_seed_resolution,
                 self._explored_area_seed_bounds,
                 alpha=self._explored_area_alpha(24),
             )
             cache_painter.restore()
             cache_painter.end()
+            self._explored_area_cached_count = len(self.explored_area_polygons)
+            return
 
+        # Legacy fallback: no authoritative mask has ever been published
+        # (see set_explored_area_seed()'s docstring) -- e.g. isolated
+        # tests/callers that only ever set polygons directly. Replay the
+        # bounded polygon history exactly as before.
         for polygon in self.explored_area_polygons:
             self.paint_explored_polygon_to_cache(polygon)
-
         self._explored_area_cached_count = len(self.explored_area_polygons)
 
     def ensure_robot_explored_area_cache(self, robot_index: int) -> QPixmap:
@@ -3006,22 +3142,30 @@ class SimulationCanvas(QWidget):
         if not self.config.show_explored_area:
             return
 
-        painter.save()
+        if (
+            not self.explored_area_polygons
+            and self._explored_area_seed_mask is None
+            and not self._explored_area_caches_by_robot
+            and self._explored_area_cache is None
+        ):
+            return
 
+        # ensure_explored_area_cache() (re)builds from the authoritative
+        # seed mask when stale (see rebuild_explored_area_cache()) -- for a
+        # multi-robot mask this populates _explored_area_caches_by_robot as
+        # a side effect, so that dict must be read AFTER this call, not
+        # before it: checking it first would see a stale/just-invalidated
+        # empty dict and fall through to the combined cache, missing the
+        # per-robot coverage the rebuild below is about to produce.
+        self.ensure_explored_area_cache()
+
+        painter.save()
         if self._explored_area_caches_by_robot:
             for robot_index in sorted(self._explored_area_caches_by_robot):
                 cache = self._explored_area_caches_by_robot.get(robot_index)
                 if cache is not None:
                     painter.drawPixmap(0, 0, cache)
-            painter.restore()
-            return
-
-        if not self.explored_area_polygons and self._explored_area_seed_mask is None:
-            painter.restore()
-            return
-
-        self.ensure_explored_area_cache()
-        if self._explored_area_cache is not None:
+        elif self._explored_area_cache is not None:
             painter.drawPixmap(0, 0, self._explored_area_cache)
         painter.restore()
 

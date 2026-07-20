@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import numbers
 from typing import Iterable
 
 import numpy as np
@@ -33,6 +34,23 @@ from robotics_sim.environment.grid_geometry import GridCell, GridGeometry
 UNKNOWN = -1
 FREE = 0
 OCCUPIED = 1
+
+
+def _validate_initial_revision(value) -> int:
+    """Accept only a real, non-boolean integer (numpy integers included --
+    bool is a subclass of int in Python, so isinstance(x, int) alone would
+    otherwise wrongly accept it). Rejects float/str/None/negative values.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(
+            f"initial_revision must be a non-boolean integer, got {value!r} ({type(value).__name__})."
+        )
+
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"initial_revision must be >= 0, got {value!r}.")
+
+    return result
 
 
 def _point_inside_polygon(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
@@ -90,6 +108,7 @@ class BeliefMap:
         bounds: tuple[float, float, float, float],
         resolution: float,
         robot_count: int = 1,
+        initial_revision: int = 0,
     ):
         self.geometry = GridGeometry(bounds, resolution)
 
@@ -106,14 +125,42 @@ class BeliefMap:
         self.visit_count = np.zeros((self.height, self.width), dtype=np.uint16)
         self.explored_by_robot = np.zeros((self.robot_count, self.height, self.width), dtype=bool)
         self.last_seen = np.full((self.height, self.width), -1.0, dtype=np.float32)
-        # Monotonic visual-state revision used by immutable debug replay.
-        # It changes only when occupancy or per-robot explored masks change,
-        # not for visit-count/last-seen updates that do not alter rendering.
-        self.revision = 0
+        # Monotonic visual-state revision used by immutable debug replay and
+        # by ExplorationMapSnapshot producers (see snapshot()). It changes
+        # only when occupancy or per-robot explored masks change, not for
+        # visit-count/last-seen updates that do not alter rendering. Private
+        # so external code cannot silently desynchronize it from the grid it
+        # is meant to describe -- see revision property and restore_grid_
+        # state() (the one place besides this class's own methods that
+        # legitimately needs to bump it, for navigation-debug-snapshot
+        # restore's wholesale array replacement).
+        #
+        # initial_revision defaults to 0 for a standalone/first-ever
+        # BeliefMap. A host that REPLACES one BeliefMap instance with a new
+        # one (see engine.py's reset_belief_map()) must seed the new
+        # instance's starting revision at old_revision + 1, so the overall
+        # exploration-map revision sequence a consumer observes (e.g. via
+        # PlanningCostmapSnapshot.source_revisions) never goes backwards
+        # just because the underlying object was replaced.
+        self._grid_revision = _validate_initial_revision(initial_revision)
 
     @property
     def bounds(self) -> tuple[float, float, float, float]:
         return self.geometry.bounds
+
+    @property
+    def revision(self) -> int:
+        """Read-only. Starts at 0, increases monotonically for the life of
+        this BeliefMap instance whenever a mutating operation writes or
+        attempts to write self.grid (mark_free_cell/force_free_cell/
+        mark_occupied_cell/reset/restore_grid_state -- mark_visible_polygon/
+        mark_occupied_points call into mark_free_cell/mark_occupied_cell, so
+        they are covered too). Does not depend on the number of known
+        cells -- two BeliefMaps with identical grid content do not
+        necessarily share a revision, and this counter is never derived
+        from a cell count.
+        """
+        return self._grid_revision
 
     def reset(self, robot_count: int | None = None) -> None:
         if robot_count is not None and int(robot_count) != self.robot_count:
@@ -124,7 +171,49 @@ class BeliefMap:
         self.visit_count.fill(0)
         self.explored_by_robot.fill(False)
         self.last_seen.fill(-1.0)
-        self.revision += 1
+        self._grid_revision += 1
+
+    def restore_grid_state(
+        self,
+        *,
+        grid: np.ndarray,
+        explored_by_robot: np.ndarray,
+        visit_count: np.ndarray,
+        last_seen: np.ndarray,
+    ) -> None:
+        """Wholesale-replace the belief's internal arrays and bump revision
+        by exactly one.
+
+        Used only by navigation-debug-snapshot restore, which replays a
+        captured historical frame (grid/explored_by_robot/visit_count/
+        last_seen together) rather than incremental per-cell updates -- the
+        caller already owns shape validation against the live arrays before
+        calling this. Always bumps once per call rather than comparing
+        old/new content: the caller is restoring a specific historical
+        revision, which must be distinguishable from whatever revision
+        preceded the restore even on the (rare) chance the restored content
+        happens to be byte-identical.
+        """
+        self.grid = grid
+        self.explored_by_robot = explored_by_robot
+        self.visit_count = visit_count
+        self.last_seen = last_seen
+        self._grid_revision += 1
+
+    def snapshot(self) -> "ExplorationMapSnapshot":
+        """Immutable ExplorationMapSnapshot of the current grid/bounds/
+        resolution/revision. The grid array is copied and frozen by
+        ExplorationMapSnapshot's own contract (see map_snapshots.py) --
+        this does not duplicate that freezing logic here.
+        """
+        from robotics_sim.environment.map_snapshots import ExplorationMapSnapshot
+
+        return ExplorationMapSnapshot(
+            grid=self.grid,
+            bounds=self.bounds,
+            resolution=self.resolution,
+            revision=self.revision,
+        )
 
     # ------------------------------------------------------------------
     # Coordinate conversion
@@ -187,7 +276,7 @@ class BeliefMap:
             self.last_seen[row, col] = float(time_s)
 
         if changed:
-            self.revision += 1
+            self._grid_revision += 1
 
     def force_free_cell(
         self,
@@ -218,7 +307,7 @@ class BeliefMap:
             self.last_seen[row, col] = float(time_s)
 
         if changed:
-            self.revision += 1
+            self._grid_revision += 1
         return bool(changed)
 
     def force_free_point(
@@ -242,7 +331,7 @@ class BeliefMap:
         if time_s is not None:
             self.last_seen[row, col] = float(time_s)
         if changed:
-            self.revision += 1
+            self._grid_revision += 1
 
     def mark_visible_polygon(
         self,

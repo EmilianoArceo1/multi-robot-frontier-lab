@@ -18,6 +18,7 @@ import functools
 import json
 import logging
 import math
+import numbers
 import os
 import time
 import zlib
@@ -681,18 +682,43 @@ class SimulationControllerMixin:
                     for source in previous_service.sources()
                 ]
 
+        # A new BeliefMap object replaces self.belief_map on every reset, but
+        # its revision must never regress just because the underlying
+        # instance changed -- a consumer that saw revision 850 before a
+        # reset must never see revision 0 after it. The first-ever creation
+        # (no previous belief_map) legitimately starts at 0; every later
+        # replacement seeds strictly above whatever the outgoing instance
+        # had reached. Never derived from known-cell count, wall-clock time,
+        # object id, a hash, or robot_count.
+        previous_belief = getattr(self, "belief_map", None)
+        next_initial_revision = 0 if previous_belief is None else previous_belief.revision + 1
+
         self.belief_map = BeliefMap(
             bounds=(WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX),
             resolution=max(float(self.config.grid_resolution), 0.10),
             robot_count=max(1, int(robot_count)),
+            initial_revision=next_initial_revision,
         )
         self.explored_free_points = set()
         # Dense, visible obstacle-boundary samples. This is intentionally
         # separate from belief_map.grid OCCUPIED cells; the grid is logical,
         # while these samples preserve the obstacle contour for rendering and
         # local safety checks.
+        #
+        # mapped_obstacle_revision is a monotonic counter for this list's
+        # content, owned by this host object (there is no per-scenario
+        # object like BeliefMap to own it) -- see observed_obstacle_
+        # snapshot(). It is NOT reset to 0 here: a reset that actually
+        # clears prior points is itself a content change and must bump it
+        # forward, not restart it, so a consumer holding an old revision
+        # number never mistakes a post-reset state for one it already saw.
+        had_mapped_obstacle_points = bool(getattr(self, "mapped_obstacle_points", None))
         self.mapped_obstacle_points = []
         self.mapped_obstacle_point_keys: set[tuple[float, float]] = set()
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+        elif had_mapped_obstacle_points:
+            self.mapped_obstacle_revision += 1
 
         # Dynamic hazards are a parallel layer aligned with the belief map.
         # Recreating the service here gives start/reset the required ephemeral
@@ -940,6 +966,70 @@ class SimulationControllerMixin:
                 (round(float(p[0]), 3), round(float(p[1]), 3))
                 for p in self.mapped_obstacle_points
             }
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+
+    def observed_obstacle_snapshot(self) -> "ObservedObstacleSnapshot":
+        """Immutable snapshot of the shared, unprocessed observed-obstacle
+        geometry: mapped_obstacle_points as-is.
+
+        Deliberately excludes dynamic robot points, hazard points, and
+        ground-truth obstacles -- those are separate contracts/layers.
+        Per-robot sanitization (see sanitize_planner_obstacle_points())
+        still happens later, against this same shared source; this
+        snapshot is upstream of that, not a replacement for it.
+        """
+        from robotics_sim.environment.map_snapshots import ObservedObstacleSnapshot
+
+        belief = self.ensure_belief_map()
+        return ObservedObstacleSnapshot(
+            points=tuple(getattr(self, "mapped_obstacle_points", ())),
+            bounds=belief.bounds,
+            resolution=belief.resolution,
+            revision=int(getattr(self, "mapped_obstacle_revision", 0)),
+            source="mapped_obstacle_points",
+        )
+
+    def _truncate_mapped_obstacle_points(self, count: int) -> bool:
+        """Truncate self.mapped_obstacle_points to its own first `count`
+        points and bump mapped_obstacle_revision exactly once if that
+        changed the content. Returns True if it changed, False otherwise.
+
+        mapped_obstacle_points is append-only at runtime (see update_sensed_
+        obstacles()), so `count` is always a request for a plain PREFIX of
+        the current list -- comparing lengths before/after is equivalent to
+        comparing content for this specific operation. The single caller
+        today is navigation-debug-snapshot restore (truncating back to the
+        boundary-sample count captured at a historical revision), but
+        nothing here is specific to that caller.
+
+        count is validated as a real, non-boolean integer (a caller bug --
+        e.g. a float or a string -- raises TypeError). A NEGATIVE count is
+        clamped to 0 rather than rejected: count is expected to come from a
+        persisted snapshot field that could in principle be corrupted or
+        predate this field existing, and "truncate to nothing" is a safe,
+        recoverable interpretation of a bad count -- unlike raising and
+        aborting the caller's whole restore.
+        """
+        if isinstance(count, bool) or not isinstance(count, numbers.Integral):
+            raise TypeError(f"count must be a non-boolean integer, got {count!r} ({type(count).__name__}).")
+
+        normalized_count = max(0, int(count))
+        previous_points = getattr(self, "mapped_obstacle_points", [])
+        previous_length = len(previous_points)
+
+        self.mapped_obstacle_points = list(previous_points[:normalized_count])
+        self.mapped_obstacle_point_keys = {
+            (round(float(p[0]), 3), round(float(p[1]), 3)) for p in self.mapped_obstacle_points
+        }
+
+        changed = len(self.mapped_obstacle_points) != previous_length
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+        elif changed:
+            self.mapped_obstacle_revision += 1
+
+        return changed
 
     # CONFIG
     # ========================================================
@@ -4632,11 +4722,12 @@ class SimulationControllerMixin:
         # so average_seen_penalty()/stats() (revisit_ratio, etc.) read the
         # exact historical values instead of whatever the live run had
         # accumulated past this point.
-        belief.grid = grid
-        belief.explored_by_robot = explored
-        belief.visit_count = visit_count
-        belief.last_seen = last_seen
-        belief.revision += 1
+        belief.restore_grid_state(
+            grid=grid,
+            explored_by_robot=explored,
+            visit_count=visit_count,
+            last_seen=last_seen,
+        )
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
         self.sync_legacy_map_views_from_belief()
@@ -4732,12 +4823,11 @@ class SimulationControllerMixin:
         # 5. mapped_obstacle_points is append-only at runtime (see
         # update_sensed_obstacles()), so truncating to the snapshot's own
         # count reproduces the exact boundary-sample set known at capture
-        # time without needing to store the points themselves.
-        count = max(0, int(snapshot.mapped_obstacle_points_count))
-        self.mapped_obstacle_points = list(self.mapped_obstacle_points[:count])
-        self.mapped_obstacle_point_keys = {
-            (round(float(p[0]), 3), round(float(p[1]), 3)) for p in self.mapped_obstacle_points
-        }
+        # time without needing to store the points themselves. See
+        # _truncate_mapped_obstacle_points() for the mapped_obstacle_
+        # revision policy this applies (bumped once iff content changed,
+        # never `revision = count`).
+        self._truncate_mapped_obstacle_points(int(snapshot.mapped_obstacle_points_count))
 
         # 6. Cosmetic trails. The bounded sensor-sweep polygon list itself
         # (self.explored_area_polygons, capped to EXPLORED_POLYGON_HISTORY_
@@ -6477,6 +6567,8 @@ class SimulationControllerMixin:
                 (round(float(p[0]), 3), round(float(p[1]), 3))
                 for p in self.mapped_obstacle_points
             }
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
 
         spacing = max(float(self.config.mapping_point_spacing), 0.015)
         quantization = spacing
@@ -6515,6 +6607,7 @@ class SimulationControllerMixin:
         _record_perf(self, "obstacle_extract", time.perf_counter() - _obstacle_extract_perf_start)
 
         if newly_mapped:
+            self.mapped_obstacle_revision += 1
             _belief_update_perf_start = time.perf_counter()
             changed_cells = belief.mark_occupied_points(
                 newly_mapped,

@@ -430,6 +430,11 @@ def _build_fake_engine(
         "_invalidate_all_prefetch_requests",
         "_restore_final_goal_into_config_and_widgets",
         "final_goal_xy",
+        # restore_navigation_debug_snapshot() now truncates mapped_obstacle_
+        # points via this real helper (see engine.py) instead of an inline
+        # copy of its policy -- bound here so this fixture keeps exercising
+        # the real restore path end to end.
+        "_truncate_mapped_obstacle_points",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     fake.agent = agent

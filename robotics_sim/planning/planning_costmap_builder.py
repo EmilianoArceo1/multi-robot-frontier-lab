@@ -1,14 +1,19 @@
 """Internal builder that unifies planning-costmap construction.
 
-Not connected to runtime yet. This is the first version of a single
-composition point meant to eventually replace the several independent ways
-the simulator currently derives a discrete planning grid (see
+Not connected to runtime yet. This is a composition point meant to
+eventually replace the several independent ways the simulator currently
+derives a discrete planning grid (see
 robotics_sim/tests/test_planning_map_characterization.py for the
-characterized divergences). It must reproduce today's runtime behavior
-exactly before any later phase changes what that behavior is.
+characterized divergences). It reproduces today's runtime composition
+order and inflation policy, with ONE deliberate, documented divergence:
+legacy exploration-belief OCCUPIED cells are no longer treated as physical
+obstacle occupancy (see "Legacy belief occupancy vs. observed obstacle
+geometry" below). Every other aspect -- hazard projection, observed-
+obstacle-point inflation, composition order, canonical geometry -- still
+matches build_planning_grid_for_robot() exactly.
 
-Reference contract this reproduces
------------------------------------
+Reference contract this reproduces (with one intentional divergence)
+----------------------------------------------------------------------
 ``SimulationControllerMixin.build_planning_grid_for_robot()``
 (robotics_sim/simulation/engine.py) currently does, in order:
 
@@ -20,22 +25,59 @@ Reference contract this reproduces
        belief-OCCUPIED cell centers through add_obstacle_points(padding=
        inflate_radius) when inflate_radius > 0, or marks them OCCUPIED
        directly (no inflation) when inflate_radius <= 0.
+       ** This builder does NOT reproduce that OCCUPIED-cell handling. **
+       See "Legacy belief occupancy vs. observed obstacle geometry" below.
     3. if obstacle_points: planning_grid.add_obstacle_points(obstacle_points,
            padding=radius)
        -- obstacle_points is whatever the CALLER already decided to project
        (already sanitized upstream by sanitize_planner_obstacle_points() --
-       this builder does not sanitize; see "Sanitization" below).
+       this builder does not sanitize; see "Sanitization" below). This step
+       IS reproduced exactly.
     4. if hazard_service: apply_hazard_belief_to_planning_grid(planning_grid,
            hazard_service.belief, block_threshold=..., inflate_radius=radius)
        -- discovered-only hazard belief, never ground-truth HazardField.
+       This step IS reproduced exactly.
 
 The SAME ``radius`` value (robot's effective safety radius,
-safety_radius_for_robot()) is used for all three inflation points above.
-This builder mirrors that: PlanningCostmapPolicy.obstacle_padding is that
-one shared value, applied identically to belief-occupied inflation,
-observed-obstacle-point inflation, and hazard inflation. Nothing arrives
-"pre-inflated" into this builder -- every source is inflated inside build(),
-exactly once, by the same policy value, matching current runtime.
+safety_radius_for_robot()) is used for steps 3-4 above. This builder
+mirrors that: PlanningCostmapPolicy.obstacle_padding is that one shared
+value, applied identically to observed-obstacle-point inflation and hazard
+inflation. It is no longer applied to exploration-grid projection at all --
+there is nothing left there to inflate (see below). Nothing arrives
+"pre-inflated" into this builder -- every physical-occupancy source is
+inflated inside build(), exactly once, by the same policy value.
+
+Legacy belief occupancy vs. observed obstacle geometry
+----------------------------------------------------------
+ExplorationMapSnapshot.grid's OCCUPIED=1 cells record that the team's
+belief map *once* marked a cell occupied, from whatever heuristic
+BeliefMap itself currently uses to set that state -- which is not
+necessarily confirmed obstacle geometry. Conflating that belief state with
+physical occupancy is exactly the coupling this migration is separating
+out. So this builder treats BOTH FREE=0 and OCCUPIED=1 exploration cells as
+"observed and traversable" when projecting the base grid -- neither one
+places a physical obstacle by itself. Only two things ever mark a cell as
+physically blocked in this builder's output:
+
+    - ObservedObstacleSnapshot.points, inflated by obstacle_padding (via
+      OccupancyGrid.add_obstacle_points()) -- unchanged from before.
+    - Observed HazardBeliefFrame cells at/above hazard_block_threshold,
+      inflated by obstacle_padding (via
+      apply_hazard_belief_to_planning_grid()) -- unchanged from before.
+
+UNKNOWN=-1 cells are unaffected by this change: they still resolve to
+traversable or blocked purely from policy.unknown_is_traversable, exactly
+as before -- this divergence only changes what happens to OCCUPIED=1.
+
+This is an intentional behavior change from build_planning_grid_for_robot()
+today, not a bug: a robot's live BeliefMap can carry OCCUPIED cells that
+this builder now routes through as traversable unless
+ObservedObstacleSnapshot (or hazard) independently confirms occupancy
+there. See
+test_builder_intentionally_ignores_legacy_belief_occupancy_without_observed_geometry
+in the test file for the exact contract. PlanningCostmapBuilder is still
+not connected to runtime (see top of this docstring), so this divergence
+has no effect on simulator behavior yet.
 
 Inputs are the Phase 1 snapshot contracts
 ------------------------------------------
@@ -90,7 +132,6 @@ from robotics_sim.environment.map_snapshots import (
 )
 from robotics_sim.environment.occupancy_grid import (
     FREE as OG_FREE,
-    OCCUPIED as OG_OCCUPIED,
     UNKNOWN as OG_UNKNOWN,
     OccupancyGrid,
 )
@@ -157,10 +198,13 @@ class PlanningCostmapPolicy:
     """Explicit traversability/inflation policy for one build() call.
 
     obstacle_padding is the single shared inflation radius applied to
-    belief-occupied cells, observed obstacle points, AND hazard cells --
-    matching build_planning_grid_for_robot()'s current single `radius`
-    value (see module docstring). It corresponds to whatever the caller's
-    robot/safety radius currently resolves to
+    observed obstacle points AND hazard cells -- matching
+    build_planning_grid_for_robot()'s current single `radius` value (see
+    module docstring). It is NOT applied to legacy exploration-belief
+    OCCUPIED cells, which this builder never treats as physical occupancy
+    (see module docstring's "Legacy belief occupancy vs. observed obstacle
+    geometry"). It corresponds to whatever the caller's robot/safety radius
+    currently resolves to
     (SimulationControllerMixin.safety_radius_for_robot()) -- this policy
     object does not read that itself, the caller supplies the number.
 
@@ -299,11 +343,16 @@ def _project_exploration_grid(
     exploration: ExplorationMapSnapshot,
     *,
     unknown_is_traversable: bool,
-    obstacle_padding: float,
 ) -> OccupancyGrid:
-    """Mirrors BeliefMap.to_planning_grid() exactly (see module docstring),
-    reading cell states from an ExplorationMapSnapshot.grid array instead of
-    a live BeliefMap.grid.
+    """Projects ExplorationMapSnapshot.grid into a base OccupancyGrid.
+
+    Both FREE and legacy OCCUPIED belief cells are treated as observed and
+    traversable here -- deliberately NOT as physical occupancy (see module
+    docstring's "Legacy belief occupancy vs. observed obstacle geometry"
+    section). UNKNOWN cells are left at whatever initial_value
+    unknown_is_traversable already resolved to. Physical occupancy is
+    projected afterwards, in build(), from ObservedObstacleSnapshot.points
+    and observed hazard cells only -- never from this function.
     """
     initial_value = OG_FREE if unknown_is_traversable else OG_UNKNOWN
 
@@ -317,25 +366,11 @@ def _project_exploration_grid(
         unknown_is_traversable=unknown_is_traversable,
     )
 
-    free_rows, free_cols = np.where(exploration.grid == SNAPSHOT_FREE)
-    for row, col in zip(free_rows, free_cols):
+    observed_rows, observed_cols = np.where(
+        (exploration.grid == SNAPSHOT_FREE) | (exploration.grid == SNAPSHOT_OCCUPIED)
+    )
+    for row, col in zip(observed_rows, observed_cols):
         grid.set_value(GridCell(int(row), int(col)), OG_FREE)
-
-    occupied_rows, occupied_cols = np.where(exploration.grid == SNAPSHOT_OCCUPIED)
-    padding = max(0.0, float(obstacle_padding))
-
-    if padding > 0.0:
-        # Matches BeliefMap.cell_to_world()'s round(..., 3) exactly, so this
-        # reproduces the same rasterization BeliefMap.to_planning_grid()
-        # would have produced from the equivalent live belief.
-        occupied_points = [
-            tuple(round(v, 3) for v in grid.grid_to_world(GridCell(int(row), int(col))))
-            for row, col in zip(occupied_rows, occupied_cols)
-        ]
-        grid.add_obstacle_points(occupied_points, padding=padding)
-    else:
-        for row, col in zip(occupied_rows, occupied_cols):
-            grid.set_value(GridCell(int(row), int(col)), OG_OCCUPIED)
 
     return grid
 
@@ -359,12 +394,13 @@ class PlanningCostmapBuilder:
         _validate_matching_geometry(exploration, observed_obstacles)
         _validate_hazard_inputs(hazard_belief, hazard_geometry, exploration)
 
-        # 1. exploration belief -> base grid, with belief-occupied cells
-        #    already inflated (mirrors BeliefMap.to_planning_grid()).
+        # 1. exploration belief -> base grid. Legacy belief-OCCUPIED cells
+        #    become FREE here -- observed-but-not-independently-confirmed
+        #    occupancy is not physical occupancy (see module docstring's
+        #    "Legacy belief occupancy vs. observed obstacle geometry").
         grid = _project_exploration_grid(
             exploration,
             unknown_is_traversable=policy.unknown_is_traversable,
-            obstacle_padding=policy.obstacle_padding,
         )
 
         # 2. observed obstacle projection/inflation.

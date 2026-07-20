@@ -4,10 +4,18 @@ planning_costmap_builder.py) -- not connected to runtime yet.
 
 These pin the builder's own contract: given ExplorationMapSnapshot +
 ObservedObstacleSnapshot (+ optional HazardBeliefFrame) + a
-PlanningCostmapPolicy, it must reproduce SimulationControllerMixin.
-build_planning_grid_for_robot()'s current cell-by-cell result exactly (see
-test_builder_matches_current_runtime_planning_grid_for_same_inputs), without
-touching engine.py, Qt, config, or any live BeliefMap/HazardBelief.
+PlanningCostmapPolicy, it reproduces SimulationControllerMixin.
+build_planning_grid_for_robot()'s composition order and inflation policy,
+WITH one intentional, pinned divergence: legacy exploration-belief
+OCCUPIED cells are no longer treated as physical obstacle occupancy (see
+test_legacy_exploration_occupied_cell_does_not_block_without_observed_geometry
+and
+test_builder_intentionally_ignores_legacy_belief_occupancy_without_observed_geometry).
+Where a case's fixture also gives the same physical occupancy to
+ObservedObstacleSnapshot, builder/runtime equivalence still holds exactly
+(see test_builder_matches_current_runtime_planning_grid_for_same_inputs).
+None of this touches engine.py, Qt, config, or any live BeliefMap/
+HazardBelief.
 """
 from __future__ import annotations
 
@@ -23,10 +31,13 @@ from robotics_sim.environment.collision_checker import CollisionChecker
 from robotics_sim.environment.grid_geometry import GridCell, GridGeometry
 from robotics_sim.environment.hazard_belief import HazardBelief, HazardBeliefFrame
 from robotics_sim.environment.map_snapshots import ExplorationMapSnapshot, ObservedObstacleSnapshot
+from robotics_sim.environment.occupancy_grid import FREE as OG_FREE
 from robotics_sim.environment.occupancy_grid import OCCUPIED as OG_OCCUPIED
 from robotics_sim.environment.occupancy_grid import UNKNOWN as OG_UNKNOWN
 from robotics_sim.environment.occupancy_grid import OccupancyGrid
+from robotics_sim.planning.costmap_snapshot import FREE as COSTMAP_FREE
 from robotics_sim.planning.costmap_snapshot import OCCUPIED as COSTMAP_OCCUPIED
+from robotics_sim.planning.costmap_snapshot import UNKNOWN as COSTMAP_UNKNOWN
 from robotics_sim.planning.planning_costmap_builder import (
     PlanningCostmapBuilder,
     PlanningCostmapPolicy,
@@ -155,6 +166,156 @@ def test_basic_construction_produces_matching_geometry_and_source_revisions():
     assert result.grid.flags.writeable is False
     assert (exploration.grid == grid_before).all(), "exploration.grid must never be mutated by build()"
     assert result.source_revisions == (("exploration", 4), ("observed_obstacles", 9))
+
+
+# ---------------------------------------------------------------------------
+# 1b. Legacy exploration-belief OCCUPIED cells vs. observed obstacle
+# geometry -- the intentional separation this task introduces. See the
+# module docstring in planning_costmap_builder.py, "Legacy belief occupancy
+# vs. observed obstacle geometry".
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_exploration_occupied_cell_does_not_block_without_observed_geometry():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    occupied_row, occupied_col = 4, 4
+    grid[occupied_row, occupied_col] = 1  # legacy belief OCCUPIED, no observed geometry there
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+
+    result = PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    assert result.grid[occupied_row, occupied_col] != COSTMAP_OCCUPIED, (
+        "a legacy belief-OCCUPIED cell with no corroborating ObservedObstacleSnapshot "
+        "geometry must not be treated as physical occupancy"
+    )
+    assert result.grid[occupied_row, occupied_col] == COSTMAP_FREE
+
+
+def test_legacy_exploration_occupied_cell_blocks_when_also_observed():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    occupied_row, occupied_col = 4, 4
+    grid[occupied_row, occupied_col] = 1
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+
+    point = GridGeometry(BOUNDS, RESOLUTION).grid_to_world(GridCell(occupied_row, occupied_col))
+    observed = ObservedObstacleSnapshot(points=(point,), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0)
+
+    result = PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    assert result.grid[occupied_row, occupied_col] == COSTMAP_OCCUPIED, (
+        "the same cell becomes occupied once ObservedObstacleSnapshot independently "
+        "confirms it -- occupancy comes from observed geometry, not the legacy belief state"
+    )
+
+
+@pytest.mark.parametrize("unknown_is_traversable", [True, False])
+def test_unknown_cells_still_resolve_purely_by_policy(unknown_is_traversable):
+    """UNKNOWN handling is untouched by the OCCUPIED-cell projection change --
+    only what happens to OCCUPIED=1 cells changed, not -1 cells."""
+    grid = np.full((10, 10), -1, dtype=np.int8)  # all UNKNOWN
+    unknown_row, unknown_col = 5, 5
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=unknown_is_traversable, obstacle_padding=0.3)
+
+    result = PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    expected = COSTMAP_FREE if unknown_is_traversable else COSTMAP_UNKNOWN
+    assert result.grid[unknown_row, unknown_col] == expected
+    assert result.grid[unknown_row, unknown_col] != COSTMAP_OCCUPIED
+
+
+def test_no_physical_inflation_around_legacy_occupied_cell_without_observed_geometry():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    occupied_row, occupied_col = 5, 5
+    grid[occupied_row, occupied_col] = 1
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+    # A large padding: under the old (pre-divergence) behavior this would
+    # have rasterized the belief-OCCUPIED cell center through
+    # add_obstacle_points() and inflated into every one of these neighbors.
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.9)
+
+    result = PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            row, col = occupied_row + dr, occupied_col + dc
+            assert result.grid[row, col] != COSTMAP_OCCUPIED, (
+                f"cell ({row},{col}) must not be inflated from a legacy belief-OCCUPIED "
+                "cell that has no corroborating observed obstacle geometry"
+            )
+
+
+def test_observed_obstacle_inflation_matches_raw_occupancy_grid_add_obstacle_points_footprint():
+    """Observed-obstacle inflation itself is unchanged: the builder's output
+    footprint for an ObservedObstacleSnapshot point must match calling
+    OccupancyGrid.add_obstacle_points() directly with the same point and
+    padding on an all-FREE grid."""
+    exploration = _all_free_exploration()
+    point = (5.5, 5.5)
+    padding = 0.9
+    observed = ObservedObstacleSnapshot(points=(point,), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=padding)
+
+    result = PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    reference_grid = OccupancyGrid.from_bounds(
+        x_min=BOUNDS[0], x_max=BOUNDS[1], y_min=BOUNDS[2], y_max=BOUNDS[3],
+        resolution=RESOLUTION, initial_value=OG_FREE, unknown_is_traversable=True,
+    )
+    reference_grid.add_obstacle_points([point], padding=padding)
+
+    assert np.array_equal(result.grid == COSTMAP_OCCUPIED, reference_grid.data == OG_OCCUPIED), (
+        "observed-obstacle inflation footprint must match a raw "
+        "OccupancyGrid.add_obstacle_points() call with the same point and padding"
+    )
+
+
+@pytest.mark.parametrize("exploration_cell_state", [0, 1], ids=["exploration_free", "exploration_legacy_occupied"])
+def test_hazard_blocks_cell_regardless_of_underlying_exploration_state(exploration_cell_state):
+    grid = np.zeros((10, 10), dtype=np.int8)
+    hazard_row, hazard_col = 5, 5
+    grid[hazard_row, hazard_col] = exploration_cell_state
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+
+    hazard_belief = HazardBelief(GridGeometry(BOUNDS, RESOLUTION), robot_count=1)
+    hazard_belief.observe_cells([hazard_row], [hazard_col], [0.9], robot_index=0)
+    frame = hazard_belief.snapshot()
+
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0, hazard_block_threshold=0.55)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        hazard_belief=frame, hazard_geometry=GridGeometry(BOUNDS, RESOLUTION),
+    )
+
+    assert result.grid[hazard_row, hazard_col] == COSTMAP_OCCUPIED, (
+        "hazard blocking must apply independent of whether the underlying exploration "
+        f"cell was FREE or legacy-OCCUPIED (state={exploration_cell_state})"
+    )
+
+
+def test_build_does_not_mutate_exploration_grid_occupied_values():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    occupied_row, occupied_col = 3, 3
+    grid[occupied_row, occupied_col] = 1
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+    grid_before = exploration.grid.copy()
+
+    PlanningCostmapBuilder().build(exploration=exploration, observed_obstacles=observed, policy=policy)
+
+    assert (exploration.grid == grid_before).all()
+    assert exploration.grid[occupied_row, occupied_col] == 1, (
+        "exploration.grid's own OCCUPIED=1 encoding must remain untouched -- only the "
+        "builder's OUTPUT interpretation of that cell changes, never the input snapshot"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -531,16 +692,23 @@ def test_builder_matches_current_runtime_planning_grid_for_same_inputs(case):
             if row < geometry.height and col < geometry.width:
                 belief.mark_free_cell((row, col))
 
-    # A belief-native OCCUPIED cell.
+    # A belief-native OCCUPIED cell -- also given as an observed obstacle
+    # point below, so runtime/builder equivalence holds here regardless of
+    # PlanningCostmapBuilder's intentional legacy-OCCUPIED divergence (the
+    # cell's physical occupancy is independently confirmed by observed
+    # geometry, not just legacy belief state). See
+    # test_builder_intentionally_ignores_legacy_belief_occupancy_without_observed_geometry
+    # for the case where it is NOT also observed.
     occupied_row, occupied_col = _pick_cell(geometry, 0.1, 0.1)
     belief.mark_occupied_cell((occupied_row, occupied_col))
+    occupied_cell_point = tuple(round(v, 6) for v in geometry.grid_to_world(GridCell(occupied_row, occupied_col)))
 
     # An observed obstacle point placed near a cell boundary, not its
     # center -- exercises the round(..., 3) rasterization path faithfully.
     boundary_row, boundary_col = _pick_cell(geometry, 0.5, 0.5)
     cell_center_x, cell_center_y = geometry.grid_to_world(GridCell(boundary_row, boundary_col))
     near_boundary_point = (round(cell_center_x + resolution * 0.49, 6), cell_center_y)
-    mapped_points = [near_boundary_point]  # already-sanitized, as the real caller would pass
+    mapped_points = [near_boundary_point, occupied_cell_point]  # already-sanitized, as the real caller would pass
 
     hazard_service = None
     hazard_row = hazard_col = unobserved_row = unobserved_col = None
@@ -601,6 +769,54 @@ def test_builder_matches_current_runtime_planning_grid_for_same_inputs(case):
         assert runtime_grid.get_value(GridCell(unobserved_row, unobserved_col)) != OG_OCCUPIED
         assert builder_result.grid[hazard_row, hazard_col] == COSTMAP_OCCUPIED
         assert builder_result.grid[unobserved_row, unobserved_col] != COSTMAP_OCCUPIED
+
+
+def test_builder_intentionally_ignores_legacy_belief_occupancy_without_observed_geometry():
+    """Pins the intentional divergence from build_planning_grid_for_robot()
+    that this task introduces (see planning_costmap_builder.py's module
+    docstring, "Legacy belief occupancy vs. observed obstacle geometry").
+
+    A live BeliefMap OCCUPIED cell with no corroborating observed obstacle
+    geometry still blocks the CURRENT runtime's planning grid --
+    BeliefMap.to_planning_grid() unconditionally rasterizes/marks
+    belief-OCCUPIED cells as physical occupancy. PlanningCostmapBuilder no
+    longer reproduces that: it treats the same belief state as observed and
+    traversable, since nothing has independently confirmed occupancy there.
+    This is not a bug -- separating the two is the entire point of this
+    task -- but it is a real, deliberate behavior difference from today's
+    runtime, which is why it is pinned here explicitly rather than only
+    implied by the equivalence cases above (all of which give the same
+    physical occupancy to ObservedObstacleSnapshot too, so they cannot by
+    themselves prove this divergence exists).
+    """
+    bounds = BOUNDS
+    resolution = RESOLUTION
+    padding = 0.3
+
+    belief = BeliefMap(bounds=bounds, resolution=resolution, robot_count=1)
+    occupied_row, occupied_col = 4, 4
+    belief.mark_occupied_cell((occupied_row, occupied_col))
+
+    fake = _make_fake_engine(belief_map=belief, mapped_obstacle_points=[])
+    runtime_grid = fake.build_planning_grid_for_robot(fake.robot, obstacle_points=[], robot_radius=padding)
+
+    exploration = ExplorationMapSnapshot(
+        grid=belief.grid, bounds=belief.bounds, resolution=belief.resolution, revision=1,
+    )
+    observed = _empty_observed_obstacles(revision=2)  # deliberately no corroborating geometry
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=padding)
+
+    builder_result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+    )
+
+    assert runtime_grid.get_value(GridCell(occupied_row, occupied_col)) == OG_OCCUPIED, (
+        "sanity check: today's runtime still blocks this cell via legacy belief occupancy alone"
+    )
+    assert builder_result.grid[occupied_row, occupied_col] != COSTMAP_OCCUPIED, (
+        "PlanningCostmapBuilder must NOT reproduce that legacy behavior -- this divergence "
+        "is intentional, not a regression"
+    )
 
 
 def test_builder_preserves_canonical_exploration_bounds_when_occupancy_grid_expands_max_bounds():

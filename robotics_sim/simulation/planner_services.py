@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 import inspect
 from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
 
+from robotics_sim.core.geometry import sensor_fov_angle_radians
+
 if TYPE_CHECKING:
     from robotics_sim.environment.occupancy_grid import OccupancyGrid
 
@@ -323,6 +325,7 @@ class PlannerServices:
             robot_radius=request.robot_radius,
             sensor_range=request.sensor_range,
             vision_model=request.vision_model,
+            fov_angle=sensor_fov_angle_radians(request.vision_model),
             ipp_distance_penalty=request.ipp_distance_penalty,
             excluded_targets=list(request.excluded_targets),
             target_exclusion_radius=request.target_exclusion_radius,

@@ -27,6 +27,10 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from robotics_sim.core.geometry import (
+    OMNIDIRECTIONAL_FOV_ANGLE_RAD,
+    sensor_fov_angle_radians,
+)
 from robotics_sim.environment.belief_map import (
     BeliefMap,
     FREE,
@@ -86,6 +90,32 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 def _wrap_angle(angle: float) -> float:
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _resolve_fov_angle(kwargs: Mapping[str, Any]) -> float:
+    """
+    Resolve the field-of-view angle used for swept-FoV information gain.
+
+    Priority:
+        1. An explicit, non-None kwargs["fov_angle"] is authoritative --
+           callers that already know the numeric angle (e.g. PlannerServices)
+           should not be second-guessed.
+        2. Otherwise derive it from kwargs["vision_model"] via
+           sensor_fov_angle_radians(), the same source of truth the sensor
+           runtime uses to build its visible polygon.
+        3. If vision_model is also absent, fall back to the LiDAR/
+           omnidirectional policy (2*pi): an invented cone angle would not
+           correspond to any sensor actually configured in this simulator.
+    """
+    explicit = kwargs.get("fov_angle")
+    if explicit is not None:
+        return float(explicit)
+
+    vision_model = kwargs.get("vision_model")
+    if vision_model is None:
+        return OMNIDIRECTIONAL_FOV_ANGLE_RAD
+
+    return sensor_fov_angle_radians(vision_model)
 
 
 def _angle_between(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -935,7 +965,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         robot_radius = float(kwargs.get("robot_radius", 0.0))
         safety_margin = float(kwargs.get("safety_margin", 0.0))
         sensor_range = float(kwargs.get("sensor_range", 2.5))
-        fov_angle = float(kwargs.get("fov_angle", math.radians(120.0)))
+        fov_angle = _resolve_fov_angle(kwargs)
         fov_stride_cells = int(kwargs.get("fov_stride_cells", 2))
         use_occlusion = bool(kwargs.get("fov_use_occlusion", True))
         seen_saturation = float(kwargs.get("seen_saturation", 5.0))

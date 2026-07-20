@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from PySide6.QtGui import QColor
 
+from robotics_sim.core.geometry import sensor_fov_angle_radians
+
 try:
     from robotics_sim.planning.path_simplifier import (
         PATH_SIMPLIFIER_OPTIONS,
@@ -1122,7 +1124,7 @@ def sensor_visible_polygon_world(
     if "Camera" in vision_model:
         count = ray_count or 121
         count = max(3, int(count))
-        camera_fov = math.radians(70.0)
+        camera_fov = sensor_fov_angle_radians(vision_model)
         start_angle = float(theta) - camera_fov / 2.0
         end_angle = float(theta) + camera_fov / 2.0
         angles = [
@@ -1165,18 +1167,24 @@ def angle_is_inside_sensor_model(
     angle: float,
     robot_theta: float,
     vision_model: str,
-    camera_fov: float = math.radians(70.0),
+    camera_fov: float | None = None,
 ) -> bool:
     """
     Decide whether a direction belongs to the current sensor model.
 
     LiDAR and Omnidirectional are treated as 360-degree sensors in this 2D
     baseline. Camera / FoV uses a finite cone around robot_theta.
+
+    camera_fov: optional explicit override in radians. When omitted, the
+    cone half-angle is derived from vision_model via sensor_fov_angle_radians()
+    -- the single source of truth also used by sensor_visible_polygon_world().
     """
     if "Camera" not in vision_model:
         return True
 
-    return abs(wrapped_angle_error(angle, robot_theta)) <= camera_fov / 2.0
+    effective_fov = camera_fov if camera_fov is not None else sensor_fov_angle_radians(vision_model)
+
+    return abs(wrapped_angle_error(angle, robot_theta)) <= effective_fov / 2.0
 
 
 def mode_name(robot) -> str:

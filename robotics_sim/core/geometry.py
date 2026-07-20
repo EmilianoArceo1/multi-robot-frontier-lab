@@ -1,5 +1,28 @@
 import numpy as np
 
+# Single source of truth for the numeric field-of-view angle behind each
+# vision_model string. Sensor ray-casting (robotics_sim/simulation/config.py)
+# and exploration information-gain estimation
+# (robotics_sim/planning/exploration_planners.py) must both derive their FoV
+# from this function so they never silently diverge.
+CAMERA_FOV_ANGLE_RAD = float(np.radians(70.0))
+OMNIDIRECTIONAL_FOV_ANGLE_RAD = float(2.0 * np.pi)
+
+
+def sensor_fov_angle_radians(vision_model: str) -> float:
+    """
+    Translate a vision_model label into its numeric field-of-view angle.
+
+    Contract:
+        "Camera / FoV" (or any label containing "Camera") -> radians(70).
+        Any other current model, including "LiDAR" and "Omnidirectional"
+        -> 2*pi (treated as a 360-degree sensor in this 2D baseline).
+    """
+    if "Camera" in str(vision_model):
+        return CAMERA_FOV_ANGLE_RAD
+
+    return OMNIDIRECTIONAL_FOV_ANGLE_RAD
+
 
 def wrap_angle(angle: float) -> float:
     """

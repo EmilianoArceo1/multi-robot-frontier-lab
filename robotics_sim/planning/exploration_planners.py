@@ -998,10 +998,25 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         candidates = self._preselect(candidates, robot_xy, max_candidates)
         max_frontier_size = max((c.size for c in candidates), default=1)
 
-        planning_grid = belief.to_planning_grid(
-            unknown_is_traversable=True,
-            inflate_radius=max(0.0, robot_radius + safety_margin),
-        )
+        # Caller-supplied planning_grid (built by engine.py via the SAME
+        # PlanningCostmapBuilder-backed adapter build_planner_kwargs()/
+        # make_exploration_reachability_check() already use -- see
+        # SimulationControllerMixin.build_planning_grid_for_robot()) takes
+        # priority when given: it carries sanitized static observed
+        # geometry, other-robot dynamic points, and observed hazard, not
+        # just the belief map alone. Falls back to the belief-only grid
+        # this planner has always built on its own when no caller supplies
+        # one (e.g. direct/test callers, or callers with no live robot
+        # object to build one from) -- this fallback's behavior is
+        # unchanged from before.
+        supplied_planning_grid = kwargs.get("planning_grid")
+        if supplied_planning_grid is not None:
+            planning_grid = supplied_planning_grid
+        else:
+            planning_grid = belief.to_planning_grid(
+                unknown_is_traversable=True,
+                inflate_radius=max(0.0, robot_radius + safety_margin),
+            )
 
         scored: list[FrontierCandidate] = []
 

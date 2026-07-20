@@ -1393,6 +1393,24 @@ class SimulationControllerMixin:
             if agent.active_path_goal_xy is not None:
                 excluded_targets.append(agent.active_path_goal_xy)
 
+        robot_radius = float(self.safety_radius())
+        # Same PlanningCostmapBuilder-backed adapter build_planner_kwargs()/
+        # make_exploration_reachability_check() already use (see
+        # build_planning_grid_for_robot()) -- reused here, not duplicated,
+        # so FoV/candidate scoring sees the same static/dynamic/hazard
+        # composition the real planner and reachability check do. None when
+        # there is no live robot yet; the planner falls back to its own
+        # belief-only grid in that case (unchanged prior behavior).
+        planning_grid = (
+            self.build_planning_grid_for_robot(
+                self.robot,
+                robot_radius=robot_radius,
+                dynamic_obstacle_points=self._dynamic_obstacle_points_for_robot_object(self.robot),
+            )
+            if self.robot is not None
+            else None
+        )
+
         result = select_exploration_goal(
             planner_name,
             belief_map=belief,
@@ -1401,7 +1419,7 @@ class SimulationControllerMixin:
             current_target=current_target,
             final_goal_xy=final_goal,
             robot_count=1,
-            robot_radius=float(self.safety_radius()),
+            robot_radius=robot_radius,
             sensor_range=float(self.config.vision),
             vision_model=str(self.config.vision_model),
             ipp_distance_penalty=float(self.config.ipp_distance_penalty),
@@ -1411,6 +1429,7 @@ class SimulationControllerMixin:
                 if excluded_targets
                 else 0.0
             ),
+            planning_grid=planning_grid,
         )
 
         selected_score = None

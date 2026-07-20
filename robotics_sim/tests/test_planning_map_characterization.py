@@ -16,12 +16,17 @@ Covered routes:
        alone does not know about.
     2. build_planning_grid_for_robot() includes observed hazards
        (HazardBelief, via apply_hazard_belief_to_planning_grid()).
-    3. FoVAwareDirectionalFrontierPlanner.select_goal()'s OWN internal
-       scoring grid (belief.to_planning_grid(), built without mapped
-       obstacle points) currently omits what (1) shows the real runtime
-       grid includes.
-    4. The same internal scoring grid currently omits what (2) shows the
-       real runtime grid includes for hazards.
+    3. FoVAwareDirectionalFrontierPlanner.select_goal()'s FALLBACK scoring
+       grid (belief.to_planning_grid(), built without mapped obstacle
+       points) -- used only when no caller supplies planning_grid= --
+       omits what (1) shows the real runtime grid includes. engine.py's
+       select_navigation_goal() now supplies a PlanningCostmapBuilder-
+       backed planning_grid= on the real runtime path (see
+       test_fov_costmap_integration.py); the two tests here characterize
+       only the pre-existing, still-unchanged fallback used by direct/test
+       callers that never pass that kwarg.
+    4. The same fallback scoring grid omits what (2) shows the real runtime
+       grid includes for hazards -- same caveat as (3).
     5. candidate_reachable_on_planning_grid() can be driven with the EXACT
        runtime grid build_planning_grid_for_robot() produces.
     6. AStarPlanner.plan() and the path simplifier receive the same grid
@@ -231,10 +236,13 @@ def test_fov_scoring_grid_currently_omits_mapped_obstacle_projection(monkeypatch
         "sanity: the real runtime planning grid does represent the mapped obstacle point"
     )
     assert internal_grid.get_value(internal_cell) != OG_OCCUPIED, (
-        "currently, FoVAwareDirectionalFrontierPlanner.select_goal()'s own internal "
-        "scoring grid is built from belief.to_planning_grid() alone, with no mapped "
-        "obstacle points, so it does not represent this point even though the real "
-        "runtime planning grid used by A*/reachability does"
+        "when no planning_grid= is supplied (as here -- a direct select_exploration_goal() "
+        "call, not through engine.py's select_navigation_goal()), FoVAwareDirectionalFrontier"
+        "Planner.select_goal() still falls back to belief.to_planning_grid() alone, with no "
+        "mapped obstacle points -- unchanged fallback behavior. The REAL runtime path "
+        "(engine.py's select_navigation_goal()) now supplies a PlanningCostmapBuilder-backed "
+        "planning_grid= that DOES include mapped obstacle points -- see "
+        "test_fov_costmap_integration.py for that path's own coverage."
     )
 
 
@@ -289,9 +297,13 @@ def test_fov_scoring_grid_currently_omits_hazard_projection(monkeypatch):
         "sanity: the real runtime planning grid does project the observed hazard"
     )
     assert internal_grid.get_value(internal_cell) != OG_OCCUPIED, (
-        "currently, FoVAwareDirectionalFrontierPlanner.select_goal() never reads "
-        "hazard_service at all, so its internal scoring grid cannot reflect this "
-        "observed hazard even though the real runtime planning grid does"
+        "when no planning_grid= is supplied (as here -- a direct select_exploration_goal() "
+        "call, not through engine.py's select_navigation_goal()), FoVAwareDirectionalFrontier"
+        "Planner.select_goal() never reads hazard_service at all, so its fallback scoring "
+        "grid cannot reflect this observed hazard -- unchanged fallback behavior. The REAL "
+        "runtime path (engine.py's select_navigation_goal()) now supplies a "
+        "PlanningCostmapBuilder-backed planning_grid= that DOES project observed hazard -- "
+        "see test_fov_costmap_integration.py for that path's own coverage."
     )
 
 

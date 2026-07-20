@@ -898,7 +898,8 @@ def test_build_signature_has_no_ground_truth_parameter():
         f"parameter; found {parameters & forbidden!r} in signature {parameters!r}"
     )
     assert parameters == {
-        "self", "exploration", "observed_obstacles", "policy", "hazard_belief", "hazard_geometry",
+        "self", "exploration", "observed_obstacles", "policy", "dynamic_obstacle_points",
+        "hazard_belief", "hazard_geometry",
     }
 
 
@@ -947,3 +948,210 @@ def test_builder_module_does_not_import_forbidden_modules():
         if any(keyword in name.lower() for keyword in forbidden_prefixes)
     ]
     assert violations == [], f"planning_costmap_builder.py must not import: {violations}"
+
+
+# ---------------------------------------------------------------------------
+# 11. Dynamic obstacle points -- a third, ephemeral physical-occupancy
+# source alongside ObservedObstacleSnapshot.points and observed hazard
+# cells (see planning_costmap_builder.py's module docstring, "Dynamic
+# obstacle points"). Never part of ObservedObstacleSnapshot, never tracked
+# in source_revisions.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_dynamic_obstacle_points_does_not_change_result():
+    exploration = _all_free_exploration()
+    observed = ObservedObstacleSnapshot(points=((5.5, 5.5),), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+    builder = PlanningCostmapBuilder()
+
+    result_without_param = builder.build(exploration=exploration, observed_obstacles=observed, policy=policy)
+    result_with_empty_tuple = builder.build(
+        exploration=exploration, observed_obstacles=observed, policy=policy, dynamic_obstacle_points=(),
+    )
+
+    assert np.array_equal(result_without_param.grid, result_with_empty_tuple.grid)
+    assert result_without_param.source_revisions == result_with_empty_tuple.source_revisions
+
+
+def test_single_dynamic_obstacle_point_becomes_occupied():
+    exploration = _all_free_exploration()
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=((5.5, 5.5),),
+    )
+
+    row, col = _cell_index((5.5, 5.5))
+    assert result.grid[row, col] == COSTMAP_OCCUPIED
+
+
+def test_static_and_dynamic_points_share_identical_inflation_footprint():
+    exploration = _all_free_exploration()
+    padding = 0.9
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=padding)
+
+    static_result = PlanningCostmapBuilder().build(
+        exploration=exploration,
+        observed_obstacles=ObservedObstacleSnapshot(
+            points=((5.5, 5.5),), bounds=BOUNDS, resolution=RESOLUTION, revision=1,
+        ),
+        policy=policy,
+    )
+    dynamic_result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=_empty_observed_obstacles(), policy=policy,
+        dynamic_obstacle_points=((5.5, 5.5),),
+    )
+
+    assert np.array_equal(static_result.grid == COSTMAP_OCCUPIED, dynamic_result.grid == COSTMAP_OCCUPIED), (
+        "the SAME point at the SAME padding must produce an IDENTICAL occupied footprint "
+        "whether it arrives via observed_obstacles.points or dynamic_obstacle_points"
+    )
+
+
+def test_static_and_dynamic_point_at_the_same_location_does_not_error():
+    exploration = _all_free_exploration()
+    observed = ObservedObstacleSnapshot(points=((5.5, 5.5),), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=((5.5, 5.5),),
+    )
+
+    row, col = _cell_index((5.5, 5.5))
+    assert result.grid[row, col] == COSTMAP_OCCUPIED
+
+
+def test_dynamic_obstacle_points_order_and_duplicates_do_not_mutate_input():
+    exploration = _all_free_exploration()
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0)
+    dynamic_points = [(5.5, 5.5), (2.5, 2.5), (5.5, 5.5)]  # a plain list, with a duplicate
+    dynamic_points_before = list(dynamic_points)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=dynamic_points,
+    )
+
+    assert dynamic_points == dynamic_points_before, "the caller's own list must never be mutated or reordered"
+    row1, col1 = _cell_index((5.5, 5.5))
+    row2, col2 = _cell_index((2.5, 2.5))
+    assert result.grid[row1, col1] == COSTMAP_OCCUPIED
+    assert result.grid[row2, col2] == COSTMAP_OCCUPIED
+
+
+def test_hazard_remains_independent_of_dynamic_obstacle_points():
+    exploration = _all_free_exploration()
+    observed = _empty_observed_obstacles()
+
+    hazard_belief = HazardBelief(GridGeometry(BOUNDS, RESOLUTION), robot_count=1)
+    hazard_row, hazard_col = _cell_index((7.5, 7.5))
+    hazard_belief.observe_cells([hazard_row], [hazard_col], [0.8], robot_index=0)
+    frame = hazard_belief.snapshot()
+
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0, hazard_block_threshold=0.55)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=((2.5, 2.5),),
+        hazard_belief=frame, hazard_geometry=GridGeometry(BOUNDS, RESOLUTION),
+    )
+
+    dyn_row, dyn_col = _cell_index((2.5, 2.5))
+    assert result.grid[dyn_row, dyn_col] == COSTMAP_OCCUPIED
+    assert result.grid[hazard_row, hazard_col] == COSTMAP_OCCUPIED
+    source_names = {name for name, _ in result.source_revisions}
+    assert source_names == {"exploration", "observed_obstacles", "hazard"}, (
+        "dynamic_obstacle_points must never appear in source_revisions -- it is ephemeral, "
+        "per-call input, not a versioned layer"
+    )
+
+
+def test_legacy_belief_occupied_still_does_not_block_with_dynamic_points_present():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    legacy_row, legacy_col = 4, 4
+    grid[legacy_row, legacy_col] = 1  # legacy OCCUPIED, no corroborating geometry
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=((8.5, 8.5),),  # unrelated dynamic point elsewhere
+    )
+
+    assert result.grid[legacy_row, legacy_col] != COSTMAP_OCCUPIED, (
+        "legacy BeliefMap.OCCUPIED must still not block on its own, even when unrelated "
+        "dynamic_obstacle_points are present in the same build() call"
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_points",
+    [
+        pytest.param(((float("nan"), 0.0),), id="nan_coordinate"),
+        pytest.param(((float("inf"), 0.0),), id="inf_coordinate"),
+        pytest.param(((1.0,),), id="malformed_not_a_pair"),
+        pytest.param(((True, False),), id="bool_coordinates"),
+        pytest.param("ab", id="not_an_iterable_of_pairs"),
+    ],
+)
+def test_invalid_dynamic_obstacle_point_raises(bad_points):
+    exploration = _all_free_exploration()
+    observed = _empty_observed_obstacles()
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0)
+
+    with pytest.raises(ValueError):
+        PlanningCostmapBuilder().build(
+            exploration=exploration, observed_obstacles=observed, policy=policy,
+            dynamic_obstacle_points=bad_points,
+        )
+
+
+def test_dynamic_obstacle_points_build_does_not_mutate_original_snapshots():
+    grid = np.zeros((10, 10), dtype=np.int8)
+    exploration = ExplorationMapSnapshot(grid=grid, bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    observed = ObservedObstacleSnapshot(points=((5.5, 5.5),), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.3)
+    exploration_grid_before = exploration.grid.copy()
+    observed_points_before = observed.points
+
+    PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=((2.5, 2.5),),
+    )
+
+    assert (exploration.grid == exploration_grid_before).all()
+    assert observed.points == observed_points_before
+
+
+def test_combined_result_contains_static_dynamic_and_hazard_occupancy():
+    exploration = _all_free_exploration()
+    static_point = (1.5, 1.5)
+    dynamic_point = (5.5, 5.5)
+    hazard_row, hazard_col = _cell_index((8.5, 8.5))
+
+    observed = ObservedObstacleSnapshot(points=(static_point,), bounds=BOUNDS, resolution=RESOLUTION, revision=1)
+
+    hazard_belief = HazardBelief(GridGeometry(BOUNDS, RESOLUTION), robot_count=1)
+    hazard_belief.observe_cells([hazard_row], [hazard_col], [0.8], robot_index=0)
+    frame = hazard_belief.snapshot()
+
+    policy = PlanningCostmapPolicy(unknown_is_traversable=True, obstacle_padding=0.0, hazard_block_threshold=0.55)
+
+    result = PlanningCostmapBuilder().build(
+        exploration=exploration, observed_obstacles=observed, policy=policy,
+        dynamic_obstacle_points=(dynamic_point,),
+        hazard_belief=frame, hazard_geometry=GridGeometry(BOUNDS, RESOLUTION),
+    )
+
+    static_row, static_col = _cell_index(static_point)
+    dynamic_row, dynamic_col = _cell_index(dynamic_point)
+
+    assert result.grid[static_row, static_col] == COSTMAP_OCCUPIED
+    assert result.grid[dynamic_row, dynamic_col] == COSTMAP_OCCUPIED
+    assert result.grid[hazard_row, hazard_col] == COSTMAP_OCCUPIED

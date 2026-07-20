@@ -88,6 +88,36 @@ Inputs are the Phase 1 snapshot contracts
     - HazardBeliefFrame        (robotics_sim/environment/hazard_belief.py)
       replaces hazard_service.belief; optional, discovered-only.
 
+Composition order: exploration knowledge -> observed static obstacles ->
+dynamic obstacle points -> observed hazards. See "Dynamic obstacle points"
+below for the third layer.
+
+Dynamic obstacle points
+------------------------
+``dynamic_obstacle_points: tuple[Point2D, ...] = ()`` is a THIRD, separate
+physical-occupancy source, alongside ObservedObstacleSnapshot.points and
+observed hazard cells (see "Legacy belief occupancy vs. observed obstacle
+geometry" above for why legacy BeliefMap.OCCUPIED is never one of these
+three). It exists to let a caller project runtime-only, non-static
+occupancy -- today, other runtime robots
+(SimulationControllerMixin.dynamic_robot_obstacle_points_for_robot()) --
+without inventing a second static-geometry contract for it.
+
+It is deliberately NOT an ObservedObstacleSnapshot and there is no
+DynamicObstacleSnapshot type: unlike static observed geometry, these points
+have no meaningful revision of their own to track (a robot's position
+changes every tick; a "revision" counter for that would either be
+meaningless or would have to be the tick count in disguise) and are not
+persisted/cached anywhere -- they are supplied fresh, per build() call, by
+the caller, and never appear in source_revisions. Two calls to build() with
+the same dynamic_obstacle_points content are expected to be made with a
+FRESH tuple each time (built by the caller from live state), not reused
+from a cached snapshot. It is inflated by the exact same
+policy.obstacle_padding as ObservedObstacleSnapshot.points (see rule 3
+below), and validated the same way (see _validate_dynamic_obstacle_points()
+below) -- normalized to a fresh tuple of finite float pairs, never mutating
+whatever the caller passed in.
+
 Hazard geometry
 ----------------
 HazardBeliefFrame carries no bounds/resolution of its own (see hazard_belief.py
@@ -122,6 +152,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from robotics_interfaces.observations import Point2D
 from robotics_sim.environment.grid_geometry import GridCell, GridGeometry
 from robotics_sim.environment.hazard_belief import HazardBeliefFrame
 from robotics_sim.environment.map_snapshots import FREE as SNAPSHOT_FREE
@@ -191,6 +222,52 @@ def _validate_real(
             raise ValueError(f"{field_name} must be < {maximum}, got {result!r}.")
 
     return result
+
+
+def _validate_dynamic_obstacle_points(points) -> tuple[Point2D, ...]:
+    """Validate and tuple-ize dynamic_obstacle_points -- an iterable of
+    (x, y) pairs, normalized the same way ObservedObstacleSnapshot's own
+    points are (map_snapshots.py's _validate_points()): float-normalized,
+    finite-only, never reordered. Duplicated here rather than imported
+    (matching this file's existing validators and map_snapshots.py's own
+    "duplicate small validators per module" convention) -- kept small and
+    self-contained, not a new validation framework.
+
+    Unlike ObservedObstacleSnapshot.points, this ALSO rejects bool
+    coordinates explicitly (bool is an int subclass in Python, so a bare
+    float(x) would otherwise silently accept True/False as 1.0/0.0) --
+    dynamic points are fresh, caller-constructed live-state samples, not
+    data that already passed through a validated snapshot contract.
+    """
+    try:
+        raw_points = list(points)
+    except TypeError as exc:
+        raise ValueError(
+            f"dynamic_obstacle_points must be an iterable of (x, y) pairs, got {points!r}."
+        ) from exc
+
+    validated: list[Point2D] = []
+    for point in raw_points:
+        try:
+            x, y = point
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"each dynamic obstacle point must be an (x, y) pair, got {point!r}.") from exc
+
+        if isinstance(x, bool) or isinstance(y, bool):
+            raise ValueError(f"dynamic obstacle point coordinates must not be bool, got {point!r}.")
+
+        try:
+            x = float(x)
+            y = float(y)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"dynamic obstacle point coordinates must be numeric, got {point!r}.") from exc
+
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise ValueError(f"dynamic obstacle point coordinates must be finite, got {point!r}.")
+
+        validated.append((x, y))
+
+    return tuple(validated)
 
 
 @dataclass(frozen=True)
@@ -388,11 +465,13 @@ class PlanningCostmapBuilder:
         exploration: ExplorationMapSnapshot,
         observed_obstacles: ObservedObstacleSnapshot,
         policy: PlanningCostmapPolicy,
+        dynamic_obstacle_points: tuple[Point2D, ...] = (),
         hazard_belief: HazardBeliefFrame | None = None,
         hazard_geometry: GridGeometry | None = None,
     ) -> PlanningCostmapSnapshot:
         _validate_matching_geometry(exploration, observed_obstacles)
         _validate_hazard_inputs(hazard_belief, hazard_geometry, exploration)
+        validated_dynamic_points = _validate_dynamic_obstacle_points(dynamic_obstacle_points)
 
         # 1. exploration belief -> base grid. Legacy belief-OCCUPIED cells
         #    become FREE here -- observed-but-not-independently-confirmed
@@ -403,18 +482,29 @@ class PlanningCostmapBuilder:
             unknown_is_traversable=policy.unknown_is_traversable,
         )
 
-        # 2. observed obstacle projection/inflation.
+        padding = max(0.0, float(policy.obstacle_padding))
+
+        # 2. observed STATIC obstacle projection/inflation.
         if observed_obstacles.points:
-            grid.add_obstacle_points(
-                observed_obstacles.points, padding=max(0.0, float(policy.obstacle_padding))
-            )
+            grid.add_obstacle_points(observed_obstacles.points, padding=padding)
+
+        # 3. DYNAMIC obstacle point projection/inflation -- the SAME
+        #    padding as static observed points (see module docstring's
+        #    "Dynamic obstacle points"). Ephemeral, per-call input: never
+        #    part of ObservedObstacleSnapshot, never tracked in
+        #    source_revisions. A point already present in
+        #    observed_obstacles.points is simply re-marked OCCUPIED here --
+        #    OccupancyGrid has no notion of cumulative "more occupied", so
+        #    this is a harmless no-op, not a double-inflation bug.
+        if validated_dynamic_points:
+            grid.add_obstacle_points(validated_dynamic_points, padding=padding)
 
         source_revisions: list[tuple[str, int]] = [
             ("exploration", exploration.revision),
             ("observed_obstacles", observed_obstacles.revision),
         ]
 
-        # 3. observed hazard projection -- only ever observed cells, never
+        # 4. observed hazard projection -- only ever observed cells, never
         #    ground truth. Applied last, matching build_planning_grid_for_
         #    robot()'s current composition order.
         if hazard_belief is not None:
@@ -428,7 +518,7 @@ class PlanningCostmapBuilder:
                 grid,
                 adapter,
                 block_threshold=policy.hazard_block_threshold,
-                inflate_radius=max(0.0, float(policy.obstacle_padding)),
+                inflate_radius=padding,
             )
             source_revisions.append(("hazard", hazard_belief.revision))
 

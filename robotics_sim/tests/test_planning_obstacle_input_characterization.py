@@ -168,6 +168,9 @@ def _make_fake_engine(
         "obstacle_points_for_segment_safety_check",
         "dynamic_robot_obstacle_points_for_robot",
         "build_planning_grid_for_robot",
+        "_planning_costmap_inputs_for_robot",
+        "_planning_grid_from_costmap_snapshot",
+        "_dynamic_obstacle_points_for_robot_object",
         "final_goal_xy",
         "select_navigation_goal",
         "select_navigation_goal_for_multi_robot",
@@ -202,18 +205,32 @@ def _capture_calls(fake: SimpleNamespace, method_name: str) -> list[dict]:
     """Wrap the ALREADY-bound real method on fake, recording every call's
     arguments and return value before delegating to the real
     implementation -- never a copy of the method's own logic, just a thin
-    recording shim around the real, already-bound callable."""
+    recording shim around the real, already-bound callable.
+
+    obstacle_points is captured RAW (None stays None) -- under the runtime
+    costmap-builder integration, obstacle_points is None whenever a
+    production caller uses the NEW path (the four production call sites
+    all do), so `is None` is itself the signal that the new path was
+    taken, not an accident to normalize away like the old None-vs-empty-
+    list ambiguity this used to guard against.
+    """
     real_method = getattr(fake, method_name)
     calls: list[dict] = []
 
-    def _wrapper(robot, *, obstacle_points=None, robot_radius=None):
-        result = real_method(robot, obstacle_points=obstacle_points, robot_radius=robot_radius)
+    def _wrapper(robot, *, obstacle_points=None, robot_radius=None, dynamic_obstacle_points=()):
+        result = real_method(
+            robot,
+            obstacle_points=obstacle_points,
+            robot_radius=robot_radius,
+            dynamic_obstacle_points=dynamic_obstacle_points,
+        )
         calls.append(
             {
                 "robot": robot,
                 "obstacle_points_id": id(obstacle_points),
-                "obstacle_points": list(obstacle_points) if obstacle_points else [],
+                "obstacle_points": obstacle_points,
                 "robot_radius": robot_radius,
+                "dynamic_obstacle_points": tuple(dynamic_obstacle_points),
                 "result": result,
             }
         )
@@ -455,16 +472,25 @@ def test_ground_truth_obstacles_are_excluded_from_obstacle_points_preparation():
 # intercepting its OWN internal call to build_planning_grid_for_robot() via
 # the same _capture_calls() recorder. None of these hand-compose a
 # substitute call: every one below drives the real, already-bound
-# orchestrating method and only re-derives an "expected" value via the same
-# real helper functions (sanitize_planner_obstacle_points()/dynamic_robot_
-# obstacle_points_for_robot()), for comparison, never a copied formula.
+# orchestrating method.
+#
+# Under the runtime costmap-builder integration, obstacle_points and static/
+# dynamic sanitization now happen INSIDE build_planning_grid_for_robot()
+# itself (obstacle_points is None on every one of these calls -- that IS
+# the new-path signal, see _capture_calls()'s own docstring), so "what was
+# passed in" is no longer where static-point composition is observable.
+# These tests instead verify the RESULT: the actual OccupancyGrid cells,
+# plus (for radius/robot/dynamic points) the arguments still passed
+# directly. Expected radius/dynamic points are still derived by calling the
+# same real helper functions (sanitize_planner_obstacle_points()/
+# dynamic_robot_obstacle_points_for_robot()), never a copied formula.
 # ---------------------------------------------------------------------------
 
 
 def test_build_planner_kwargs_intercepted_reveals_exact_planning_grid_input():
     fake = _make_fake_engine()
     near_point = (0.0, 0.0)  # exactly at the robot -- must be sanitized away
-    far_point = (50.0, 0.0)  # far -- must survive
+    far_point = (8.0, 0.0)  # far, but still within WORLD_X_MIN/MAX -- must survive
     fake.mapped_obstacle_points = [near_point, far_point]
     calls = _capture_calls(fake, "build_planning_grid_for_robot")
 
@@ -476,25 +502,23 @@ def test_build_planner_kwargs_intercepted_reveals_exact_planning_grid_input():
     assert call["robot"] is fake.robot
     expected_radius = fake.safety_radius()
     assert call["robot_radius"] == expected_radius
+    # NEW runtime path signal: no obstacle_points passed in, no dynamic
+    # points either (single-robot path never has other robots to include).
+    assert call["obstacle_points"] is None
+    assert call["dynamic_obstacle_points"] == ()
 
-    expected_points, _ = fake.sanitize_planner_obstacle_points(
-        list(fake.mapped_obstacle_points), start_xy=(0.0, 0.0), robot_radius=expected_radius,
-        resolution=float(fake.config.grid_resolution),
+    grid = call["result"]
+    assert grid.get_value(grid.world_to_grid(*near_point)) != OG_OCCUPIED, (
+        "the near-start static point must be sanitized away"
     )
-    assert call["obstacle_points"] == expected_points
-    assert near_point not in call["obstacle_points"]
-    assert far_point in call["obstacle_points"]
-    # Single-robot path: no dynamic other-robot points exist to include
-    # (only one robot in this fake), consistent with the AST inventory
-    # test's finding that build_planner_kwargs()'s traced obstacle_points
-    # expression never contains "dynamic_points".
+    assert grid.get_value(grid.world_to_grid(*far_point)) == OG_OCCUPIED, "the far static point must block"
     assert result["planning_grid"] is call["result"]
 
 
 def test_build_planner_kwargs_for_goal_intercepted_reveals_exact_planning_grid_input():
     fake = _make_fake_engine()
     near_point = (0.0, 0.0)  # exactly at the robot -- must be sanitized away
-    far_point = (50.0, 0.0)  # far -- must survive
+    far_point = (8.0, 0.0)  # far, but still within WORLD_X_MIN/MAX -- must survive
     fake.mapped_obstacle_points = [near_point, far_point]
     calls = _capture_calls(fake, "build_planning_grid_for_robot")
 
@@ -508,18 +532,17 @@ def test_build_planner_kwargs_for_goal_intercepted_reveals_exact_planning_grid_i
     assert call["robot"] is fake.robot
     expected_radius = fake.safety_radius_for_robot(fake.robot)
     assert call["robot_radius"] == expected_radius
-
-    expected_points, _ = fake.sanitize_planner_obstacle_points(
-        list(fake.mapped_obstacle_points), start_xy=start_xy, robot_radius=expected_radius,
-        resolution=float(fake.config.grid_resolution),
-    )
-    assert call["obstacle_points"] == expected_points
-    assert near_point not in call["obstacle_points"]
-    assert far_point in call["obstacle_points"]
+    assert call["obstacle_points"] is None
     # build_planner_kwargs_for_goal() has no dynamic_robot_obstacle_points_
-    # for_robot() call at all (AST-confirmed above: its traced
-    # obstacle_points expression never contains "dynamic_points") -- only
-    # sanitized mapped_obstacle_points reach it, exactly as just verified.
+    # for_robot() call at all (AST-confirmed below: its traced
+    # obstacle_points expression never contains "dynamic_points").
+    assert call["dynamic_obstacle_points"] == ()
+
+    grid = call["result"]
+    assert grid.get_value(grid.world_to_grid(*near_point)) != OG_OCCUPIED, (
+        "the near-start static point must be sanitized away"
+    )
+    assert grid.get_value(grid.world_to_grid(*far_point)) == OG_OCCUPIED, "the far static point must block"
     assert result["planning_grid"] is call["result"]
 
 
@@ -535,7 +558,7 @@ def test_build_planner_kwargs_for_multi_robot_intercepted_reveals_exact_composit
     target_start_xy = (float(target_robot.x), float(target_robot.y))
 
     near_point = target_start_xy  # exactly at robot 0's own position -- must be sanitized away
-    far_point = (target_start_xy[0] + 50.0, target_start_xy[1])  # far -- must survive
+    far_point = (8.0, target_start_xy[1])  # far, but still within WORLD_X_MIN/MAX -- must survive
     fake.mapped_obstacle_points = [near_point, far_point]
 
     calls = _capture_calls(fake, "build_planning_grid_for_robot")
@@ -553,27 +576,28 @@ def test_build_planner_kwargs_for_multi_robot_intercepted_reveals_exact_composit
     expected_radius = fake.safety_radius_for_robot(target_robot)
     assert call["robot_radius"] == expected_radius
 
-    # 4. exact points, built ONLY from the real helpers -- no reimplemented
-    #    sanitization formula, no reimplemented circular sampling.
-    expected_dynamic = fake.dynamic_robot_obstacle_points_for_robot(0)
-    expected_points, _ = fake.sanitize_planner_obstacle_points(
-        list(fake.mapped_obstacle_points) + expected_dynamic,
-        start_xy=target_start_xy,
-        robot_radius=expected_radius,
-        resolution=float(fake.config.grid_resolution),
-    )
-    assert call["obstacle_points"] == expected_points
+    # NEW runtime path signal: obstacle_points is never passed by the real
+    # multi-robot orchestrator -- dynamic_obstacle_points carries the other
+    # robot's points explicitly instead.
+    assert call["obstacle_points"] is None
 
+    # 4. exact dynamic points, built ONLY from the real helper -- no
+    #    reimplemented circular sampling formula.
+    expected_dynamic = tuple(fake.dynamic_robot_obstacle_points_for_robot(0))
+    assert call["dynamic_obstacle_points"] == expected_dynamic
+
+    grid = call["result"]
     # 5. the near-start static point was removed.
-    assert near_point not in call["obstacle_points"]
+    assert grid.get_value(grid.world_to_grid(*near_point)) != OG_OCCUPIED, (
+        "the near-start static point must be sanitized away"
+    )
     # 6. the far static point remained.
-    assert far_point in call["obstacle_points"]
-    # 7. points corresponding to the other robot exist.
+    assert grid.get_value(grid.world_to_grid(*far_point)) == OG_OCCUPIED, "the far static point must block"
+    # 7. the other robot's own position blocks the grid.
     other_robot_xy = (float(fake.robots[1].x), float(fake.robots[1].y))
-    assert any(
-        math.hypot(px - other_robot_xy[0], py - other_robot_xy[1]) < 1e-6
-        for px, py in call["obstacle_points"]
-    ), "the real multi-robot path's obstacle_points must include a sample AT the other robot's own center"
+    assert grid.get_value(grid.world_to_grid(*other_robot_xy)) == OG_OCCUPIED, (
+        "the real multi-robot path must block the other robot's own position"
+    )
 
     # 8. the SAME grid object the wrapper captured is what ends up in the
     #    returned kwargs.
@@ -585,14 +609,17 @@ def test_build_planner_kwargs_for_multi_robot_intercepted_reveals_exact_composit
 # ---------------------------------------------------------------------------
 
 
-def test_reachability_builds_its_own_grid_with_narrower_composition_than_multi_robot_planner():
-    """Reuses the real make_exploration_reachability_check() entry point
-    already exercised by test_reachability_instrumentation.py (same
-    duck-typed-fake convention). The multi-robot side of the comparison
-    is NOT hand-composed here: it goes through _run_real_multi_robot_path(),
-    the same helper that drives build_planner_kwargs_for_multi_robot() for
-    real in test_build_planner_kwargs_for_multi_robot_intercepted_reveals_
-    exact_composition above, sharing the SAME fake/wrapped-recorder so both
+def test_reachability_now_matches_multi_robot_planner_dynamic_composition():
+    """Pins the FIX for the previously-confirmed gap: reachability used to
+    never include other runtime robots at all, while the multi-robot
+    planner did. Reuses the real make_exploration_reachability_check()
+    entry point already exercised by test_reachability_instrumentation.py
+    (same duck-typed-fake convention). The multi-robot side of the
+    comparison is NOT hand-composed here: it goes through
+    _run_real_multi_robot_path(), the same helper that drives
+    build_planner_kwargs_for_multi_robot() for real in
+    test_build_planner_kwargs_for_multi_robot_intercepted_reveals_exact_
+    composition above, sharing the SAME fake/wrapped-recorder so both
     captures come from actually running the real production methods.
     """
     fake = _make_fake_engine(robot_positions=[(0.0, 0.0), (5.0, 5.0)])
@@ -613,22 +640,30 @@ def test_reachability_builds_its_own_grid_with_narrower_composition_than_multi_r
     # dynamic_robot_obstacle_points_for_robot() is called here only to get
     # a REFERENCE set for the containment checks below -- not to hand-build
     # a competing grid/obstacle_points list (that role is now filled by the
-    # real _run_real_multi_robot_path() call above).
-    dynamic_points_reference = fake.dynamic_robot_obstacle_points_for_robot(0)
+    # real _run_real_multi_robot_path()/make_exploration_reachability_check()
+    # calls above).
+    dynamic_points_reference = tuple(fake.dynamic_robot_obstacle_points_for_robot(0))
     assert dynamic_points_reference, "sanity: a second robot exists, so there is something to reference"
 
-    assert not (set(reachability_call["obstacle_points"]) & set(dynamic_points_reference)), (
-        "reachability's own obstacle_points must not contain any of the other robot's dynamic "
-        "points"
+    # THE FIX: reachability's own dynamic_obstacle_points now equals the
+    # SAME reference the multi-robot planner uses for this robot -- both
+    # resolve robot index 0 and exclude only itself.
+    assert reachability_call["dynamic_obstacle_points"] == dynamic_points_reference
+    assert multi_robot_call["dynamic_obstacle_points"] == dynamic_points_reference
+    assert reachability_call["dynamic_obstacle_points"] == multi_robot_call["dynamic_obstacle_points"]
+
+    other_robot_xy = (float(fake.robots[1].x), float(fake.robots[1].y))
+    reachability_grid = reachability_call["result"]
+    multi_robot_grid = multi_robot_call["result"]
+    assert reachability_grid.get_value(reachability_grid.world_to_grid(*other_robot_xy)) == OG_OCCUPIED, (
+        "reachability's own grid must now block the other robot's position too"
     )
-    assert set(multi_robot_call["obstacle_points"]) & set(dynamic_points_reference), (
-        "the REAL multi-robot path's obstacle_points must contain points from the other robot"
-    )
-    assert reachability_call["result"] is not multi_robot_call["result"], (
-        "reachability reconstructs its OWN OccupancyGrid -- it never reuses the grid the real "
-        "multi-robot planning path builds"
-    )
-    assert len(multi_robot_call["obstacle_points"]) > len(reachability_call["obstacle_points"])
+    assert multi_robot_grid.get_value(multi_robot_grid.world_to_grid(*other_robot_xy)) == OG_OCCUPIED
+
+    # No object-identity requirement (per this migration's own contract):
+    # each caller still builds its OWN OccupancyGrid independently, even
+    # though both now use the same layers/composition.
+    assert reachability_grid is not multi_robot_grid
 
 
 # ---------------------------------------------------------------------------
@@ -711,12 +746,15 @@ def _last_assignment_source(function_node, target_name: str, before_lineno: int,
     return ast.get_source_segment(source, best.value) if best is not None else None
 
 
+_TRACKED_KEYWORDS = ("obstacle_points", "robot_radius", "dynamic_obstacle_points")
+
+
 class _PlanningGridCallVisitor(ast.NodeVisitor):
     """Records every call to .build_planning_grid_for_robot(...) in one
     module's AST: its nearest enclosing def/async def (innermost lexical
-    scope, "<module>" if none), line number, whether obstacle_points/
-    robot_radius are passed by keyword, the exact source expression used
-    for each, and (for obstacle_points, when it is a bare identifier) the
+    scope, "<module>" if none), line number, and -- for each of
+    _TRACKED_KEYWORDS -- whether it is passed by keyword, the exact source
+    expression used, and (when that expression is a bare identifier) the
     traced source of its most recent local assignment.
     """
 
@@ -744,41 +782,29 @@ class _PlanningGridCallVisitor(ast.NodeVisitor):
             keyword_values = {kw.arg: kw.value for kw in node.keywords if kw.arg is not None}
             positional_arg_exprs = [ast.get_source_segment(self._source, arg) for arg in node.args]
 
-            obstacle_points_is_keyword = "obstacle_points" in keyword_values
-            obstacle_points_call_expr = (
-                ast.get_source_segment(self._source, keyword_values["obstacle_points"])
-                if obstacle_points_is_keyword
-                else None
-            )
-            robot_radius_is_keyword = "robot_radius" in keyword_values
-            robot_radius_call_expr = (
-                ast.get_source_segment(self._source, keyword_values["robot_radius"])
-                if robot_radius_is_keyword
-                else None
-            )
+            record = {
+                "enclosing_function": enclosing_name,
+                "lineno": node.lineno,
+                "positional_arg_exprs": positional_arg_exprs,
+            }
 
-            traced_obstacle_points_expr = None
-            if (
-                enclosing_node is not None
-                and obstacle_points_call_expr is not None
-                and obstacle_points_call_expr.isidentifier()
-            ):
-                traced_obstacle_points_expr = _last_assignment_source(
-                    enclosing_node, obstacle_points_call_expr, node.lineno, self._source,
+            for keyword_name in _TRACKED_KEYWORDS:
+                is_keyword = keyword_name in keyword_values
+                call_expr = (
+                    ast.get_source_segment(self._source, keyword_values[keyword_name])
+                    if is_keyword
+                    else None
                 )
+                traced_expr = None
+                if enclosing_node is not None and call_expr is not None and call_expr.isidentifier():
+                    traced_expr = _last_assignment_source(
+                        enclosing_node, call_expr, node.lineno, self._source,
+                    )
+                record[f"{keyword_name}_is_keyword"] = is_keyword
+                record[f"{keyword_name}_call_expr"] = call_expr
+                record[f"{keyword_name}_traced_expr"] = traced_expr
 
-            self.calls.append(
-                {
-                    "enclosing_function": enclosing_name,
-                    "lineno": node.lineno,
-                    "positional_arg_exprs": positional_arg_exprs,
-                    "obstacle_points_is_keyword": obstacle_points_is_keyword,
-                    "obstacle_points_call_expr": obstacle_points_call_expr,
-                    "obstacle_points_traced_expr": traced_obstacle_points_expr,
-                    "robot_radius_is_keyword": robot_radius_is_keyword,
-                    "robot_radius_call_expr": robot_radius_call_expr,
-                }
-            )
+            self.calls.append(record)
         self.generic_visit(node)
 
 
@@ -794,6 +820,13 @@ def _find_planning_grid_calls(path: Path) -> list[dict]:
 
 
 def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_composition_detail():
+    """Under the runtime costmap-builder integration, obstacle_points is
+    never passed at these 4 call sites anymore -- that IS the signal that
+    routes each of them through PlanningCostmapBuilder inside
+    build_planning_grid_for_robot() itself (obstacle_points is None
+    triggers the new path; see that method's own docstring). What
+    distinguishes the 4 call sites now is dynamic_obstacle_points instead.
+    """
     calls = _find_planning_grid_calls(_ENGINE_PATH)
     enclosing_names = [call["enclosing_function"] for call in calls]
 
@@ -815,24 +848,44 @@ def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_compositi
     by_function = {call["enclosing_function"]: call for call in calls}
 
     for name, call in by_function.items():
-        assert call["obstacle_points_is_keyword"] is True, (name, call)
-        assert call["obstacle_points_call_expr"] == "obstacle_points", (name, call)
+        assert call["obstacle_points_is_keyword"] is False, (name, call)
         assert call["robot_radius_is_keyword"] is True, (name, call)
         assert call["robot_radius_call_expr"] == "robot_radius", (name, call)
-        traced = call["obstacle_points_traced_expr"] or ""
-        assert "self.mapped_obstacle_points" in traced, (name, traced)
-        assert "self.config.obstacles" not in traced, (name, traced)
 
-    # Only build_planner_kwargs_for_multi_robot() merges other robots'
-    # dynamic points into the SAME local variable that ends up as
-    # obstacle_points here -- confirmed by tracing the assignment, not
-    # assumed from the function's name.
-    multi_robot_traced = by_function["build_planner_kwargs_for_multi_robot"]["obstacle_points_traced_expr"]
-    assert multi_robot_traced is not None and "dynamic_points" in multi_robot_traced
+    # Only build_planner_kwargs_for_multi_robot() and _build_context()
+    # (reachability) pass dynamic_obstacle_points at all -- the single-
+    # robot/known-goal paths never have another robot to include (confirmed
+    # by the ABSENCE of the keyword here, not assumed from the name).
+    for name in ("build_planner_kwargs", "build_planner_kwargs_for_goal"):
+        assert by_function[name]["dynamic_obstacle_points_is_keyword"] is False, name
 
-    for name in ("build_planner_kwargs", "build_planner_kwargs_for_goal", "_build_context"):
-        traced = by_function[name]["obstacle_points_traced_expr"] or ""
-        assert "dynamic_points" not in traced, (name, traced)
+    for name in ("build_planner_kwargs_for_multi_robot", "_build_context"):
+        call = by_function[name]
+        assert call["dynamic_obstacle_points_is_keyword"] is True, name
+        expr = call["dynamic_obstacle_points_call_expr"] or ""
+        assert "dynamic_points" in expr, (name, expr)
+
+    # build_planner_kwargs_for_multi_robot() wraps its dynamic points in
+    # tuple(...) right at the call site -- visible directly, no need to
+    # trace further back.
+    assert (
+        by_function["build_planner_kwargs_for_multi_robot"]["dynamic_obstacle_points_call_expr"]
+        == "tuple(dynamic_points)"
+    )
+
+    # _build_context()'s dynamic_obstacle_points is a bare identifier --
+    # trace it back to its own assignment to confirm it comes from
+    # _dynamic_obstacle_points_for_robot_object(), not a copied formula.
+    reachability_traced = by_function["_build_context"]["dynamic_obstacle_points_traced_expr"] or ""
+    assert "_dynamic_obstacle_points_for_robot_object" in reachability_traced
+
+    # Ground truth never enters through any tracked keyword at any call site.
+    for name, call in by_function.items():
+        for keyword_name in ("obstacle_points", "robot_radius", "dynamic_obstacle_points"):
+            expr = call.get(f"{keyword_name}_call_expr") or ""
+            traced = call.get(f"{keyword_name}_traced_expr") or ""
+            assert "self.config.obstacles" not in expr, (name, keyword_name, expr)
+            assert "self.config.obstacles" not in traced, (name, keyword_name, traced)
 
 
 # ---------------------------------------------------------------------------

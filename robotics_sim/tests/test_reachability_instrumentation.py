@@ -98,6 +98,11 @@ def _make_fake_engine(*, monitor: PerfMonitor | None = None) -> SimpleNamespace:
         # the single-robot case (empty dynamic points) without needing any
         # extra fixture state.
         "_dynamic_obstacle_points_for_robot_object",
+        # Real, not stubbed: ensure_planner_services() now also refreshes
+        # PlannerServices.planning_grid_provider via this factory. It only
+        # returns a closure (or None) -- it never builds a grid itself --
+        # so binding it here adds no grid/belief work to this fixture.
+        "_planning_grid_provider_for_robot",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     return fake

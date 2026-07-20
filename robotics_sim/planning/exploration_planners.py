@@ -998,25 +998,40 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         candidates = self._preselect(candidates, robot_xy, max_candidates)
         max_frontier_size = max((c.size for c in candidates), default=1)
 
-        # Caller-supplied planning_grid (built by engine.py via the SAME
+        # Three-tier grid source, in priority order -- both #1 and #2 carry
+        # sanitized static observed geometry, other-robot dynamic points,
+        # and observed hazard (built by engine.py via the SAME
         # PlanningCostmapBuilder-backed adapter build_planner_kwargs()/
         # make_exploration_reachability_check() already use -- see
-        # SimulationControllerMixin.build_planning_grid_for_robot()) takes
-        # priority when given: it carries sanitized static observed
-        # geometry, other-robot dynamic points, and observed hazard, not
-        # just the belief map alone. Falls back to the belief-only grid
-        # this planner has always built on its own when no caller supplies
-        # one (e.g. direct/test callers, or callers with no live robot
-        # object to build one from) -- this fallback's behavior is
-        # unchanged from before.
+        # SimulationControllerMixin.build_planning_grid_for_robot()), never
+        # just the belief map alone:
+        #   1. kwargs["planning_grid"] -- an already-built grid, when a
+        #      caller happens to have one on hand.
+        #   2. kwargs["planning_grid_provider"] -- a Callable[[], grid],
+        #      invoked HERE, at most once, only by this planner. Other
+        #      planners in this module receive the same kwarg but never
+        #      read it, so they never trigger this build. This keeps grid
+        #      construction lazy: engine.py registers the provider once per
+        #      tick (see ensure_planner_services()) but nothing actually
+        #      builds a grid unless FoV scoring is genuinely reached.
+        #   3. Neither supplied (e.g. direct/test callers, or callers with
+        #      no live robot object to build one from): falls back to the
+        #      belief-only grid this planner has always built on its own --
+        #      this fallback's behavior is unchanged from before.
+        # #1/#2 are copied here so this function never mutates whatever the
+        # caller's grid/provider produced.
         supplied_planning_grid = kwargs.get("planning_grid")
         if supplied_planning_grid is not None:
-            planning_grid = supplied_planning_grid
+            planning_grid = supplied_planning_grid.copy()
         else:
-            planning_grid = belief.to_planning_grid(
-                unknown_is_traversable=True,
-                inflate_radius=max(0.0, robot_radius + safety_margin),
-            )
+            planning_grid_provider = kwargs.get("planning_grid_provider")
+            if callable(planning_grid_provider):
+                planning_grid = planning_grid_provider().copy()
+            else:
+                planning_grid = belief.to_planning_grid(
+                    unknown_is_traversable=True,
+                    inflate_radius=max(0.0, robot_radius + safety_margin),
+                )
 
         scored: list[FrontierCandidate] = []
 

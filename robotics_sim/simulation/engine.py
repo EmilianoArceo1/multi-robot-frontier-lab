@@ -1394,22 +1394,16 @@ class SimulationControllerMixin:
                 excluded_targets.append(agent.active_path_goal_xy)
 
         robot_radius = float(self.safety_radius())
-        # Same PlanningCostmapBuilder-backed adapter build_planner_kwargs()/
-        # make_exploration_reachability_check() already use (see
-        # build_planning_grid_for_robot()) -- reused here, not duplicated,
-        # so FoV/candidate scoring sees the same static/dynamic/hazard
-        # composition the real planner and reachability check do. None when
-        # there is no live robot yet; the planner falls back to its own
+        # LAZY: same _planning_grid_provider_for_robot() used to refresh
+        # PlannerServices.planning_grid_provider (see ensure_planner_
+        # services()) -- reused here, not duplicated, and not built eagerly.
+        # Only FoVAwareDirectionalFrontierPlanner.select_goal() ever calls
+        # this closure (at most once); every other exploration planner
+        # ignores the kwarg entirely, so no planning grid is built at all
+        # for those (unnecessary runtime work avoided). None when there is
+        # no live robot yet; the FoV planner falls back to its own
         # belief-only grid in that case (unchanged prior behavior).
-        planning_grid = (
-            self.build_planning_grid_for_robot(
-                self.robot,
-                robot_radius=robot_radius,
-                dynamic_obstacle_points=self._dynamic_obstacle_points_for_robot_object(self.robot),
-            )
-            if self.robot is not None
-            else None
-        )
+        planning_grid_provider = self._planning_grid_provider_for_robot(self.robot)
 
         result = select_exploration_goal(
             planner_name,
@@ -1429,7 +1423,7 @@ class SimulationControllerMixin:
                 if excluded_targets
                 else 0.0
             ),
-            planning_grid=planning_grid,
+            planning_grid_provider=planning_grid_provider,
         )
 
         selected_score = None
@@ -7838,15 +7832,30 @@ class SimulationControllerMixin:
     # loops are untouched; call these from the new architecture incrementally.
     # ========================================================
 
-    def ensure_planner_services(self):
+    def ensure_planner_services(self, robot=None):
         """Return the shared PlannerServices instance, creating it if needed.
 
-        Refreshes is_candidate_reachable on every call so exploration target
-        selection always checks against the current robot pose and map --
-        see make_exploration_reachability_check(). The callback itself is
-        now LAZY (see that method's docstring): this call only captures a
-        snapshot of robot pose/config, it does not sanitize obstacles or
-        build a planning grid.
+        Refreshes is_candidate_reachable AND planning_grid_provider on every
+        call so exploration target selection always checks against the
+        current robot pose and map -- see make_exploration_reachability_
+        check() and _planning_grid_provider_for_robot(). Both are LAZY (see
+        their own docstrings): this call only captures a snapshot of robot
+        pose/config and builds a closure, it does not sanitize obstacles or
+        build a planning grid itself.
+
+        robot -- explicit target robot for this refresh. Defaults to
+        self.robot (single-robot compat: the sole existing call site,
+        simulation_step(), keeps calling this with no argument). A
+        multi-robot caller that loops over self.robots and calls
+        agent.step() once per robot MUST pass that robot explicitly here,
+        right before each agent.step() call -- self.robot is only ever ONE
+        of possibly several robots and does not track "the robot this
+        iteration is for", so relying on it there would silently hand every
+        robot's agent.step() a provider (and reachability check) built for
+        the same wrong robot. The PlannerServices instance itself stays
+        shared/reused across robots either way (never one per robot) --
+        only its two callbacks are refreshed per call, exactly like the
+        single-robot case.
 
         planner_services_refresh_ms times this ENTIRE method as a single
         top-level section for the optional [PERF] summary -- diagnosis-only
@@ -7857,19 +7866,44 @@ class SimulationControllerMixin:
         measures only the remaining cheap snapshot/closure-creation work --
         see make_exploration_reachability_check()'s own docstring for where
         the (now lazy) nested sub-timings are recorded instead. Reading/
-        recording this timing never changes what is_candidate_reachable
-        does or how often this method is called.
+        recording this timing never changes what is_candidate_reachable/
+        planning_grid_provider do or how often this method is called.
         """
         if PlannerServices is None:
             return None
         if not hasattr(self, "_planner_services") or self._planner_services is None:
             self._planner_services = PlannerServices()
         _refresh_start = time.perf_counter()
-        self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(
-            getattr(self, "robot", None)
-        )
+        target_robot = robot if robot is not None else getattr(self, "robot", None)
+        self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(target_robot)
+        self._planner_services.planning_grid_provider = self._planning_grid_provider_for_robot(target_robot)
         _record_perf(self, "planner_services_refresh", time.perf_counter() - _refresh_start)
         return self._planner_services
+
+    def _planning_grid_provider_for_robot(self, robot):
+        """Build a LAZY Callable[[], OccupancyGrid] for PlannerServices.
+        planning_grid_provider -- closes over robot, does nothing until
+        actually called, and every call routes through the same
+        build_planning_grid_for_robot() adapter build_planner_kwargs()/
+        select_navigation_goal() use (never obstacle_points=, so it always
+        takes the NEW PlanningCostmapBuilder-backed path): static observed
+        geometry sanitized for THIS robot, other-runtime-robot dynamic
+        points, observed hazard, and the same padding/radius. None when
+        there is no live robot, mirroring make_exploration_reachability_
+        check()'s own None-when-no-robot behavior -- callers must check for
+        None before calling.
+        """
+        if robot is None:
+            return None
+
+        def _provider():
+            return self.build_planning_grid_for_robot(
+                robot,
+                robot_radius=self.safety_radius_for_robot(robot),
+                dynamic_obstacle_points=self._dynamic_obstacle_points_for_robot_object(robot),
+            )
+
+        return _provider
 
     def make_exploration_reachability_check(self, robot):
         """Build an is_candidate_reachable(xy) callback for PlannerServices,
@@ -8076,7 +8110,7 @@ class SimulationControllerMixin:
         form the new "engine as executor" contract:
 
             observation = self.build_observation(robot, agent, idx)
-            decision    = agent.step(observation, self.ensure_planner_services(), dt)
+            decision    = agent.step(observation, self.ensure_planner_services(robot), dt)
             should_brake = self.apply_navigation_decision(robot, agent, decision)
 
         Integration notes

@@ -553,6 +553,43 @@ class ExplorationBehavior:
 
         return excluded
 
+    def _reject_own_position_or_excluded(
+        self,
+        candidate: tuple[float, float],
+        observation: "RobotObservation",
+        excluded: list[tuple[float, float]],
+    ) -> tuple[float, float] | None:
+        """Defensive floor under every candidate source, not just the ones
+        that actually consult excluded_targets.
+
+        _frontier_candidates() filters against reserved/excluded targets
+        internally, but _forward_candidate() (the ray-cast bootstrap/
+        fallback used when no genuine frontier cluster is nearby -- see its
+        docstring) takes no excluded_targets parameter at all: it is a pure
+        function of belief/robot_xy/robot_heading. While the robot sits
+        motionless in a HOLD/retry cycle (pose unchanged between attempts),
+        it recomputes to the exact same point every time regardless of
+        anything _excluded_targets() ever recorded -- so a target that
+        engine.py just marked failed (e.g. repeated_safety_replan invalidating
+        it via invalidate_failed_exploration_route()) can come straight back
+        unchanged, defeating the exclusion and re-requesting a plan for a
+        point already known to fail, forever. Rejecting it here (instead of
+        trusting every candidate source to have honored the exclusion)
+        forces the caller on to the next fallback (map-wide search, then
+        RecoveryPolicy) instead of looping on the same doomed point.
+        """
+        if math.hypot(
+            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
+        ) <= observation.goal_tolerance:
+            return None
+
+        same_target_radius = max(observation.grid_resolution, 2.0 * observation.goal_tolerance)
+        for excluded_xy in excluded:
+            if math.hypot(candidate[0] - excluded_xy[0], candidate[1] - excluded_xy[1]) <= same_target_radius:
+                return None
+
+        return candidate
+
     def _pick_next_target(
         self,
         agent: "RobotAgent",
@@ -596,18 +633,7 @@ class ExplorationBehavior:
             return None
 
         candidate = (float(result.target[0]), float(result.target[1]))
-
-        # Belt-and-suspenders: reject a candidate at/near the robot's
-        # current position outright, regardless of whether the planner
-        # actually honored the exclusion above -- this is the guarantee
-        # that stops the near-zero-length route loop, independent of
-        # exploration-planner internals.
-        if math.hypot(
-            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
-        ) <= observation.goal_tolerance:
-            return None
-
-        return candidate
+        return self._reject_own_position_or_excluded(candidate, observation, excluded)
 
     def _pick_map_wide_fallback_target(
         self,
@@ -657,9 +683,4 @@ class ExplorationBehavior:
             return None
 
         candidate = (float(result.target[0]), float(result.target[1]))
-        if math.hypot(
-            candidate[0] - observation.robot_xy[0], candidate[1] - observation.robot_xy[1]
-        ) <= observation.goal_tolerance:
-            return None
-
-        return candidate
+        return self._reject_own_position_or_excluded(candidate, observation, excluded)

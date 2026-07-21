@@ -766,7 +766,14 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
     def frontier_candidates(self, **kwargs) -> list[FrontierCandidate]:
         belief = _belief_from_kwargs(kwargs)
         robot_xy = _as_point(kwargs["robot_xy"])
-        final_goal_xy = _as_point(kwargs.get("final_goal_xy", robot_xy))
+        # kwargs.get(..., robot_xy) only falls back when the key is MISSING --
+        # PlannerServices always passes final_goal_xy explicitly (even as
+        # None, for pure-exploration runs with no configured mission goal),
+        # so that default never actually applied; _as_point(None) crashed
+        # instead. final_goal_xy is legitimately Optional (see
+        # RobotObservation.final_goal_xy), so an explicit None must fall
+        # back to robot_xy too.
+        final_goal_xy = _as_point(kwargs.get("final_goal_xy") or robot_xy)
         robot_radius = float(kwargs.get("robot_radius", 0.0))
         target_exclusion_radius = float(kwargs.get("target_exclusion_radius", 1.0))
         dynamic_obstacle_margin = float(kwargs.get("dynamic_obstacle_margin", 0.25))

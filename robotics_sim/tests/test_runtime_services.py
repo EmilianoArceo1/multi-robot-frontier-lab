@@ -216,3 +216,83 @@ def test_runtime_frontier_information_service_can_convert_candidates_to_clusters
     assert len(all_robots) == 2
 
     assert RuntimeFrontierInformationService().get_frontier_clusters() == ()
+
+
+def test_runtime_frontier_information_service_returns_real_connected_components():
+    """With enough map data, get_frontier_clusters() must return real
+    detect_connected_frontier_components() output -- non-empty cells, the
+    connected-component source tag, and valid=True -- not the old
+    one-candidate-per-pseudo-cluster (cells=()) shape."""
+    explored_points = tuple((x * 0.5, 0.0) for x in range(-8, 9))
+    service = RuntimeFrontierInformationService(
+        explored_points=explored_points,
+        mapped_obstacle_points=(),
+        bounds=(-5.0, 5.0, -5.0, 5.0),
+        resolution=0.5,
+        robot_radius=0.35,
+        sensor_range=2.5,
+    )
+
+    clusters = service.get_frontier_clusters()
+
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert len(cluster.cells) > 0
+    assert cluster.metadata["source"] == "connected_frontier_component"
+    assert cluster.valid is True
+    assert len(cluster.viewpoints) > 1
+
+
+def test_runtime_frontier_information_service_robot_id_does_not_change_geometry():
+    """robot_id is only allowed to annotate metadata with
+    requested_for_robot_id -- it must never filter or regenerate the
+    detected components (cluster_id/cells/centroid/viewpoints/
+    information_gain/valid must stay identical)."""
+    explored_points = tuple((x * 0.5, 0.0) for x in range(-8, 9))
+    service = RuntimeFrontierInformationService(
+        explored_points=explored_points,
+        mapped_obstacle_points=(),
+        bounds=(-5.0, 5.0, -5.0, 5.0),
+        resolution=0.5,
+        robot_radius=0.35,
+        sensor_range=2.5,
+    )
+
+    unscoped = service.get_frontier_clusters()
+    scoped = service.get_frontier_clusters(robot_id=0)
+
+    assert len(unscoped) == len(scoped)
+    for plain, per_robot in zip(unscoped, scoped):
+        assert plain.cluster_id == per_robot.cluster_id
+        assert plain.cells == per_robot.cells
+        assert plain.centroid == per_robot.centroid
+        assert plain.viewpoints == per_robot.viewpoints
+        assert plain.information_gain == per_robot.information_gain
+        assert plain.valid == per_robot.valid
+        assert "requested_for_robot_id" not in plain.metadata
+        assert per_robot.metadata["requested_for_robot_id"] == 0
+        # Every other metadata key must survive untouched.
+        for key, value in plain.metadata.items():
+            assert per_robot.metadata[key] == value
+
+
+def test_runtime_frontier_information_service_legacy_fallback_when_map_is_insufficient():
+    """Without enough map data, get_frontier_clusters() must fall back to
+    legacy_candidates_by_robot -- adapters with cells=() and
+    legacy_adapter=True in metadata -- and never mix them with real
+    components (there are none to mix with here)."""
+    candidates = (
+        ExplorationCandidate(target=(2.0, 0.0), source="team_frontier", information_gain=5.0),
+        ExplorationCandidate(target=(0.0, 3.0), source="team_frontier", information_gain=7.0),
+    )
+    service = RuntimeFrontierInformationService(legacy_candidates_by_robot={0: candidates})
+
+    clusters = service.get_frontier_clusters(robot_id=0)
+
+    assert len(clusters) == 2
+    targets = [cluster.centroid for cluster in clusters]
+    assert targets == [(2.0, 0.0), (0.0, 3.0)]
+    for cluster in clusters:
+        assert cluster.cells == ()
+        assert cluster.valid is True
+        assert cluster.metadata["legacy_adapter"] is True

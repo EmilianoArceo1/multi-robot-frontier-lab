@@ -692,6 +692,68 @@ class SimulationCanvas(QWidget):
         self._static_plot_cache = None
         self._static_plot_cache_size = None
 
+    def is_monochrome_discovery_mode(self) -> bool:
+        return (
+            getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION)
+            == "Monochrome Discovery"
+        )
+
+    def is_custom_discovery_mode(self) -> bool:
+        return (
+            getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION)
+            == "Custom Discovery"
+        )
+
+    def is_shared_discovery_mode(self) -> bool:
+        """Rendering-only discovery presentations with one shared team color."""
+        return self.is_monochrome_discovery_mode() or self.is_custom_discovery_mode()
+
+    @staticmethod
+    def _valid_config_color(value: str, fallback: str) -> QColor:
+        color = QColor(str(value))
+        return color if color.isValid() else QColor(str(fallback))
+
+    def plot_background_color(self) -> QColor:
+        if self.is_monochrome_discovery_mode():
+            return QColor(0, 0, 0)
+        if self.is_custom_discovery_mode():
+            return self._valid_config_color(
+                getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
+                DEFAULT_CUSTOM_UNEXPLORED_COLOR,
+            )
+        return QColor(theme_colors(self._theme_mode).app_background)
+
+    def explored_area_color(self, robot_index: int | None = None) -> QColor:
+        """Return the free-space discovery color without affecting obstacles."""
+        if self.is_monochrome_discovery_mode():
+            if self._theme_mode == ThemeMode.DARK:
+                return QColor(184, 190, 198)
+            return QColor(248, 249, 251)
+        if self.is_custom_discovery_mode():
+            return self._valid_config_color(
+                getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
+                DEFAULT_CUSTOM_EXPLORED_COLOR,
+            )
+        if robot_index is None or int(robot_index) < 0:
+            return QColor(BLUE)
+        return robot_color(int(robot_index))
+
+    def sensor_display_color(self, robot_index: int | None = None) -> QColor:
+        if self.is_monochrome_discovery_mode():
+            return QColor(255, 255, 255)
+        if self.is_custom_discovery_mode():
+            return self.explored_area_color(robot_index)
+        if robot_index is None or int(robot_index) < 0:
+            return QColor(BLUE)
+        return robot_color(int(robot_index))
+
+    def discovery_contrast_color(self, alpha: int) -> QColor:
+        """Black or white canvas chrome chosen against the unknown color."""
+        background = self.plot_background_color()
+        color = QColor(0, 0, 0) if background.lightness() >= 150 else QColor(255, 255, 255)
+        color.setAlpha(max(0, min(255, int(alpha))))
+        return color
+
     def set_theme_mode(self, mode: ThemeMode | str) -> None:
         """Re-theme the canvas chrome (card/header/plot backdrop/borders and
         the obstacle/explored-area tints that must stand out against a dark
@@ -705,6 +767,9 @@ class SimulationCanvas(QWidget):
         self.invalidate_static_plot_cache()
         self.invalidate_obstacles_cache()
         self.invalidate_explored_area_cache()
+        self.invalidate_mapped_points_cache()
+        self._grid_overlay_cache = None
+        self._grid_overlay_cache_key = None
         self.update()
 
     def invalidate_explored_area_cache(self):
@@ -835,6 +900,13 @@ class SimulationCanvas(QWidget):
         previous_obstacles = getattr(self.config, "obstacles", None)
         previous_vision = getattr(self.config, "vision", None)
         previous_vision_model = getattr(self.config, "vision_model", None)
+        previous_visualization = getattr(
+            self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION
+        )
+        previous_discovery_colors = (
+            getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
+            getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
+        )
         previous_camera = (
             getattr(self.config, "camera_center_x", None),
             getattr(self.config, "camera_center_y", None),
@@ -842,6 +914,18 @@ class SimulationCanvas(QWidget):
             getattr(self.config, "camera_height", None),
         )
         self.config = config
+        current_discovery_colors = (
+            config.custom_unexplored_color,
+            config.custom_explored_color,
+        )
+        if (
+            previous_visualization != config.map_visualization
+            or previous_discovery_colors != current_discovery_colors
+        ):
+            self.invalidate_static_plot_cache()
+            self.invalidate_explored_area_cache()
+            self._grid_overlay_cache = None
+            self._grid_overlay_cache_key = None
         if previous_spacing != config.mapping_point_spacing or previous_obstacles != config.obstacles:
             self.invalidate_obstacle_coverage_cache()
             self.invalidate_obstacles_cache()
@@ -2162,7 +2246,7 @@ class SimulationCanvas(QWidget):
         rect = self.plot_rect()
         cache_painter.save()
         cache_painter.setClipRect(rect)
-        cache_painter.fillRect(rect, QColor(theme_colors(self._theme_mode).app_background))
+        cache_painter.fillRect(rect, self.plot_background_color())
         self.draw_grid(cache_painter, rect)
         cache_painter.restore()
         cache_painter.end()
@@ -2199,6 +2283,8 @@ class SimulationCanvas(QWidget):
         near-white canvas) up for dark mode, where the same low alpha over a
         near-black backdrop barely reads. Same hue/robot color either way --
         only how strongly it stands out from the backdrop changes."""
+        if self.is_shared_discovery_mode():
+            return 255
         if self._theme_mode == ThemeMode.DARK:
             return min(255, int(light_alpha * 2.8))
         return light_alpha
@@ -2263,7 +2349,9 @@ class SimulationCanvas(QWidget):
             return
         cache_painter.setPen(Qt.NoPen)
         for robot_index in range(mask.shape[0]):
-            color = QColor(BLUE) if mask.shape[0] == 1 else robot_color(robot_index)
+            color = self.explored_area_color(
+                None if mask.shape[0] == 1 else robot_index
+            )
             color.setAlpha(alpha)
             self._paint_explored_mask_layer_to_cache(
                 cache_painter, mask[robot_index], resolution, bounds,
@@ -2288,7 +2376,7 @@ class SimulationCanvas(QWidget):
         )
         if cell_bounds is None:
             return
-        color = robot_color(robot_index)
+        color = self.explored_area_color(robot_index)
         color.setAlpha(alpha)
         cache_painter.setPen(Qt.NoPen)
         self._paint_explored_mask_layer_to_cache(
@@ -2379,7 +2467,7 @@ class SimulationCanvas(QWidget):
                 if world_path is not None and not world_path.isEmpty():
                     self._paint_explored_path_to_cache(
                         cache_painter, world_path,
-                        color=robot_color(robot_index),
+                        color=self.explored_area_color(robot_index),
                         alpha=self._explored_area_alpha(24),
                     )
                 elif mask is not None and 0 <= robot_index < mask.shape[0]:
@@ -2408,7 +2496,7 @@ class SimulationCanvas(QWidget):
             cache_painter.setClipRect(self.plot_rect())
             self._paint_explored_path_to_cache(
                 cache_painter, single_path,
-                color=QColor(BLUE), alpha=self._explored_area_alpha(24),
+                color=self.explored_area_color(None), alpha=self._explored_area_alpha(24),
             )
             cache_painter.restore()
             cache_painter.end()
@@ -2468,12 +2556,12 @@ class SimulationCanvas(QWidget):
                 self.rebuild_explored_area_cache()
                 return
             target_cache = self._explored_area_cache
-            fill_color = QColor(35, 111, 207)
+            fill_color = self.explored_area_color(None)
             fill_color.setAlpha(self._explored_area_alpha(24))
             composition_mode = QPainter.CompositionMode_Source
         else:
             target_cache = self.ensure_robot_explored_area_cache(int(robot_index))
-            fill_color = robot_color(int(robot_index))
+            fill_color = self.explored_area_color(int(robot_index))
             fill_color.setAlpha(self._explored_area_alpha(24))
 
             # Same principle as single-robot explored area: each robot owns a
@@ -2527,9 +2615,8 @@ class SimulationCanvas(QWidget):
         cache_painter = QPainter(self._mapped_points_cache)
         cache_painter.setRenderHint(QPainter.Antialiasing)
         cache_painter.setClipRect(self.plot_rect())
-        # Neon pink-red, deliberately the same in both themes -- these dots
-        # mark the robot's own discovered obstacle samples and must stay
-        # unmistakably loud against either a light or a dark canvas.
+        # Obstacle mapping intentionally ignores the map presentation mode.
+        # These are the same neon samples used by the existing/default view.
         cache_painter.setPen(QPen(QColor(179, 0, 54, 210), 0.6))
         cache_painter.setBrush(QBrush(QColor(255, 23, 92, 235)))
 
@@ -2566,7 +2653,7 @@ class SimulationCanvas(QWidget):
         if self._static_plot_cache is not None:
             painter.drawPixmap(0, 0, self._static_plot_cache)
         else:
-            painter.fillRect(rect, QColor(theme_colors(self._theme_mode).app_background))
+            painter.fillRect(rect, self.plot_background_color())
             self.draw_grid(painter, rect)
         self._last_background_cache_hit = cache_hit
         self._render_layer_ms["background"] = (time.perf_counter() - _background_start) * 1000.0
@@ -2752,6 +2839,7 @@ class SimulationCanvas(QWidget):
         world-axis line itself (GRID_AXIS) is semantic and deliberately
         untouched -- see theme.py's module docstring."""
         c = theme_colors(self._theme_mode)
+        discovery = self.is_shared_discovery_mode()
         left, right, bottom, top = self.render_view_bounds_world()
         span_x = max(0.1, right - left)
         span_y = max(0.1, top - bottom)
@@ -2761,7 +2849,8 @@ class SimulationCanvas(QWidget):
         painter.save()
 
         # Minor grid.
-        painter.setPen(QPen(QColor(c.border), 1))
+        minor_color = self.discovery_contrast_color(18) if discovery else QColor(c.border)
+        painter.setPen(QPen(minor_color, 1))
         start_x = math.floor(left / minor_step) * minor_step
         x = start_x
         while x <= right + minor_step * 0.5:
@@ -2778,9 +2867,12 @@ class SimulationCanvas(QWidget):
 
         # Major grid and coordinate labels.
         painter.setFont(QFont("Consolas", 7))
-        label_color = QColor(c.text_secondary)
-        major_pen = QPen(QColor(c.border_strong), 1.15)
-        axis_pen = QPen(GRID_AXIS, 1.8)
+        label_color = self.discovery_contrast_color(150) if discovery else QColor(c.text_secondary)
+        major_pen = QPen(
+            self.discovery_contrast_color(34) if discovery else QColor(c.border_strong),
+            1.15,
+        )
+        axis_pen = QPen(self.discovery_contrast_color(72) if discovery else GRID_AXIS, 1.8)
 
         x = math.floor(left / step) * step
         while x <= right + step * 0.5:
@@ -3237,6 +3329,9 @@ class SimulationCanvas(QWidget):
             self.height(),
             tuple(round(float(bound), 2) for bound in self.render_view_bounds_world()),
             snapshot_version if cell_bounds is not None else -1,
+            getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION),
+            getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
+            getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
         )
 
         if self._grid_overlay_cache is not None and self._grid_overlay_cache_key == cache_key:
@@ -3288,7 +3383,12 @@ class SimulationCanvas(QWidget):
     def _draw_grid_overlay_lines(self, painter: QPainter, rect, resolution: float) -> None:
         left, right, bottom, top = self.render_view_bounds_world()
 
-        painter.setPen(QPen(QColor(90, 90, 90, 70), 1))
+        line_color = (
+            self.discovery_contrast_color(45)
+            if self.is_shared_discovery_mode()
+            else QColor(90, 90, 90, 70)
+        )
+        painter.setPen(QPen(line_color, 1))
 
         x = math.floor(left / resolution) * resolution
         while x <= right + resolution * 0.5:
@@ -3323,8 +3423,16 @@ class SimulationCanvas(QWidget):
         x_min, _x_max, y_min, _y_max = bounds
         col_start, col_end, row_start, row_end = cell_bounds
 
-        unknown_brush = QBrush(QColor(120, 120, 120, 35))
-        free_brush = QBrush(QColor(60, 140, 220, 45))
+        if self.is_shared_discovery_mode():
+            unknown_brush = QBrush(QColor(0, 0, 0, 0))
+            free = self.explored_area_color()
+            free.setAlpha(36)
+            free_brush = QBrush(free)
+        else:
+            unknown_brush = QBrush(QColor(120, 120, 120, 35))
+            free_brush = QBrush(QColor(60, 140, 220, 45))
+
+        # Occupied cells keep the existing obstacle-map color in every mode.
         occupied_brush = QBrush(QColor(220, 40, 40, 80))
 
         painter.setPen(Qt.NoPen)
@@ -3432,6 +3540,9 @@ class SimulationCanvas(QWidget):
             self.height(),
             self._view_transform_signature(),
             self._theme_mode,
+            getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION),
+            getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
+            getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
         )
         if self._nav_debug_explored_cache is None or self._nav_debug_explored_cache_key != cache_key:
             cache = QPixmap(self.size())
@@ -3505,9 +3616,13 @@ class SimulationCanvas(QWidget):
             return
 
         fill = QColor(color)
-        fill.setAlpha(alpha_fill)
         stroke = QColor(color)
-        stroke.setAlpha(alpha_stroke)
+        if self.is_shared_discovery_mode():
+            fill.setAlpha(max(alpha_fill, 48))
+            stroke.setAlpha(max(alpha_stroke, 205))
+        else:
+            fill.setAlpha(alpha_fill)
+            stroke.setAlpha(alpha_stroke)
 
         visible_path = QPainterPath()
         sx, sy = self.world_to_screen(*polygon[0])
@@ -3516,6 +3631,14 @@ class SimulationCanvas(QWidget):
             px, py = self.world_to_screen(*point)
             visible_path.lineTo(px, py)
         visible_path.closeSubpath()
+
+        if self.is_shared_discovery_mode():
+            # Contrast outline keeps the shared FoV boundary readable over
+            # either the unexplored or explored custom color.
+            under = QColor(0, 0, 0, 125) if color.lightness() >= 128 else QColor(255, 255, 255, 135)
+            painter.setPen(QPen(under, 3.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(visible_path)
 
         painter.setPen(QPen(stroke, 1.4))
         painter.setBrush(QBrush(fill))
@@ -3601,7 +3724,7 @@ class SimulationCanvas(QWidget):
                     float(getattr(historical_snapshot.sensor, "vision_range", 0.0) or self.config.vision),
                 )
             painter.save()
-            self.draw_sensor_polygon(painter, polygon, QColor(BLUE))
+            self.draw_sensor_polygon(painter, polygon, self.sensor_display_color(None))
             painter.restore()
             self._fov_detail["robot_fov_cache_hit"] = True
             return
@@ -3609,7 +3732,7 @@ class SimulationCanvas(QWidget):
         painter.save()
         cache_hit_this_frame = True
         for cache_key, x, y, theta, vision in self.sensor_display_poses():
-            color = QColor(BLUE) if cache_key < 0 else robot_color(cache_key)
+            color = self.sensor_display_color(cache_key)
 
             _compute_start = time.perf_counter()
             previously_cached = self._sensor_polygon_caches_by_robot.get(int(cache_key))
@@ -3881,10 +4004,9 @@ class SimulationCanvas(QWidget):
     ) -> None:
         """Draw one connected obstacle object without internal seams.
 
-        These are still the same neutral-gray tones on both themes (obstacles
-        stay obstacles, not chrome) -- but in dark mode the fill/stroke are
-        lifted several notches lighter so they read clearly against the dark
-        canvas backdrop instead of the mid-gray tuned for a near-white one.
+        Obstacle rendering is intentionally independent from map visualization.
+        Switching discovery colors must not alter ground-truth or mapped
+        obstacle appearance.
         """
         path = self.obstacle_group_screen_path(indices)
         if path.isEmpty():
@@ -5020,17 +5142,138 @@ class SimulationCanvas(QWidget):
         painter.restore()
         self._route_detail["executed_trail_paint_ms"] = (time.perf_counter() - _paint_start) * 1000.0
 
+    def draw_robot_icon(
+        self,
+        painter: QPainter,
+        sx: float,
+        sy: float,
+        body_px: float,
+        color: QColor,
+        *,
+        theta: float = 0.0,
+        label: str | None = None,
+        outline_width: float = 2.0,
+        label_font_size: int = 8,
+    ) -> None:
+        """Draw one robot marker using the selected presentation icon.
+
+        All three choices are vector shapes, so no external image assets or
+        GUI-scale-dependent pixmaps are needed. The icon choice is rendering
+        only and does not alter body/safety radii or collision geometry.
+        """
+        icon = getattr(self.config, "robot_icon", DEFAULT_ROBOT_ICON)
+        requested_radius = float(body_px)
+        radius = (
+            requested_radius
+            if icon == "Circle"
+            else max(6.0, requested_radius)
+        )
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.translate(float(sx), float(sy))
+        painter.rotate(-math.degrees(float(theta)))
+
+        outline = QColor(255, 255, 255, 245)
+        dark_detail = QColor(28, 31, 36, 235)
+
+        if icon == "Drone":
+            arm_extent = radius * 0.72
+            painter.setPen(QPen(outline, max(1.4, radius * 0.18), Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(-arm_extent, -arm_extent), QPointF(arm_extent, arm_extent))
+            painter.drawLine(QPointF(-arm_extent, arm_extent), QPointF(arm_extent, -arm_extent))
+
+            rotor_radius = max(2.1, radius * 0.27)
+            painter.setPen(QPen(outline, max(1.0, radius * 0.12)))
+            painter.setBrush(QBrush(color.darker(118)))
+            for cx, cy in (
+                (-arm_extent, -arm_extent),
+                (arm_extent, -arm_extent),
+                (-arm_extent, arm_extent),
+                (arm_extent, arm_extent),
+            ):
+                painter.drawEllipse(
+                    QRectF(
+                        cx - rotor_radius,
+                        cy - rotor_radius,
+                        2.0 * rotor_radius,
+                        2.0 * rotor_radius,
+                    )
+                )
+
+            body = QRectF(-radius * 0.48, -radius * 0.36, radius * 0.96, radius * 0.72)
+            painter.setPen(QPen(outline, max(1.2, radius * 0.14)))
+            painter.setBrush(QBrush(color))
+            painter.drawRoundedRect(body, radius * 0.18, radius * 0.18)
+
+        elif icon == "Wheeled Robot":
+            body = QRectF(-radius * 0.76, -radius * 0.58, radius * 1.52, radius * 1.16)
+            wheel_w = max(2.0, radius * 0.24)
+            wheel_h = radius * 0.72
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(dark_detail))
+            painter.drawRoundedRect(
+                QRectF(-radius * 0.88, -wheel_h / 2.0, wheel_w, wheel_h),
+                wheel_w * 0.35,
+                wheel_w * 0.35,
+            )
+            painter.drawRoundedRect(
+                QRectF(radius * 0.88 - wheel_w, -wheel_h / 2.0, wheel_w, wheel_h),
+                wheel_w * 0.35,
+                wheel_w * 0.35,
+            )
+
+            painter.setPen(QPen(outline, max(1.2, radius * 0.14)))
+            painter.setBrush(QBrush(color))
+            painter.drawRoundedRect(body, radius * 0.22, radius * 0.22)
+
+            # Front-direction marker. It makes orientation visible without
+            # bringing back the old always-on heading arrow.
+            painter.setPen(QPen(outline, max(1.2, radius * 0.13), Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(
+                QPointF(radius * 0.30, -radius * 0.28),
+                QPointF(radius * 0.62, 0.0),
+            )
+            painter.drawLine(
+                QPointF(radius * 0.62, 0.0),
+                QPointF(radius * 0.30, radius * 0.28),
+            )
+
+        else:
+            painter.setPen(QPen(outline, float(outline_width)))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(QRectF(-radius, -radius, 2.0 * radius, 2.0 * radius))
+
+        if label:
+            # Keep IDs upright even though drone/wheeled shapes rotate with
+            # the robot heading.
+            painter.save()
+            painter.rotate(math.degrees(float(theta)))
+            painter.setFont(QFont("Segoe UI", int(label_font_size), QFont.Bold))
+            painter.setPen(QPen(outline))
+            painter.drawText(
+                QRectF(-radius, -radius, 2.0 * radius, 2.0 * radius),
+                Qt.AlignCenter,
+                str(label),
+            )
+            painter.restore()
+
+        painter.restore()
+
     def draw_goal_and_robot(self, painter: QPainter):
         history_position, _history_total = self._nav_debug_history_position
         if self.navigation_debug_enabled and history_position is not None and self._nav_debug_snapshot is not None:
             snapshot = self._nav_debug_snapshot
             rx, ry = self.world_to_screen(snapshot.robot_pose.x, snapshot.robot_pose.y)
             body_px = max(5.0, float(snapshot.safety.robot_radius) * self.pixels_per_meter())
-            painter.save()
-            painter.setPen(QPen(QColor("white"), 2.0))
-            painter.setBrush(QBrush(QColor(BLUE)))
-            painter.drawEllipse(QRectF(rx - body_px, ry - body_px, 2 * body_px, 2 * body_px))
-            painter.restore()
+            self.draw_robot_icon(
+                painter,
+                rx,
+                ry,
+                body_px,
+                QColor(BLUE),
+                theta=float(snapshot.robot_pose.theta),
+            )
             return
 
         x, y, theta, _ = self.current_robot_pose()
@@ -5124,14 +5367,17 @@ class SimulationCanvas(QWidget):
                     painter.setBrush(QBrush(QColor(225, 126, 38, 45)))
                     painter.drawEllipse(QRectF(sx - body_px - 8, sy - body_px - 8, 2 * (body_px + 8), 2 * (body_px + 8)))
 
-                fill = robot_color(index)
-                painter.setPen(QPen(QColor("white"), 2.4 if is_selected else 1.8))
-                painter.setBrush(QBrush(fill))
-                painter.drawEllipse(QRectF(sx - body_px, sy - body_px, 2 * body_px, 2 * body_px))
-
-                painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
-                painter.setPen(QPen(QColor("white")))
-                painter.drawText(QRectF(sx - body_px, sy - body_px, 2 * body_px, 2 * body_px), Qt.AlignCenter, str(index + 1))
+                self.draw_robot_icon(
+                    painter,
+                    sx,
+                    sy,
+                    body_px,
+                    robot_color(index),
+                    theta=float(robot_cfg.theta),
+                    label=str(index + 1),
+                    outline_width=2.4 if is_selected else 1.8,
+                    label_font_size=8,
+                )
 
             painter.restore()
             return
@@ -5151,13 +5397,17 @@ class SimulationCanvas(QWidget):
                 color = robot_color(index)
                 body_px = max(5.0, float(getattr(robot, "_sim_body_radius", self.config.body_radius)) * px_per_meter)
 
-                painter.setPen(QPen(QColor("white"), 2.2))
-                painter.setBrush(QBrush(color))
-                painter.drawEllipse(QRectF(sx - body_px, sy - body_px, 2 * body_px, 2 * body_px))
-
-                painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
-                painter.setPen(QPen(QColor("white")))
-                painter.drawText(QRectF(sx - body_px, sy - body_px, 2 * body_px, 2 * body_px), Qt.AlignCenter, str(index + 1))
+                self.draw_robot_icon(
+                    painter,
+                    sx,
+                    sy,
+                    body_px,
+                    color,
+                    theta=float(getattr(robot, "theta", 0.0)),
+                    label=str(index + 1),
+                    outline_width=2.2,
+                    label_font_size=8,
+                )
 
             painter.restore()
             return
@@ -5166,13 +5416,16 @@ class SimulationCanvas(QWidget):
         # heading arrow was dropped -- the Navigation Debug overlay draws a
         # heading ray instead (see draw_navigation_debug_heading_rays()),
         # only when that layer is active, instead of an always-on red arrow.
-        painter.save()
         px_per_meter = self.pixels_per_meter()
         body_px = max(5.0, float(self.config.body_radius) * px_per_meter)
-        painter.setPen(QPen(QColor("white"), 2.0))
-        painter.setBrush(QBrush(QColor(BLUE)))
-        painter.drawEllipse(QRectF(rx - body_px, ry - body_px, 2 * body_px, 2 * body_px))
-        painter.restore()
+        self.draw_robot_icon(
+            painter,
+            rx,
+            ry,
+            body_px,
+            QColor(BLUE),
+            theta=float(theta),
+        )
 
     def _navigation_debug_pick_live_terms(self, snapshot):
         """Pick whichever safety check is most relevant to show as the live

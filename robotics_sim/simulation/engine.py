@@ -1093,6 +1093,10 @@ class SimulationControllerMixin:
             vision_model=self.vision_combo.currentText(),
             agent_mode=self.top_bar.mode_selector.currentText(),
             grid_resolution=max(0.10, float(self.grid_resolution_input.value())),
+            map_visualization=self.map_visualization_combo.currentText(),
+            custom_unexplored_color=self.custom_unexplored_color_button.color_hex(),
+            custom_explored_color=self.custom_explored_color_button.color_hex(),
+            robot_icon=self.robot_icon_combo.currentText(),
             obstacles=list(self.config.obstacles),
             show_goal_preview=self.preview_switch.isChecked(),
             show_path=True,
@@ -1163,6 +1167,10 @@ class SimulationControllerMixin:
         self.ipp_lambda_input.setValue(config.ipp_distance_penalty)
         self.grid_resolution_input.setValue(config.grid_resolution)
         self.vision_combo.setCurrentText(config.vision_model)
+        self.map_visualization_combo.setCurrentText(config.map_visualization)
+        self.custom_unexplored_color_button.set_color(config.custom_unexplored_color)
+        self.custom_explored_color_button.set_color(config.custom_explored_color)
+        self.robot_icon_combo.setCurrentText(config.robot_icon)
         self.top_bar.mode_selector.setCurrentText(config.agent_mode)
 
         self.multi_robot_configs = normalized_robot_start_configs(config)

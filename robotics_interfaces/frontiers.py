@@ -11,7 +11,7 @@ exists.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from robotics_interfaces.observations import Point2D
@@ -69,6 +69,7 @@ class FrontierCluster:
     viewpoints: tuple[ViewpointCandidate, ...] = ()
     information_gain: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    valid: bool = True
 
     @property
     def best_viewpoint(self) -> ViewpointCandidate | None:
@@ -80,8 +81,21 @@ class FrontierCluster:
     def as_exploration_candidate(self, source: str = "frontier_cluster") -> ExplorationCandidate | None:
         """Convert this cluster's best viewpoint into a plain
         ExplorationCandidate, so any existing target-generation plugin can
-        consume a frontier cluster without knowing this module exists."""
+        consume a frontier cluster without knowing this module exists.
+
+        Always stamps cluster_id/frontier_cell_count/cluster_valid into the
+        result's metadata -- this is the provenance a benchmark/plugin needs
+        to trace an assignment back to this cluster -- without touching any
+        other key the viewpoint's own metadata already set.
+        """
         best = self.best_viewpoint
         if best is None:
             return None
-        return best.as_exploration_candidate(source=source)
+        candidate = best.as_exploration_candidate(source=source)
+        metadata = {
+            **dict(candidate.metadata),
+            "cluster_id": self.cluster_id,
+            "frontier_cell_count": len(self.cells),
+            "cluster_valid": self.valid,
+        }
+        return replace(candidate, metadata=metadata)

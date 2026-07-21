@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QSize, Qt, QRectF
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush
+from PySide6.QtCore import QSize, Qt, QRectF, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QBrush, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -42,6 +43,55 @@ from robotics_sim.app.widgets import (
     ToggleSwitch,
     make_icon,
 )
+
+
+class ColorPickerButton(QPushButton):
+    """Compact RGB selector that stores a normalized #RRGGBB value."""
+
+    colorChanged = Signal(str)
+
+    def __init__(self, color: str, dialog_title: str):
+        super().__init__()
+        self._color = QColor(color)
+        if not self._color.isValid():
+            self._color = QColor("#000000")
+        self._dialog_title = str(dialog_title)
+        self.setMinimumHeight(34)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.clicked.connect(self._choose_color)
+        self._refresh_swatch()
+
+    def color_hex(self) -> str:
+        return self._color.name().upper()
+
+    def set_color(self, color: str) -> None:
+        candidate = QColor(str(color))
+        if not candidate.isValid():
+            return
+        normalized = candidate.name().upper()
+        changed = normalized != self.color_hex()
+        self._color = candidate
+        self._refresh_swatch()
+        if changed:
+            self.colorChanged.emit(normalized)
+
+    def _choose_color(self) -> None:
+        selected = QColorDialog.getColor(self._color, self, self._dialog_title)
+        if selected.isValid():
+            self.set_color(selected.name())
+
+    def _refresh_swatch(self) -> None:
+        swatch = QPixmap(20, 20)
+        swatch.fill(Qt.transparent)
+        painter = QPainter(swatch)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(96, 101, 112), 1.0))
+        painter.setBrush(QBrush(self._color))
+        painter.drawRoundedRect(QRectF(1.0, 1.0, 18.0, 18.0), 3.0, 3.0)
+        painter.end()
+        self.setIcon(QIcon(swatch))
+        self.setIconSize(QSize(20, 20))
+        self.setText(self.color_hex())
 
 
 class BrushSizePreview(QWidget):
@@ -117,6 +167,21 @@ def labeled_toggle(label: str, switch: ToggleSwitch):
 
     return box
 
+
+
+def labeled_color_picker(label: str, picker: ColorPickerButton):
+    box = QWidget()
+
+    layout = QVBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(5)
+
+    lbl = QLabel(label)
+    lbl.setObjectName("fieldLabel")
+
+    layout.addWidget(lbl)
+    layout.addWidget(picker)
+    return box
 
 
 def labeled_combo(label: str, combo: QComboBox):
@@ -223,6 +288,23 @@ def build_config_panel(window):
         "Omnidirectional",
     ])
 
+    window.map_visualization_combo = QComboBox()
+    window.map_visualization_combo.addItems(MAP_VISUALIZATION_OPTIONS)
+    window.map_visualization_combo.setCurrentText(DEFAULT_MAP_VISUALIZATION)
+
+    window.custom_unexplored_color_button = ColorPickerButton(
+        DEFAULT_CUSTOM_UNEXPLORED_COLOR,
+        "Choose unexplored-area color",
+    )
+    window.custom_explored_color_button = ColorPickerButton(
+        DEFAULT_CUSTOM_EXPLORED_COLOR,
+        "Choose explored-area color",
+    )
+
+    window.robot_icon_combo = QComboBox()
+    window.robot_icon_combo.addItems(ROBOT_ICON_OPTIONS)
+    window.robot_icon_combo.setCurrentText(DEFAULT_ROBOT_ICON)
+
     window.obstacles_switch = ToggleSwitch(True)
     window.explored_area_switch = ToggleSwitch(True)
 
@@ -244,15 +326,39 @@ def build_config_panel(window):
         1,
     )
     options_grid.addWidget(
-        labeled_combo("Path Planner Service", window.planner_combo),
+        labeled_combo("Map Visualization", window.map_visualization_combo),
         1,
+        0,
+        1,
+        2,
+    )
+    window.custom_unexplored_color_field = labeled_color_picker(
+        "Unexplored Color",
+        window.custom_unexplored_color_button,
+    )
+    window.custom_explored_color_field = labeled_color_picker(
+        "Explored Color",
+        window.custom_explored_color_button,
+    )
+    options_grid.addWidget(window.custom_unexplored_color_field, 2, 0)
+    options_grid.addWidget(window.custom_explored_color_field, 2, 1)
+    options_grid.addWidget(
+        labeled_combo("Robot Icon", window.robot_icon_combo),
+        3,
+        0,
+        1,
+        2,
+    )
+    options_grid.addWidget(
+        labeled_combo("Path Planner Service", window.planner_combo),
+        4,
         0,
         1,
         2,
     )
     options_grid.addWidget(
         labeled_combo("Vision Model", window.vision_combo),
-        2,
+        5,
         0,
         1,
         2,
@@ -263,7 +369,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        3,
+        5,
         0,
         1,
         2,
@@ -275,7 +381,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        4,
+        6,
         0,
         1,
         2,
@@ -287,7 +393,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        5,
+        7,
         0,
         1,
         2,
@@ -303,7 +409,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        6,
+        8,
         0,
         1,
         2,
@@ -319,7 +425,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        6,
+        8,
         0,
         1,
         2,
@@ -341,7 +447,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        7,
+        9,
         0,
         1,
         2,
@@ -357,7 +463,7 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        8,
+        10,
         0,
     )
 
@@ -378,7 +484,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Hazard Map", window.hazard_map_toggle),
-        8,
+        10,
         1,
     )
     window.fire_markers_toggle = ToggleSwitch(False)
@@ -387,7 +493,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Fire Markers", window.fire_markers_toggle),
-        9,
+        11,
         0,
     )
 
@@ -708,6 +814,17 @@ def build_config_panel(window):
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
     window.coordinator_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)
+    def update_custom_color_visibility(mode: str) -> None:
+        visible = str(mode) == "Custom Discovery"
+        window.custom_unexplored_color_field.setVisible(visible)
+        window.custom_explored_color_field.setVisible(visible)
+
+    window.map_visualization_combo.currentTextChanged.connect(update_custom_color_visibility)
+    window.map_visualization_combo.currentTextChanged.connect(window.update_preview)
+    window.custom_unexplored_color_button.colorChanged.connect(window.update_preview)
+    window.custom_explored_color_button.colorChanged.connect(window.update_preview)
+    update_custom_color_visibility(window.map_visualization_combo.currentText())
+    window.robot_icon_combo.currentTextChanged.connect(window.update_preview)
     window.obstacles_switch.toggled.connect(window.update_preview)
     window.explored_area_switch.toggled.connect(window.update_preview)
     window.body_radius_slider.valueChanged.connect(window.enforce_radius_consistency)

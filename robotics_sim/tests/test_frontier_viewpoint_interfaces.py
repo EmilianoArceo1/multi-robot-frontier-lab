@@ -63,6 +63,59 @@ def test_frontier_cluster_exposes_best_viewpoint():
     assert empty_cluster.as_exploration_candidate() is None
 
 
+def test_frontier_cluster_defaults_to_valid_true():
+    cluster = FrontierCluster(cluster_id="cluster-0")
+    assert cluster.valid is True
+
+    invalid_cluster = FrontierCluster(cluster_id="cluster-1", valid=False)
+    assert invalid_cluster.valid is False
+
+
+def test_as_exploration_candidate_stamps_cluster_provenance_into_metadata():
+    """The benchmark now requires every assignment to be traceable back to a
+    cluster_id -- as_exploration_candidate() must stamp cluster_id,
+    frontier_cell_count, and cluster_valid into metadata, while preserving
+    whatever else the viewpoint's own metadata already carried."""
+    viewpoint = ViewpointCandidate(
+        xy=(3.0, 0.0),
+        information_gain=9.0,
+        metadata={"slice_index": 1, "component_id": "frontier-component-0000"},
+    )
+    cluster = FrontierCluster(
+        cluster_id="frontier-component-0000",
+        cells=((2.5, 0.0), (3.0, 0.0), (3.5, 0.0)),
+        centroid=(3.0, 0.0),
+        viewpoints=(viewpoint,),
+        information_gain=9.0,
+        valid=True,
+    )
+
+    candidate = cluster.as_exploration_candidate()
+
+    assert candidate is not None
+    assert candidate.metadata["cluster_id"] == "frontier-component-0000"
+    assert candidate.metadata["frontier_cell_count"] == 3
+    assert candidate.metadata["cluster_valid"] is True
+    # Existing viewpoint metadata must survive untouched.
+    assert candidate.metadata["slice_index"] == 1
+    assert candidate.metadata["component_id"] == "frontier-component-0000"
+
+
+def test_as_exploration_candidate_reports_invalid_cluster_provenance():
+    cluster = FrontierCluster(
+        cluster_id="frontier-component-0003",
+        cells=(),
+        viewpoints=(ViewpointCandidate(xy=(0.0, 0.0), information_gain=1.0),),
+        valid=False,
+    )
+
+    candidate = cluster.as_exploration_candidate()
+
+    assert candidate is not None
+    assert candidate.metadata["cluster_valid"] is False
+    assert candidate.metadata["frontier_cell_count"] == 0
+
+
 def test_region_task_represents_unknown_workload():
     region = RegionTask(
         region_id="region-a",

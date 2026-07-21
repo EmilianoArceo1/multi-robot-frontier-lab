@@ -439,6 +439,57 @@ def test_bootstrap_fallback_target_is_not_misclassified_as_frontier():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Regression: a bootstrap/fallback target (never required to satisfy
+# is_frontier_cell(), see test 5 above) must not make ExplorationBehavior.
+# update() loop REQUEST_PLAN forever. Found via manual smoke testing after
+# this file's original fix landed: on a mostly-explored map with only a
+# forward/bootstrap candidate left, step 5's staleness check
+# (_active_target_is_frontier()) failed for it on EVERY tick (by design --
+# it was never a frontier to begin with), forcing continuous re-selection;
+# since the robot's heading/position had not changed, re-selection kept
+# proposing the exact same point, so the agent never reached ordinary
+# FOLLOW_PATH long enough to actually move -- an infinite REQUEST_PLAN loop
+# with the robot frozen in place. Fix: step 5 now restores and follows an
+# unchanged re-selected target instead of looping.
+# ---------------------------------------------------------------------------
+
+
+def test_unchanged_bootstrap_fallback_target_does_not_loop_request_plan():
+    belief = _empty_belief(robot_count=1)
+    _fill_free(belief)  # no UNKNOWN anywhere -- zero frontier candidates
+    robot_xy = (0.0, 0.0)
+    belief.force_free_point(robot_xy)
+
+    agent = RobotAgent(robot_id=0, position=robot_xy, planner_mode="FoV-aware directional frontier")
+    behavior = ExplorationBehavior()
+    services = PlannerServices()
+    observation = _make_observation(belief, robot_xy)
+
+    first_target = behavior._pick_next_target(agent, observation, services)
+    assert first_target is not None
+    assert _kind_from_reason(agent.last_frontier_selection_reason) == "forward", (
+        "test setup must produce a non-frontier bootstrap/fallback target"
+    )
+
+    agent.set_exploration_target(first_target, reason="initial")
+    agent.assign_path(target=first_target, waypoints=[first_target], planner_reason="initial")
+
+    # Several consecutive ticks with the robot never actually moving
+    # (matching the real bug: the loop repeated so fast within one
+    # wall-clock second that the robot never got a physics tick's worth of
+    # forward progress) -- the target must settle into FOLLOW_PATH, not
+    # cycle through REQUEST_PLAN indefinitely.
+    for _ in range(5):
+        decision = behavior.update(agent, observation, services)
+        assert decision.kind == "FOLLOW_PATH", (
+            "an unchanged bootstrap/fallback target must be followed, not "
+            f"endlessly re-planned; got {decision.kind}: {decision.reason}"
+        )
+        assert decision.target == first_target
+        assert agent.exploration_target_xy == first_target
+
+
+# ---------------------------------------------------------------------------
 # 6. Multi-robot: each source=frontier target must belong to the CURRENT
 #    frontier-cell set of the shared belief; R1 and R2 may differ; neither
 #    may be a known cell with no UNKNOWN neighbor.

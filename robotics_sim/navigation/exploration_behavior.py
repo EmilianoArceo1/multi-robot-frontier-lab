@@ -338,11 +338,35 @@ class ExplorationBehavior:
                 and observation.belief_map is not None
                 and not self._active_target_is_frontier(agent, observation)
             ):
+                stale_target = agent.exploration_target_xy
                 agent.target_switch_count += 1
                 agent.exploration_target_xy = None
                 next_target = self._pick_next_target(agent, observation, planner_services)
                 if next_target is None:
                     next_target = self._pick_map_wide_fallback_target(agent, observation, planner_services)
+
+                # A legitimate bootstrap/fallback target (e.g. _forward_
+                # candidate()'s ray-cast along the robot's current heading,
+                # used when no genuine frontier cluster remains nearby) is
+                # never required to satisfy is_frontier_cell() -- that is
+                # not what it is for -- so it fails the staleness check
+                # above on every single tick, by design, not because it
+                # went stale. Without this guard, re-selecting it (the
+                # only thing available, so it comes right back unchanged)
+                # would REQUEST_PLAN the identical point every tick
+                # forever: accepted, immediately re-invalidated next tick,
+                # accepted again -- the robot never reaches step 5's
+                # ordinary FOLLOW_PATH long enough to actually move.
+                # Restoring the unchanged target and following it instead
+                # breaks that loop while still replacing a target that
+                # staleness-checking genuinely found something new for.
+                same_target_radius = max(observation.grid_resolution, 2.0 * observation.goal_tolerance)
+                if next_target is not None and math.hypot(
+                    next_target[0] - stale_target[0], next_target[1] - stale_target[1]
+                ) <= same_target_radius:
+                    agent.exploration_target_xy = stale_target
+                    return follow(target, reason="following active path to frontier (unchanged fallback target)")
+
                 if next_target is None:
                     agent.stop_count_exploration += 1
                     return hold(reason="active target no longer a frontier; no valid next frontier available")

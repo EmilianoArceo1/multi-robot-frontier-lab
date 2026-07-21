@@ -65,6 +65,27 @@ def test_reasoning_window_has_no_step_buttons_of_its_own():
     assert not hasattr(window, "set_history_controls")
 
 
+def test_reasoning_robot_selector_cycles_via_explicit_signal():
+    window = NavigationReasoningWindow()
+    requested = []
+    window.nextRobotRequested.connect(lambda: requested.append(True))
+
+    window.set_robot_selector(1, 3)
+    assert "R2 / 3" in window.robot_selector_button.text()
+    assert window.robot_selector_button.isEnabled()
+
+    window.robot_selector_button.click()
+    assert requested == [True]
+
+
+def test_reasoning_robot_selector_disables_for_single_robot():
+    window = NavigationReasoningWindow()
+    window.set_robot_selector(0, 1)
+
+    assert "R1 / 1" in window.robot_selector_button.text()
+    assert not window.robot_selector_button.isEnabled()
+
+
 def test_canvas_has_no_history_step_buttons_of_its_own():
     canvas = SimulationCanvas()
     assert not hasattr(canvas, "navigation_debug_step_back_button")

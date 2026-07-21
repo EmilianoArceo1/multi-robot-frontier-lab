@@ -321,7 +321,7 @@ def test_ground_truth_without_sensing_does_not_block_grid():
 # ---------------------------------------------------------------------------
 
 
-def test_per_robot_sanitization_differs_between_two_robots(monkeypatch):
+def test_static_geometry_is_identical_for_two_robot_costmaps(monkeypatch):
     fake = _make_fake_engine(robot_positions=[(0.0, 0.0), (5.0, 5.0)])
     # Each point sits exactly on one robot's own position.
     fake.mapped_obstacle_points = [(0.0, 0.0), (5.0, 5.0)]
@@ -333,12 +333,7 @@ def test_per_robot_sanitization_differs_between_two_robots(monkeypatch):
     assert len(builder_calls) == 2
     points_for_robot_0 = builder_calls[0]["observed_obstacles"].points
     points_for_robot_1 = builder_calls[1]["observed_obstacles"].points
-    assert points_for_robot_0 != points_for_robot_1, (
-        "the SAME static geometry must sanitize differently depending on which robot's "
-        "start_xy the builder was given"
-    )
-    assert (0.0, 0.0) not in points_for_robot_0, "robot 0's own-start sample must be sanitized away for robot 0"
-    assert (5.0, 5.0) not in points_for_robot_1, "robot 1's own-start sample must be sanitized away for robot 1"
+    assert points_for_robot_0 == points_for_robot_1 == ((0.0, 0.0), (5.0, 5.0))
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,98 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "experiment": {
+    "id": "rss26-uncertainty-guaranteed-ipp-rbf-smoke",
+    "kind": "uncertainty_guaranteed_ipp_rss26",
+    "paper": "Informative Path Planning with Guaranteed Estimation Uncertainty",
+    "arxiv": "2602.05198v3",
+    "source_repository": "https://github.com/itskalvik/uncertainty-guaranteed-ipp",
+    "source_commit": "f387c57bcaa61bf218d26e63212bf789ef42a534",
+    "fidelity": "integration_smoke_not_paper_benchmark",
+    "model": "stationary RBF (NumPy smoke model; paper uses learned Attentive GP)",
+    "bundle": "rss26_ipp_rbf_smoke/manifest.json",
+    "description": "Dependency-free integration check for theorem coverage, bundle loading, uncertainty rendering, and exact waypoint execution. Do not report as a paper benchmark result."
+  },
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": -1.0,
+    "y": -5.0,
+    "theta": 0.0,
+    "v": 0.0,
+    "body_radius": 0.16,
+    "safety_radius": 0.25,
+    "max_speed": 1.0,
+    "max_acceleration": 1.5,
+    "max_angular_speed": 2.5,
+    "goal_tolerance": 0.15,
+    "acceleration_gain": 0.75
+  },
+  "goal": {
+    "x": -3.0,
+    "y": -5.0
+  },
+  "map": {
+    "grid_resolution": 0.25,
+    "obstacles": []
+  },
+  "camera": {
+    "center_x": 0.0,
+    "center_y": 0.0,
+    "width": 20.0,
+    "height": 16.0
+  },
+  "planner": {
+    "type": "Direct",
+    "path_simplifier": "Raw grid path"
+  },
+  "exploration": {
+    "planner": "Goal seeking",
+    "replan_cooldown": 1.0,
+    "ipp_distance_penalty": 0.0
+  },
+  "coordination": {
+    "strategy": "Independent frontiers"
+  },
+  "sensor": {
+    "type": "Camera / FoV",
+    "range": 0.8
+  },
+  "multi_robot": {
+    "robot_count": 1,
+    "selected_robot_index": 0,
+    "same_robot_configuration": true,
+    "robots": [
+      {
+        "x": -1.0,
+        "y": -5.0,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 0.8,
+        "body_radius": 0.16,
+        "safety_radius": 0.25,
+        "max_speed": 1.0,
+        "max_acceleration": 1.5,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.15,
+        "acceleration_gain": 0.75
+      }
+    ]
+  },
+  "simulation": {
+    "agent_mode": "Single Robot Mode",
+    "map_visualization": "Current",
+    "robot_icon": "Wheeled Robot",
+    "show_goal_preview": false,
+    "show_path": true,
+    "show_vision": false,
+    "show_explored_area": false,
+    "show_obstacles": false,
+    "show_robot_orders": true,
+    "mapping_point_spacing": 0.025
+  }
+}

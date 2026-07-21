@@ -119,11 +119,18 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         # result()'s diagnostics block and _finalize_navigation_debug_
         # snapshot()'s fallback.
         self._nav_debug_last_accepted_plan = None
+        # Multi-robot diagnostics keep the equivalent route provenance and
+        # live frame independently for every robot.  The scalar aliases above
+        # remain the single-robot/backward-compatible view used by the canvas.
+        self._nav_debug_last_accepted_plan_by_robot: dict[int, object] = {}
         # Last live snapshot is kept separately from the historical view so
         # stepping backward while paused can always return to the actual live
         # state instead of leaving a stale history frame on the canvas.
         self._nav_debug_live_snapshot = None
+        self._nav_debug_live_snapshots_by_robot: dict[int, object] = {}
+        self._nav_debug_last_event_by_robot: dict[int, object] = {}
         self._nav_debug_pending_plan_capture_by_robot: dict[int, object] = {}
+        self._nav_debug_current_plan_capture_by_robot: dict[int, object] = {}
 
         # Press-and-hold history scrubbing. The first press moves one frame,
         # then a single-shot timer repeats with a smooth 1x -> 20x ramp.
@@ -346,6 +353,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.navigation_reasoning_window.closeRequested.connect(
             lambda: self.on_navigation_reasoning_panel_visibility_toggled(False)
         )
+        self.navigation_reasoning_window.nextRobotRequested.connect(self.select_next_robot)
         self.canvas.set_navigation_reasoning_window(self.navigation_reasoning_window)
 
         self.simulation_panel = self.build_config_panel()
@@ -1298,6 +1306,20 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.selected_robot_index = max(0, min(int(index), len(self.multi_robot_configs) - 1))
         self.load_selected_robot_into_panel()
         self.update_preview()
+        reasoning_panel = getattr(self, "navigation_reasoning_window", None)
+        if reasoning_panel is not None and hasattr(reasoning_panel, "set_robot_selector"):
+            multiple = "Multiple" in str(getattr(self.config, "agent_mode", ""))
+            reasoning_panel.set_robot_selector(
+                self.selected_robot_index if multiple else 0,
+                len(self.multi_robot_configs) if multiple else 1,
+            )
+        # During a live multi-robot run the reasoning panel/overlay follows
+        # the robot selected on the canvas/setup controls.  Configuration
+        # selection existed before navigation debugging, so keep this call
+        # optional for lightweight UI test doubles.
+        select_debug_robot = getattr(self, "select_navigation_debug_robot", None)
+        if callable(select_debug_robot):
+            select_debug_robot(self.selected_robot_index)
 
     def select_previous_robot(self) -> None:
         self.ensure_multi_robot_configs()
@@ -1311,6 +1333,13 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.ensure_multi_robot_configs()
         self.load_selected_robot_into_panel()
         self.update_preview()
+        reasoning_panel = getattr(self, "navigation_reasoning_window", None)
+        if reasoning_panel is not None and hasattr(reasoning_panel, "set_robot_selector"):
+            multiple = "Multiple" in str(getattr(self.config, "agent_mode", ""))
+            reasoning_panel.set_robot_selector(
+                self.selected_robot_index if multiple else 0,
+                len(self.multi_robot_configs) if multiple else 1,
+            )
 
     def on_same_config_toggled(self, *_):
         self.ensure_multi_robot_configs()
@@ -1321,6 +1350,14 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
     def on_agent_mode_changed(self, *_):
         self.update_relevant_parameter_visibility()
         self.update_preview()
+        reasoning_panel = getattr(self, "navigation_reasoning_window", None)
+        if reasoning_panel is not None and hasattr(reasoning_panel, "set_robot_selector"):
+            multiple = "Multiple" in str(getattr(self.config, "agent_mode", ""))
+            count = len(getattr(self, "multi_robot_configs", [])) if multiple else 1
+            reasoning_panel.set_robot_selector(
+                self.selected_robot_index if multiple else 0,
+                max(1, count),
+            )
 
     def on_grid_resolution_control_changed(self, value: float) -> None:
         """Show the temporary red grid preview while the user adjusts

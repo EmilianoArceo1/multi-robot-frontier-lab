@@ -227,8 +227,11 @@ class FuelFrontierBaselinePlugin:
         frontier_information = getattr(request.services, "frontier_information_service", None)
         if frontier_information is not None:
             clusters = frontier_information.get_frontier_clusters(robot_id=robot.robot_id)
-            candidates = tuple(self._candidate_from_cluster(cluster) for cluster in clusters)
-            candidates = tuple(candidate for candidate in candidates if candidate is not None)
+            candidates = tuple(
+                candidate
+                for cluster in clusters
+                for candidate in self._candidates_from_cluster(cluster)
+            )
             if candidates:
                 return candidates, "frontier_information_service"
 
@@ -367,6 +370,7 @@ class FuelFrontierBaselinePlugin:
         heading_weight = float(request.parameters.get("fuel_heading_weight", 0.25))
         safety_weight = float(request.parameters.get("fuel_safety_weight", 1.0))
         overlap_weight = float(request.parameters.get("fuel_overlap_weight", 1.0))
+        information_weight = float(request.parameters.get("fuel_information_weight", 1.0))
 
         travel_cost = candidate.travel_cost
         if travel_cost <= 0.0:
@@ -376,8 +380,18 @@ class FuelFrontierBaselinePlugin:
         if candidate.heading_rad is not None:
             heading_cost += self._angle_distance(robot.theta, candidate.heading_rad)
 
+        # Runtime frontier gain is a count of UNKNOWN grid cells.  At the
+        # default 0.5 m resolution and 2.5 m sensor range it can be around
+        # 80, while travel is measured in metres with a default coefficient
+        # of 0.2.  Using the raw count means one extra cell outweighs five
+        # metres of travel and systematically sends a robot to distant
+        # frontiers for negligible marginal coverage.  Diminishing returns
+        # preserve the ordering by gain without coupling utility to grid
+        # resolution or letting a handful of cells dominate route cost.
+        information_utility = math.log1p(max(0.0, float(candidate.information_gain)))
+
         return (
-            candidate.information_gain
+            information_weight * information_utility
             - distance_weight * travel_cost
             - heading_weight * heading_cost
             - safety_weight * candidate.safety_cost
@@ -412,44 +426,68 @@ class FuelFrontierBaselinePlugin:
             metadata=metadata,
         )
 
-    def _candidate_from_cluster(self, cluster: Any) -> ExplorationCandidate | None:
+    def _candidates_from_cluster(self, cluster: Any) -> tuple[ExplorationCandidate, ...]:
+        """Return every sampled viewpoint with stable cluster provenance.
+
+        Viewpoint choice is robot-dependent because travel and heading costs
+        depend on the requesting pose.  Collapsing a cluster to its maximum
+        raw-information viewpoint here, before `_fuel_score()` sees the
+        robot, made a slightly higher-gain viewpoint win even when another
+        viewpoint of the same frontier was much closer.
+        """
         viewpoints = tuple(getattr(cluster, "viewpoints", ()) or ())
         cluster_id = str(getattr(cluster, "cluster_id", "")) or None
         if viewpoints:
-            ranked = sorted(
-                viewpoints,
-                key=lambda viewpoint: (
-                    float(getattr(viewpoint, "information_gain", 0.0)),
-                    float(getattr(viewpoint, "coverage_fraction", 0.0)),
-                    int(getattr(viewpoint, "visible_cell_count", 0)),
-                    -float(getattr(viewpoint, "travel_cost", 0.0)),
-                ),
-                reverse=True,
-            )
-            candidate = self._as_candidate(ranked[0])
+            raw_candidates = tuple(self._as_candidate(viewpoint) for viewpoint in viewpoints)
         else:
             centroid = getattr(cluster, "centroid", None)
             if centroid is None:
-                return None
-            candidate = ExplorationCandidate(
-                target=(float(centroid[0]), float(centroid[1])),
-                source="frontier_cluster_centroid",
-                information_gain=float(getattr(cluster, "information_gain", 0.0)),
+                return ()
+            raw_candidates = (
+                ExplorationCandidate(
+                    target=(float(centroid[0]), float(centroid[1])),
+                    source="frontier_cluster_centroid",
+                    information_gain=float(getattr(cluster, "information_gain", 0.0)),
+                ),
             )
 
-        metadata = dict(candidate.metadata)
-        if cluster_id is not None:
-            metadata.setdefault("cluster_id", cluster_id)
-        return ExplorationCandidate(
-            target=candidate.target,
-            source="frontier_information_service",
-            information_gain=candidate.information_gain,
-            travel_cost=candidate.travel_cost,
-            safety_cost=candidate.safety_cost,
-            overlap_cost=candidate.overlap_cost,
-            heading_cost=candidate.heading_cost,
-            heading_rad=candidate.heading_rad,
-            metadata=metadata,
+        candidates: list[ExplorationCandidate] = []
+        for candidate in raw_candidates:
+            metadata = dict(candidate.metadata)
+            if cluster_id is not None:
+                metadata.setdefault("cluster_id", cluster_id)
+            candidates.append(
+                ExplorationCandidate(
+                    target=candidate.target,
+                    source="frontier_information_service",
+                    information_gain=candidate.information_gain,
+                    travel_cost=candidate.travel_cost,
+                    safety_cost=candidate.safety_cost,
+                    overlap_cost=candidate.overlap_cost,
+                    heading_cost=candidate.heading_cost,
+                    heading_rad=candidate.heading_rad,
+                    metadata=metadata,
+                )
+            )
+        return tuple(candidates)
+
+    def _candidate_from_cluster(self, cluster: Any) -> ExplorationCandidate | None:
+        """Compatibility helper for callers expecting one cluster candidate.
+
+        Runtime assignment uses `_candidates_from_cluster()` so it can choose
+        robot-aware.  This method retains the historical highest-information
+        interpretation for direct/test callers that may still use it.
+        """
+        candidates = self._candidates_from_cluster(cluster)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda candidate: (
+                candidate.information_gain,
+                -candidate.travel_cost,
+                candidate.target,
+            ),
         )
 
     def _cluster_id(self, candidate: ExplorationCandidate, request: CoordinationRequest) -> str | None:

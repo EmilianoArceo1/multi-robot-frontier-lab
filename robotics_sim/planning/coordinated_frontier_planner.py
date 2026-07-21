@@ -829,17 +829,20 @@ def assign_frontier_viewpoints(
             if other_map_ratio > 0.3:
                 debug_tracker[index]["fov_overlap_penalty"] += 1
 
-            # A candidate whose direct corridor from the robot's current
-            # position crosses a teammate's safety disk is penalized, not
-            # vetoed -- same reasoning as reservation_penalty above: it should
-            # still be selectable as a last resort instead of forcing HOLD.
+            # Penalize the complete direct corridor, not just candidates whose
+            # endpoint happens to be close to a teammate.  The old endpoint
+            # pre-filter missed R1 -> R2 -> frontier crossings whenever the
+            # frontier itself was far beyond R2.
             corridor_margin = max(dynamic_obstacle_margin, resolution * 0.75)
             corridor_penalty = 0.0
             for cx, cy, radius in teammate_disks:
-                center = (float(cx), float(cy))
-                if _distance(target, center) > float(radius) + float(state.safety_radius) + corridor_margin:
-                    continue
-                if _distance_point_to_segment(center, state.xy, target) <= float(radius) + float(state.safety_radius) + corridor_margin:
+                if _segment_crosses_any_disk(
+                    start=state.xy,
+                    end=target,
+                    disks=[(cx, cy, radius)],
+                    margin=float(state.safety_radius) + corridor_margin,
+                    ignore_near_start=teammate_block_radius,
+                ):
                     corridor_penalty = 8.0
                     debug_tracker[index]["rejected_by_corridor_overlap"] += 1
                     debug_tracker[index]["too_close_to_robot"] += 1

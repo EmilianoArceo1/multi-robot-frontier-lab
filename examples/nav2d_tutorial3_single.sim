@@ -1,0 +1,128 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "experiment": {
+    "id": "nav2d-tutorial3-single-replication",
+    "source_repository": "https://github.com/skasperski/navigation_2d",
+    "source_commit": "3c27da9b0f5699559d9048c13ef4885815193981",
+    "reference_launch": "nav2d_tutorials/launch/tutorial3.launch",
+    "reference_world": "nav2d_tutorials/world/tutorial.world",
+    "uniform_scale": 0.5,
+    "description": "Native single-robot reproduction of the Nav2D autonomous exploration tutorial."
+  },
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": 0.0,
+    "y": -1.0,
+    "theta": 0.7853981633974483,
+    "v": 0.0,
+    "body_radius": 0.16,
+    "safety_radius": 0.25,
+    "max_speed": 0.375,
+    "max_acceleration": 0.25,
+    "max_angular_speed": 1.5707963267948966,
+    "goal_tolerance": 0.15,
+    "acceleration_gain": 0.75
+  },
+  "goal": {"x": 0.0, "y": 0.0},
+  "map": {
+    "grid_resolution": 0.05,
+    "obstacles": [
+      [-8.5, 6.76, 17.0, 0.74],
+      [-8.5, 4.46, 0.54, 2.3],
+      [-4.06, 4.46, 0.1, 2.3],
+      [-0.06, 4.46, 0.1, 2.3],
+      [3.94, 4.46, 4.56, 2.3],
+      [-8.5, 4.36, 3.3, 0.1],
+      [-4.22, 4.36, 0.42, 0.1],
+      [-2.82, 4.36, 2.86, 0.1],
+      [3.94, 4.36, 4.56, 0.1],
+      [-8.5, 4.0, 0.54, 0.36],
+      [-0.06, 4.0, 0.1, 0.36],
+      [3.94, 4.0, 4.56, 0.36],
+      [-8.5, 3.66, 0.54, 0.34],
+      [3.94, 3.66, 4.56, 0.34],
+      [-8.5, 3.56, 0.54, 0.1],
+      [-4.82, 3.56, 1.62, 0.1],
+      [3.94, 3.56, 4.56, 0.1],
+      [-8.5, 3.02, 0.54, 0.54],
+      [-4.06, 3.02, 0.1, 0.54],
+      [3.94, 3.02, 4.56, 0.54],
+      [-8.5, 2.86, 0.54, 0.16],
+      [-4.06, 2.86, 0.1, 0.16],
+      [-0.06, 2.86, 0.1, 0.16],
+      [3.94, 2.86, 4.56, 0.16],
+      [-8.5, 2.76, 0.54, 0.1],
+      [-4.06, 2.76, 0.1, 0.1],
+      [-0.06, 2.76, 8.56, 0.1],
+      [-8.5, 0.46, 0.54, 2.3],
+      [-4.06, 0.46, 0.1, 2.3],
+      [-0.06, 0.46, 0.1, 2.3],
+      [3.94, 0.46, 4.56, 2.3],
+      [-8.5, 0.36, 0.54, 0.1],
+      [-4.06, 0.36, 0.1, 0.1],
+      [-0.06, 0.36, 0.26, 0.1],
+      [1.18, 0.36, 7.32, 0.1],
+      [-8.5, -1.24, 0.54, 1.6],
+      [-4.06, -1.24, 0.1, 1.6],
+      [3.94, -1.24, 4.56, 1.6],
+      [-8.5, -1.94, 0.54, 0.7],
+      [-4.06, -1.94, 0.1, 0.7],
+      [7.94, -1.94, 0.56, 0.7],
+      [-8.5, -2.04, 0.54, 0.1],
+      [-4.82, -2.04, 1.62, 0.1],
+      [7.94, -2.04, 0.56, 0.1],
+      [-8.5, -3.14, 0.54, 1.1],
+      [7.94, -3.14, 0.56, 1.1],
+      [-8.5, -3.54, 1.34, 0.4],
+      [-6.06, -3.54, 5.3, 0.4],
+      [7.94, -3.54, 0.56, 0.4],
+      [-8.5, -3.64, 8.7, 0.1],
+      [1.18, -3.64, 7.32, 0.1],
+      [-8.5, -6.74, 8.54, 3.1],
+      [2.34, -6.74, 6.16, 3.1],
+      [-8.5, -7.5, 17.0, 0.76]
+    ]
+  },
+  "camera": {"center_x": 0.0, "center_y": 0.0, "width": 17.0, "height": 15.0},
+  "planner": {"type": "Dijkstra", "path_simplifier": "Raw grid path"},
+  "exploration": {
+    "planner": "Nav2D nearest-frontier wavefront",
+    "replan_cooldown": 1.0,
+    "ipp_distance_penalty": 0.0
+  },
+  "coordination": {"strategy": "Nav2D multi-wavefront coordinator"},
+  "sensor": {"type": "LiDAR", "range": 5.0},
+  "multi_robot": {
+    "robot_count": 1,
+    "selected_robot_index": 0,
+    "same_robot_configuration": true,
+    "robots": [
+      {
+        "x": 0.0, "y": -1.0, "theta": 0.7853981633974483, "v": 0.0,
+        "vision": 5.0, "body_radius": 0.16, "safety_radius": 0.25,
+        "max_speed": 0.375, "max_acceleration": 0.25,
+        "max_angular_speed": 1.5707963267948966,
+        "goal_tolerance": 0.15, "acceleration_gain": 0.75
+      }
+    ]
+  },
+  "simulation": {
+    "agent_mode": "Single Robot Mode",
+    "map_visualization": "Monochrome Discovery",
+    "robot_icon": "Wheeled Robot",
+    "show_goal_preview": false,
+    "show_path": true,
+    "show_vision": true,
+    "show_explored_area": true,
+    "show_obstacles": true,
+    "show_robot_orders": true,
+    "mapping_point_spacing": 0.02
+  }
+}
+

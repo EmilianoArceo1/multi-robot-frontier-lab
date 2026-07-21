@@ -26,17 +26,14 @@ per-tick behavior that follows an already-assigned route
    of a dead cell. Fix: _current_candidate() now also requires
    is_frontier_cell(belief, cell).
 
-2. Stale target followed for many ticks while far away (test 7):
-   ExplorationBehavior.update()'s step 5 ("follow current path") had no
-   revalidation at all -- it just returned FOLLOW_PATH toward whatever
-   active_target() already was. Steps 3/4 (frontier reached / approaching,
-   prefetch) already re-run selection, so the bug only showed while the
-   robot was still far from an already-assigned target that became stale
-   in the meantime: the robot kept heading toward a now-fully-known cell
-   for many more ticks instead of invalidating/reselecting immediately.
-   Fix: step 5 now does one O(1) local neighbor check
-   (ExplorationBehavior._active_target_is_frontier(), backed by the same
-   is_frontier_cell()) before following, and reselects when it fails.
+2. Frontier-status churn while following (test 7): a target often stops
+   satisfying the strict frontier predicate as a direct consequence of the
+   approaching robot observing its last UNKNOWN neighbour. Invalidating on
+   that single map update caused rapid target switches. Step 5 still performs
+   its O(1) local check, but now gives remote targets a bounded grace period
+   and commits locally sensed targets until normal arrival. A remote target
+   that remains stale is still reselected after the grace period, and safety
+   replans retain higher priority.
 
 These tests exercise the real BeliefMap, the real FoV-aware planner (via
 select_exploration_goal()), the real ExplorationBehavior/RobotAgent, and (for
@@ -638,13 +635,13 @@ def test_multi_robot_targets_are_each_valid_and_may_differ():
 
 
 # ---------------------------------------------------------------------------
-# 7. A target becomes stale while the robot is still far away: one real
-#    ExplorationBehavior.update() tick must invalidate/reselect, not keep
-#    following toward a now-fully-known cell.
+# 7. Frontier-loss hysteresis: one observation must not cancel a healthy
+#    assigned route.  A remote target that remains stale is still replaced
+#    after the bounded grace period.
 # ---------------------------------------------------------------------------
 
 
-def test_target_becomes_stale_while_moving_triggers_reselection():
+def test_remote_target_becomes_stale_only_reselects_after_grace():
     belief = _empty_belief(robot_count=1)
     _fill_free(belief)
     patch_cells = [(1, belief.width - 2), (1, belief.width - 1), (2, belief.width - 2), (2, belief.width - 1)]
@@ -676,14 +673,62 @@ def test_target_becomes_stale_while_moving_triggers_reselection():
     services = PlannerServices()
     observation = _make_observation(belief, robot_xy)
 
-    decision = behavior.update(agent, observation, services)
+    first = behavior.update(agent, observation, services)
+    assert first.kind == "FOLLOW_PATH"
+    assert agent.exploration_target_xy == target_world
+
+    after_grace = _make_observation(
+        belief,
+        robot_xy,
+        current_time=observation.current_time + behavior._STALE_TARGET_GRACE + 0.01,
+    )
+    decision = behavior.update(agent, after_grace, services)
 
     assert decision.kind != "FOLLOW_PATH", (
-        "one real tick after the active target's frontier neighborhood became "
-        "fully explored must invalidate/reselect -- not keep following the "
-        "route toward a now-fully-known cell for several more ticks"
+        "a remote target that stays stale beyond the grace period must still "
+        "enter the normal reselection/exhaustion path"
     )
     assert agent.exploration_target_xy != target_world
+
+
+def test_locally_observed_frontier_loss_keeps_committed_route():
+    belief = _empty_belief(robot_count=1)
+    _fill_free(belief)
+    robot_xy = (0.0, 0.0)
+    target_world = (2.0, 0.0)  # inside the configured 3 m sensor range
+
+    agent = RobotAgent(robot_id=0, position=robot_xy, planner_mode="FoV-aware directional frontier")
+    agent.set_exploration_target(target_world, reason="frontier observed while approaching")
+    agent.assign_path(target=target_world, waypoints=[(1.0, 0.0), target_world], planner_reason="initial")
+
+    behavior = ExplorationBehavior()
+    services = PlannerServices()
+    first = behavior.update(agent, _make_observation(belief, robot_xy, current_time=10.0), services)
+    much_later = behavior.update(agent, _make_observation(belief, robot_xy, current_time=30.0), services)
+
+    assert first.kind == "FOLLOW_PATH"
+    assert much_later.kind == "FOLLOW_PATH"
+    assert agent.exploration_target_xy == target_world
+    assert agent.target_switch_count == 0
+
+
+def test_stale_target_hysteresis_never_overrides_safety_replan():
+    belief = _empty_belief(robot_count=1)
+    _fill_free(belief)
+    robot_xy = (0.0, 0.0)
+    target_world = (2.0, 0.0)
+
+    agent = RobotAgent(robot_id=0, position=robot_xy, planner_mode="FoV-aware directional frontier")
+    agent.set_exploration_target(target_world, reason="initial")
+    agent.assign_path(target=target_world, waypoints=[target_world], planner_reason="initial")
+
+    decision = ExplorationBehavior().update(
+        agent,
+        _make_observation(belief, robot_xy, predicted_collision=True),
+        PlannerServices(),
+    )
+
+    assert decision.kind == "REPLAN_FOR_SAFETY"
 
 
 # ---------------------------------------------------------------------------

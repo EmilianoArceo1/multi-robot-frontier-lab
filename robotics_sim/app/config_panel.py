@@ -582,7 +582,7 @@ def build_config_panel(window):
     window.multi_y_input = NumericStepper("Robot Y (m)", -0.6, WORLD_Y_MIN, WORLD_Y_MAX, 0.25)
     window.multi_theta_input = NumericStepper("Robot Theta", 0.0, -math.pi, math.pi, 0.1)
     window.multi_v_slider = SliderValueRow("Initial v", 0.0, 0.0, 5.0)
-    window.multi_vision_slider = SliderValueRow("Vision Radius", window.config.vision, 0.25, 8.0)
+    window.multi_vision_slider = SliderValueRow("Vision Radius", window.config.vision, 0.25, 20.0)
     window.multi_body_radius_slider = SliderValueRow("Body Radius", window.config.body_radius, 0.05, 1.00)
     window.multi_safety_radius_slider = SliderValueRow("Safety Radius r", window.config.safety_radius, 0.05, 1.50)
     window.multi_max_speed_input = NumericStepper("Max Speed", window.config.max_speed, 0.1, 20.0, 0.1)
@@ -685,7 +685,7 @@ def build_config_panel(window):
     motion_grid.setVerticalSpacing(7)
 
     window.v_slider = SliderValueRow("Initial Velocity (m/s)", window.config.v, 0.0, 5.0)
-    window.vision_slider = SliderValueRow("Vision Radius (m)", window.config.vision, 0.25, 8.0)
+    window.vision_slider = SliderValueRow("Vision Radius (m)", window.config.vision, 0.25, 20.0)
 
     motion_grid.addWidget(window.v_slider, 0, 0)
     motion_grid.addWidget(window.vision_slider, 0, 1)

@@ -98,6 +98,24 @@ def expanded_rect(
     )
 
 
+def distance_point_to_rect(point: Point2D, rect: RectObstacle) -> float:
+    """Return the exact Euclidean distance from a point to a rectangle.
+
+    The distance is zero inside or on the rectangle.  This is the correct
+    disk-vs-rectangle primitive: a disk of radius ``r`` intersects the
+    rectangle exactly when its center is at distance ``<= r``.  Expanding
+    both axes independently instead produces square corner caps and rejects
+    trajectories that are still more than ``r`` away from the real corner.
+    """
+    px, py = float(point[0]), float(point[1])
+    x, y, width, height = (float(value) for value in rect)
+    x_min, x_max = sorted((x, x + width))
+    y_min, y_max = sorted((y, y + height))
+    dx = max(x_min - px, 0.0, px - x_max)
+    dy = max(y_min - py, 0.0, py - y_max)
+    return math.hypot(dx, dy)
+
+
 def point_inside_expanded_rect(
     point: Point2D,
     rect: RectObstacle,
@@ -106,14 +124,13 @@ def point_inside_expanded_rect(
     """
     Return whether a point lies inside a rectangle expanded by padding.
 
-    Abstraction:
-        Instead of checking disk-vs-rectangle directly, the obstacle is expanded
-        by the robot radius and the robot center is checked as a point.
+    The exact Minkowski expansion of an axis-aligned rectangle by a disk has
+    straight sides and *rounded* corners.  It is therefore equivalent to an
+    Euclidean point-to-rectangle distance check, not membership in the larger
+    axis-aligned bounding box returned by :func:`expanded_rect`.
     """
-    px, py = point
-    x_min, y_min, x_max, y_max = expanded_rect(rect, padding)
-
-    return x_min <= px <= x_max and y_min <= py <= y_max
+    safe_padding = max(0.0, float(padding))
+    return distance_point_to_rect(point, rect) <= safe_padding + 1e-12
 
 
 def orientation(a: Point2D, b: Point2D, c: Point2D) -> int:
@@ -203,22 +220,13 @@ def segment_intersects_expanded_rect(
     padding: float = 0.0,
 ) -> bool:
     """
-    Return whether a segment intersects an expanded rectangle.
+    Return whether a segment intersects the exact rounded expansion.
 
     This is the core test for local path blocking:
         robot center -> active waypoint
     """
-    if point_inside_expanded_rect(start, rect, padding):
-        return True
-
-    if point_inside_expanded_rect(end, rect, padding):
-        return True
-
-    for edge_start, edge_end in rect_edges(rect, padding):
-        if segments_intersect(start, end, edge_start, edge_end):
-            return True
-
-    return False
+    safe_padding = max(0.0, float(padding))
+    return distance_segment_to_rect(start, end, rect) <= safe_padding + 1e-12
 
 
 def distance_point_to_segment(point: Point2D, start: Point2D, end: Point2D) -> float:
@@ -246,6 +254,28 @@ def distance_point_to_segment(point: Point2D, start: Point2D, end: Point2D) -> f
     closest_x = sx + t * dx
     closest_y = sy + t * dy
     return math.hypot(px - closest_x, py - closest_y)
+
+
+def distance_segment_to_rect(start: Point2D, end: Point2D, rect: RectObstacle) -> float:
+    """Return the exact minimum Euclidean distance from a segment to a rectangle."""
+    # Intersection (including a segment endpoint inside the rectangle) has
+    # zero distance.  Use the unexpanded rectangle here; padding is applied by
+    # segment_intersects_expanded_rect after this exact distance is known.
+    if point_inside_expanded_rect(start, rect, 0.0) or point_inside_expanded_rect(end, rect, 0.0):
+        return 0.0
+
+    edges = rect_edges(rect, 0.0)
+    if any(segments_intersect(start, end, edge_start, edge_end) for edge_start, edge_end in edges):
+        return 0.0
+
+    # For two disjoint convex polygons the closest pair contains a vertex of
+    # at least one polygon.  A segment is a degenerate convex polygon, so the
+    # endpoint-to-rectangle and rectangle-corner-to-segment distances cover
+    # every possible closest feature pair (including parallel edges).
+    endpoint_distance = min(distance_point_to_rect(start, rect), distance_point_to_rect(end, rect))
+    corners = [edge[0] for edge in edges]
+    corner_distance = min(distance_point_to_segment(corner, start, end) for corner in corners)
+    return min(endpoint_distance, corner_distance)
 
 
 def point_inside_disk(point: Point2D, center: Point2D, radius: float) -> bool:

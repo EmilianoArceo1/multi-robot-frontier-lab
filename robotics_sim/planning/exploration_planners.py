@@ -38,9 +38,11 @@ from robotics_sim.planning.grid_planners import AStarPlanner
 
 
 DEFAULT_EXPLORATION_PLANNER = "FoV-aware directional frontier"
+NAV2D_NEAREST_FRONTIER_PLANNER = "Nav2D nearest-frontier wavefront"
 
 EXPLORATION_PLANNER_OPTIONS = [
     "Goal seeking",
+    NAV2D_NEAREST_FRONTIER_PLANNER,
     "Nearest frontier",
     "Largest frontier",
     "Utility frontier",
@@ -310,6 +312,9 @@ def _frontier_candidates(
     target_exclusion_radius: float,
     robot_radius: float,
     dynamic_obstacle_margin: float,
+    viewpoints_per_cluster: int = 1,
+    robot_xy: tuple[float, float] | None = None,
+    robot_heading: float = 0.0,
 ) -> list[_InternalCandidate]:
     candidates: list[_InternalCandidate] = []
 
@@ -318,18 +323,36 @@ def _frontier_candidates(
         if candidate is None:
             continue
 
-        if _target_near_reserved(candidate.target, reserved_targets, target_exclusion_radius):
-            continue
+        viewpoints = [candidate]
+        if viewpoints_per_cluster > 1 and robot_xy is not None:
+            viewpoints = _sample_frontier_viewpoints(
+                candidate,
+                belief=belief,
+                robot_xy=robot_xy,
+                robot_heading=robot_heading,
+                limit=viewpoints_per_cluster,
+            )
 
-        if _target_near_dynamic_obstacle(
-            candidate.target,
-            dynamic_obstacles,
-            robot_radius=robot_radius,
-            margin=dynamic_obstacle_margin,
-        ):
-            continue
+        # Filter individual viewpoints, not the whole connected component.
+        # A recently failed cell (or a nearby dynamic obstacle) must not make
+        # every other safe point on a long frontier disappear.
+        for viewpoint in viewpoints:
+            if _target_near_reserved(
+                viewpoint.target,
+                reserved_targets,
+                target_exclusion_radius,
+            ):
+                continue
 
-        candidates.append(candidate)
+            if _target_near_dynamic_obstacle(
+                viewpoint.target,
+                dynamic_obstacles,
+                robot_radius=robot_radius,
+                margin=dynamic_obstacle_margin,
+            ):
+                continue
+
+            candidates.append(viewpoint)
 
     return candidates
 
@@ -572,6 +595,93 @@ def _current_candidate(
     )
 
 
+def _sample_frontier_viewpoints(
+    candidate: _InternalCandidate,
+    *,
+    belief: BeliefMap,
+    robot_xy: tuple[float, float],
+    robot_heading: float,
+    limit: int,
+) -> list[_InternalCandidate]:
+    """Expose several useful viewpoints from one connected frontier.
+
+    A frontier surrounding a newly-observed patch is commonly one large
+    connected component.  Reducing that component to only the cell nearest
+    its centroid makes the directional scorer ineffective: it never gets to
+    compare the forward-facing, nearby, and opposite sides of the component.
+
+    Keep the old representative for continuity, then add the nearest and most
+    heading-aligned cells.  Remaining slots use farthest-point sampling so a
+    long wall/ring is represented across its extent rather than by adjacent
+    cells.  The returned viewpoints all retain the component's full size for
+    scoring; only their route/FoV geometry differs.
+    """
+    if candidate.kind != "frontier" or limit <= 1 or not candidate.cluster_cells:
+        return [candidate]
+
+    cells = sorted(set(candidate.cluster_cells))
+    selected: list[tuple[int, int]] = []
+
+    def add(cell: tuple[int, int]) -> None:
+        if cell not in selected:
+            selected.append(cell)
+
+    add(candidate.target_cell)
+
+    nearest = min(
+        cells,
+        key=lambda cell: (
+            _distance(robot_xy, belief.cell_to_world(cell)),
+            cell[0],
+            cell[1],
+        ),
+    )
+    add(nearest)
+
+    aligned = min(
+        cells,
+        key=lambda cell: (
+            abs(_wrap_angle(_angle_between(robot_xy, belief.cell_to_world(cell)) - robot_heading)),
+            _distance(robot_xy, belief.cell_to_world(cell)),
+            cell[0],
+            cell[1],
+        ),
+    )
+    add(aligned)
+
+    while len(selected) < min(max(1, int(limit)), len(cells)):
+        remaining = [cell for cell in cells if cell not in selected]
+        if not remaining:
+            break
+
+        # Grid distance is sufficient here and avoids repeated world
+        # conversions.  Deterministic row/column tie-breaks make target
+        # choice reproducible across runs.
+        farthest = min(
+            remaining,
+            key=lambda cell: (
+                -min(
+                    (cell[0] - chosen[0]) ** 2 + (cell[1] - chosen[1]) ** 2
+                    for chosen in selected
+                ),
+                cell[0],
+                cell[1],
+            ),
+        )
+        add(farthest)
+
+    return [
+        _InternalCandidate(
+            target_cell=cell,
+            target=belief.cell_to_world(cell),
+            size=candidate.size,
+            kind="frontier",
+            cluster_cells=candidate.cluster_cells,
+        )
+        for cell in selected[: max(1, int(limit))]
+    ]
+
+
 def _grid_diagonal(belief: BeliefMap) -> float:
     return max(1e-6, math.hypot(belief.x_max - belief.x_min, belief.y_max - belief.y_min))
 
@@ -685,6 +795,27 @@ def _score_candidate(
         info = 0.0
         novelty = 0.0
 
+    terminal_heading = _path_heading(belief, path, len(path) - 1, robot_heading)
+    terminal_fov = _fov_cells(
+        belief=belief,
+        position=candidate.target,
+        heading=terminal_heading,
+        sensor_range=sensor_range,
+        fov_angle=fov_angle,
+        use_occlusion=use_occlusion,
+    )
+    terminal_info = float(
+        sum(1 for r, c in terminal_fov if int(belief.grid[r, c]) == UNKNOWN)
+    )
+    terminal_novelty = terminal_info / len(terminal_fov) if terminal_fov else 0.0
+
+    # Preserve the useful density signal, but do not dilute every distant
+    # frontier merely because its route crosses a long known corridor.  A
+    # full terminal FoV's worth of newly observed cells is already enough to
+    # saturate the absolute-gain term.
+    gain_norm = min(1.0, info / max(1, len(terminal_fov)))
+    information_utility = 0.40 * novelty + 0.40 * terminal_novelty + 0.20 * gain_norm
+
     path_cells = [(cell.row, cell.col) for cell in path]
     fov_repeat = _seen_penalty(belief, swept, seen_saturation)
     path_repeat = _seen_penalty(belief, path_cells, seen_saturation)
@@ -692,6 +823,13 @@ def _score_candidate(
     length_norm = float(result.total_cost) / _grid_diagonal(belief)
     turn_norm = min(1.0, _turn_cost(belief, path, robot_heading) / math.pi)
     align = _alignment(belief, path, robot_heading)
+    direct_distance = _distance(robot_xy, candidate.target)
+    route_efficiency = min(1.0, direct_distance / max(float(result.total_cost), 1e-9))
+    detour_penalty = 1.0 - route_efficiency
+    target_alignment = math.cos(
+        _wrap_angle(_angle_between(robot_xy, candidate.target) - robot_heading)
+    ) if direct_distance > 1e-9 else 1.0
+    backtrack_penalty = max(0.0, -target_alignment)
 
     frontier_norm = (
         math.log1p(candidate.size) / math.log1p(max(1, max_frontier_size))
@@ -713,23 +851,27 @@ def _score_candidate(
         multi_penalty += math.exp(-(d * d) / (safe * safe))
 
     score = (
-        weights["information"] * novelty
+        weights["information"] * information_utility
         + weights["frontier"] * frontier_norm
         + weights["alignment"] * align
         - weights["length"] * length_norm
         - weights["fov_repetition"] * fov_repeat
         - weights["path_repetition"] * path_repeat
         - weights["turn"] * turn_norm
+        - weights["detour"] * detour_penalty
+        - weights["backtrack"] * backtrack_penalty
         - weights["switch"] * switch_penalty
         - weights["multi_robot"] * multi_penalty
     )
 
     reason = (
         f"kind={candidate.kind}, size={candidate.size}, "
-        f"info={info:.0f}, novelty={novelty:.2f}, "
+        f"info={info:.0f}, novelty={novelty:.2f}, terminal_info={terminal_info:.0f}, "
+        f"info_utility={information_utility:.2f}, "
         f"fov_repeat={fov_repeat:.2f}, path_repeat={path_repeat:.2f}, "
         f"length={result.total_cost:.2f}, turn={turn_norm:.2f}, "
-        f"align={align:.2f}, switch={switch_penalty:.0f}, "
+        f"align={align:.2f}, detour={detour_penalty:.2f}, "
+        f"backtrack={backtrack_penalty:.2f}, switch={switch_penalty:.0f}, "
         f"multi={multi_penalty:.2f}, score={score:.3f}"
     )
 
@@ -758,6 +900,148 @@ class GoalSeekingPlanner(BaseExplorationPlanner):
         if final_goal_xy is None:
             return ExplorationPlannerResult(False, None, "Goal seeking requires final_goal_xy")
         return ExplorationPlannerResult(True, _as_point(final_goal_xy), "using final mission goal")
+
+
+class Nav2DNearestFrontierPlanner(BaseExplorationPlanner):
+    """Faithful native port of Nav2D's ``NearestFrontierPlanner``.
+
+    Nav2D does not rank frontier clusters by straight-line distance.  It
+    expands a four-connected, unit-cost wavefront through *known free* cells
+    and selects the first frontier reached.  Consequently the selected target
+    is nearest by traversable grid distance, including detours around walls.
+
+    The small exclusion/reachability checks are host integration guards: they
+    prevent a just-reached/failed cell from being returned forever and ensure
+    the target is accepted by the simulator's real navigation costmap.  They
+    do not alter the wavefront ordering among valid candidates.
+    """
+
+    name = NAV2D_NEAREST_FRONTIER_PLANNER
+
+    @staticmethod
+    def _nearest_free_start(
+        belief: BeliefMap,
+        robot_xy: tuple[float, float],
+    ) -> tuple[int, int] | None:
+        start = belief.world_to_cell(robot_xy, clamp=True)
+        if start is not None and int(belief.grid[start[0], start[1]]) == FREE:
+            return start
+
+        free_cells = np.argwhere(belief.grid == FREE)
+        if free_cells.size == 0:
+            return None
+
+        if start is None:
+            start = (belief.height // 2, belief.width // 2)
+        best = min(
+            ((int(row), int(col)) for row, col in free_cells),
+            key=lambda cell: (
+                abs(cell[0] - start[0]) + abs(cell[1] - start[1]),
+                cell[0],
+                cell[1],
+            ),
+        )
+        return best
+
+    def select_goal(self, **kwargs) -> ExplorationPlannerResult:
+        belief = _belief_from_kwargs(kwargs)
+        robot_xy = _as_point(kwargs["robot_xy"])
+        start = self._nearest_free_start(belief, robot_xy)
+        if start is None:
+            return ExplorationPlannerResult(
+                False,
+                None,
+                f"{self.name}: map contains no known free start cell",
+                (),
+            )
+
+        excluded = _normalize_targets(kwargs.get("excluded_targets"))
+        exclusion_radius = max(0.0, float(kwargs.get("target_exclusion_radius", 0.0)))
+        dynamic = _normalize_dynamic_obstacles(kwargs.get("dynamic_obstacles"))
+        robot_radius = max(0.0, float(kwargs.get("robot_radius", 0.0)))
+        dynamic_margin = max(0.0, float(kwargs.get("dynamic_obstacle_margin", 0.25)))
+        is_candidate_reachable = kwargs.get("is_candidate_reachable")
+
+        queue: deque[tuple[int, int]] = deque([start])
+        distance_steps = {start: 0}
+        checked = 0
+        rejected = 0
+        candidates: list[FrontierCandidate] = []
+
+        while queue:
+            row, col = queue.popleft()
+            cell = (row, col)
+            checked += 1
+
+            if is_frontier_cell(belief, cell):
+                target = belief.cell_to_world(cell)
+                blocked = any(_distance(target, item) <= exclusion_radius for item in excluded)
+                blocked = blocked or _target_near_dynamic_obstacle(
+                    target,
+                    dynamic,
+                    robot_radius=robot_radius,
+                    margin=dynamic_margin,
+                )
+
+                reachable = True
+                if not blocked and callable(is_candidate_reachable):
+                    try:
+                        reachable = bool(is_candidate_reachable(target))
+                    except Exception:
+                        # Match the other planners: a diagnostic callback must
+                        # never crash exploration; unknown means assume valid.
+                        reachable = True
+
+                path_distance = distance_steps[cell] * belief.resolution
+                candidate = FrontierCandidate(
+                    target=target,
+                    size=1,
+                    distance_from_robot=path_distance,
+                    score=-path_distance,
+                    information_gain=float(
+                        sum(
+                            1
+                            for neighbor in _neighbors8(cell)
+                            if _valid_cell(belief, neighbor)
+                            and int(belief.grid[neighbor[0], neighbor[1]]) == UNKNOWN
+                        )
+                    ),
+                    reason=f"wavefront_distance={path_distance:.2f} m",
+                )
+                candidates.append(candidate)
+                if not blocked and reachable:
+                    return ExplorationPlannerResult(
+                        True,
+                        target,
+                        (
+                            f"{self.name}: first reachable frontier in four-connected "
+                            f"wavefront; distance={path_distance:.2f} m, "
+                            f"checked={checked}, rejected={rejected}"
+                        ),
+                        tuple(candidates),
+                    )
+                rejected += 1
+
+            # Nav2D's single-robot implementation expands only the four
+            # cardinal neighbors and only through known-free cells.
+            for neighbor in _neighbors4(cell):
+                if neighbor in distance_steps or not _valid_cell(belief, neighbor):
+                    continue
+                nr, nc = neighbor
+                if int(belief.grid[nr, nc]) != FREE:
+                    continue
+                distance_steps[neighbor] = distance_steps[cell] + 1
+                queue.append(neighbor)
+
+        return ExplorationPlannerResult(
+            False,
+            None,
+            (
+                f"{self.name}: no reachable frontier after checking {checked} "
+                f"known-free cell(s); rejected={rejected}"
+            ),
+            tuple(candidates),
+        )
 
 
 class FrontierExplorationPlanner(BaseExplorationPlanner):
@@ -999,6 +1283,8 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             "fov_repetition": float(kwargs.get("w_fov_repetition", 2.2)),
             "path_repetition": float(kwargs.get("w_path_repetition", 0.8)),
             "turn": float(kwargs.get("w_turn", 1.0)),
+            "detour": float(kwargs.get("w_detour", 0.45)),
+            "backtrack": float(kwargs.get("w_backtrack", 0.75)),
             "switch": float(kwargs.get("w_switch", 0.6)),
             "multi_robot": float(kwargs.get("w_multi_robot", 1.2)),
         }
@@ -1006,6 +1292,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         hysteresis_margin = float(kwargs.get("hysteresis_margin", 0.15))
         min_current_information_gain = float(kwargs.get("min_current_information_gain", 1.0))
         max_candidates = max(1, int(kwargs.get("max_fov_candidates", 32)))
+        viewpoints_per_cluster = max(1, int(kwargs.get("max_frontier_viewpoints_per_cluster", 5)))
         max_forward_distance = float(kwargs.get("max_forward_distance", max(sensor_range, 4.0 * belief.resolution)))
 
         candidates = _frontier_candidates(
@@ -1015,6 +1302,9 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             target_exclusion_radius=target_exclusion_radius,
             robot_radius=robot_radius,
             dynamic_obstacle_margin=dynamic_obstacle_margin,
+            viewpoints_per_cluster=viewpoints_per_cluster,
+            robot_xy=robot_xy,
+            robot_heading=robot_heading,
         )
 
         forward = _forward_candidate(
@@ -1033,7 +1323,12 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         if not candidates:
             return ExplorationPlannerResult(False, None, "no frontier, forward, or current-target candidates found", ())
 
-        candidates = self._preselect(candidates, robot_xy, max_candidates)
+        candidates = self._preselect(
+            candidates,
+            robot_xy,
+            max_candidates,
+            robot_heading=robot_heading,
+        )
         max_frontier_size = max((c.size for c in candidates), default=1)
 
         # Three-tier grid source, in priority order -- both #1 and #2 carry
@@ -1179,6 +1474,8 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         candidates: list[_InternalCandidate],
         robot_xy: tuple[float, float],
         max_candidates: int,
+        *,
+        robot_heading: float = 0.0,
     ) -> list[_InternalCandidate]:
         if len(candidates) <= max_candidates:
             return candidates
@@ -1190,20 +1487,50 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         if budget <= 0:
             return special[:max_candidates]
 
-        by_size = sorted(frontiers, key=lambda c: c.size, reverse=True)
-        by_distance = sorted(frontiers, key=lambda c: _distance(robot_xy, c.target))
+        by_size = sorted(
+            frontiers,
+            key=lambda c: (-c.size, _distance(robot_xy, c.target), c.target_cell),
+        )
+        by_distance = sorted(
+            frontiers,
+            key=lambda c: (_distance(robot_xy, c.target), -c.size, c.target_cell),
+        )
+        by_alignment = sorted(
+            frontiers,
+            key=lambda c: (
+                abs(_wrap_angle(_angle_between(robot_xy, c.target) - robot_heading)),
+                _distance(robot_xy, c.target),
+                -c.size,
+                c.target_cell,
+            ),
+        )
 
         chosen: list[_InternalCandidate] = []
         seen: set[tuple[int, int]] = set()
 
-        for pool in (by_size, by_distance):
-            for candidate in pool:
+        # Interleave rankings.  Previously `by_size` always contained every
+        # frontier and therefore consumed the whole budget before
+        # `by_distance` was ever consulted, despite the apparent two-pool
+        # implementation.  Directional candidates now receive an equal
+        # opportunity as well.
+        pools = (by_size, by_distance, by_alignment)
+        indices = [0] * len(pools)
+        while len(chosen) < budget:
+            added_this_round = False
+            for pool_index, pool in enumerate(pools):
+                while indices[pool_index] < len(pool):
+                    candidate = pool[indices[pool_index]]
+                    indices[pool_index] += 1
+                    if candidate.target_cell in seen:
+                        continue
+                    seen.add(candidate.target_cell)
+                    chosen.append(candidate)
+                    added_this_round = True
+                    break
                 if len(chosen) >= budget:
                     break
-                if candidate.target_cell in seen:
-                    continue
-                seen.add(candidate.target_cell)
-                chosen.append(candidate)
+            if not added_this_round:
+                break
 
         return special + chosen[:budget]
 
@@ -1212,6 +1539,7 @@ class ExplorationPlannerRegistry:
     def __init__(self):
         self._planners: dict[str, BaseExplorationPlanner] = {
             GoalSeekingPlanner.name: GoalSeekingPlanner(),
+            Nav2DNearestFrontierPlanner.name: Nav2DNearestFrontierPlanner(),
             NearestFrontierPlanner.name: NearestFrontierPlanner(),
             LargestFrontierPlanner.name: LargestFrontierPlanner(),
             UtilityFrontierPlanner.name: UtilityFrontierPlanner(),

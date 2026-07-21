@@ -218,6 +218,29 @@ def test_predicted_collision_replan_uses_current_path_goal_not_new_frontier():
     assert fake.build_planner_kwargs_for_goal_calls == [((6.0, 3.0), REPAIR_GOAL)]
 
 
+def test_multi_robot_predicted_collision_repairs_route_without_reassigning_frontier():
+    fake = _build_fake_engine()
+    _give_agent_active_route(fake, target=REPAIR_GOAL)
+    fake.robots = [fake.robot]
+    fake.multi_safety_replan_allowed = lambda robot_index, reason, target: True
+    calls = []
+    fake.assign_route_to_multi_robot = lambda robot_index, **kwargs: calls.append(
+        (robot_index, kwargs)
+    ) or True
+
+    decision = _replan_for_safety_decision(REPAIR_GOAL)
+    should_brake = SimulationControllerMixin.apply_navigation_decision(
+        fake, fake.robot, fake.agent, decision
+    )
+
+    assert should_brake is True
+    assert len(calls) == 1
+    robot_index, kwargs = calls[0]
+    assert robot_index == 0
+    assert kwargs["force_new_exploration_target"] is False
+    assert kwargs["reason"] == "safety replan: predicted collision"
+
+
 # ---------------------------------------------------------------------------
 # 3. With nothing active to repair, existing fallback target selection is
 #    still allowed.

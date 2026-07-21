@@ -11,6 +11,7 @@ from robotics_sim.simulation.coordination import select_runtime_path_source
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.plugin_loader import load_coordination_plugin
 from robotics_sim.simulation.telemetry import TelemetryLogger
+from robotics_sim.environment.collision_checker import CollisionChecker
 
 
 def test_direct_route_crossing_robot_safety_is_rejected_before_active():
@@ -159,6 +160,7 @@ def _build_fake_engine(*, planner_type: str = "A*", route_plan_responses):
         route_result_count=0,
         last_goal_selection_reason="",
         console_logs=[],
+        collision_checker=CollisionChecker(),
     )
 
     fake.is_exploration_mode = lambda: True
@@ -227,6 +229,7 @@ def _build_fake_engine(*, planner_type: str = "A*", route_plan_responses):
         "compute_grid_safe_fallback_route_for_multi_robot",
         "set_robot_goal_or_waypoints",
         "clean_waypoints_for_robot",
+        "route_points_intersect_new_map_information",
         "log_route_assignment",
         "_xy_text",
     ):
@@ -384,3 +387,51 @@ def test_direct_route_rejected_can_try_astar_fallback(monkeypatch):
     # The fallback succeeded on the first try, so the target must not have
     # been blacklisted/retried.
     assert not any("target_blacklisted_after_route_rejection" in message for message in fake.console_logs)
+
+
+def test_direct_route_blocked_by_known_static_obstacle_uses_astar_fallback():
+    """Known static geometry must trigger the same local fallback as a
+    teammate-corridor conflict instead of ACTIVE/STUCK_SAFETY oscillation."""
+    fake = _build_fake_engine(
+        planner_type="Direct",
+        route_plan_responses=[(True, "direct route", [(4.0, 0.0)])],
+    )
+    fake.mapped_obstacle_points = [(2.0, 0.0)]
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_ACTIVE
+    assert fake.multi_planned_path_points[0] == [
+        (0.0, 0.0),
+        (0.0, 2.0),
+        (4.0, 0.0),
+    ]
+    assert any("crosses known obstacle, trying A* fallback" in msg for msg in fake.console_logs)
+
+
+def test_engine_does_not_hard_lock_untimed_teammate_future_routes(monkeypatch):
+    """Crossing future polylines have no arrival times and therefore cannot
+    be permanent corridor obstacles.  Current teammate disks remain in the
+    validator call and enforce the real instantaneous safety constraint."""
+    fake = _build_fake_engine(
+        planner_type="A*",
+        route_plan_responses=[(True, "crossing route", [(0.0, 4.0)])],
+    )
+    fake.multi_active_route_points_by_robot = lambda: [
+        [(0.0, 0.0), (0.0, 4.0)],
+        [(-2.0, 2.0), (2.0, 2.0)],
+    ]
+    seen_other_routes = []
+
+    def capture_validation(**kwargs):
+        seen_other_routes.append(list(kwargs.get("other_routes", [])))
+        return validate_multi_robot_corridor(**kwargs)
+
+    monkeypatch.setattr(engine_module, "validate_multi_robot_corridor", capture_validation)
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert seen_other_routes == [[]]
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_ACTIVE

@@ -200,19 +200,30 @@ def test_single_robot_history_beyond_limit_stays_visible_after_rebuild():
 
 
 def test_multi_robot_history_beyond_limit_stays_visible_and_attributed():
-    belief = _make_belief(robot_count=2)
-    old_cell_r0 = (0, 0)
-    old_cell_r1 = (3, 3)
-    old_world_r0 = _cell_center(*old_cell_r0)
-    old_world_r1 = _cell_center(*old_cell_r1)
-    belief.mark_free_cell(old_cell_r0, robot_index=0, time_s=0.0)
-    belief.mark_free_cell(old_cell_r1, robot_index=1, time_s=0.0)
+    """Updated for fix/smooth-explored-area-rebuild's continuous-geometry
+    rebuild (see simulation_canvas._explored_area_paths_by_robot): once a
+    robot has painted any sweep via append_explored_area_polygon(), a
+    rebuild replays that robot's own continuous QPainterPath -- not the
+    discrete seed mask -- the two are never combined for the same robot.
+    This mirrors real engine usage, where belief_map.explored_by_robot and
+    the canvas path are always updated from the exact same polygon in the
+    same call, so "the mask has history this robot's own path never saw"
+    cannot happen for a live run. The ORIGINAL version of this test set the
+    "old" zone only via belief.mark_free_cell() (never painted through the
+    canvas) specifically to prove the discrete-mask fallback worked; that
+    scenario is now covered by test_smooth_explored_area_rebuild.py's
+    "seed fallback preserved" test. This test now proves the continuous
+    path gives the same (in fact stronger, unbounded/unquantized)
+    guarantee for real appended sweeps.
+    """
+    old_world_r0 = (-1.5, -1.5)
+    old_world_r1 = (1.5, 1.5)
 
     canvas = _make_canvas()
-    canvas.set_explored_area_seed(belief.explored_by_robot, belief.resolution, belief.bounds)
-
-    # Force the initial mask-based rebuild (mirrors what the real paint
-    # loop does via draw_explored_area_trace()/ensure_explored_area_cache()).
+    old_polygon_r0 = _square_polygon(*old_world_r0)
+    old_polygon_r1 = _square_polygon(*old_world_r1)
+    canvas.append_explored_area_polygon(old_polygon_r0, robot_index=0)
+    canvas.append_explored_area_polygon(old_polygon_r1, robot_index=1)
     _paint_once(canvas)
     assert set(canvas._explored_area_caches_by_robot) == {0, 1}
 
@@ -220,6 +231,10 @@ def test_multi_robot_history_beyond_limit_stays_visible_and_attributed():
         canvas.append_explored_area_polygon(_square_polygon(-0.5, -0.5), robot_index=0)
         canvas.append_explored_area_polygon(_square_polygon(0.5, 0.5), robot_index=1)
 
+    # The bounded python-side list truncates -- the old polygons are gone
+    # from it -- but the continuous path never does.
+    assert old_polygon_r0 not in canvas.explored_area_polygons
+    assert old_polygon_r1 not in canvas.explored_area_polygons
     assert len(canvas.explored_area_polygons) <= EXPLORED_POLYGON_HISTORY_LIMIT
 
     canvas.set_theme_mode(ThemeMode.DARK)
@@ -243,27 +258,31 @@ def test_multi_robot_history_beyond_limit_stays_visible_and_attributed():
 
 
 def test_multi_robot_append_after_rebuild_keeps_other_robot_visible():
-    belief = _make_belief(robot_count=2)
-    old_cell_r0 = (0, 0)
-    old_cell_r1 = (3, 3)
-    old_world_r0 = _cell_center(*old_cell_r0)
-    old_world_r1 = _cell_center(*old_cell_r1)
-    belief.mark_free_cell(old_cell_r0, robot_index=0, time_s=0.0)
-    belief.mark_free_cell(old_cell_r1, robot_index=1, time_s=0.0)
+    """Updated for fix/smooth-explored-area-rebuild's continuous-geometry
+    rebuild -- see test_multi_robot_history_beyond_limit_stays_visible_
+    and_attributed()'s docstring above for why the old belief.
+    mark_free_cell()-only setup no longer applies once a robot has its own
+    continuous path."""
+    old_world_r0 = (-1.5, -1.5)
+    old_world_r1 = (1.5, 1.5)
 
     canvas = _make_canvas()
-    canvas.set_explored_area_seed(belief.explored_by_robot, belief.resolution, belief.bounds)
+    canvas.append_explored_area_polygon(_square_polygon(*old_world_r0), robot_index=0)
+    canvas.append_explored_area_polygon(_square_polygon(*old_world_r1), robot_index=1)
     _paint_once(canvas)
     assert set(canvas._explored_area_caches_by_robot) == {0, 1}
 
-    # Theme toggle invalidates everything, including per-robot caches.
+    # Theme toggle invalidates every render-cache pixmap, including
+    # per-robot caches -- but not the continuous paths (see
+    # clear_explored_area_geometry()'s docstring for the distinction).
     canvas.set_theme_mode(ThemeMode.DARK)
     assert canvas._explored_area_caches_by_robot == {}
 
     # A single new sweep for robot 0 only -- no full repaint/ensure call in
     # between, exactly like the live engine calling record_explored_area()
     # for one robot at a time.
-    canvas.append_explored_area_polygon(_square_polygon(-1.9, -1.9, half=0.05), robot_index=0)
+    new_world_r0 = (-1.9, -1.9)
+    canvas.append_explored_area_polygon(_square_polygon(*new_world_r0, half=0.05), robot_index=0)
 
     _paint_once(canvas)
 
@@ -271,11 +290,12 @@ def test_multi_robot_append_after_rebuild_keeps_other_robot_visible():
     cache1 = canvas._explored_area_caches_by_robot.get(1)
     assert cache0 is not None
     assert cache1 is not None, (
-        "robot 1's cache must have been rebuilt from the mask too, not "
-        "dropped just because only robot 0 appended a new sweep"
+        "robot 1's cache must have been rebuilt from its own continuous "
+        "path too, not dropped just because only robot 0 appended a new sweep"
     )
-    assert _sample_alpha(canvas, cache0, old_world_r0) > 0
-    assert _sample_alpha(canvas, cache1, old_world_r1) > 0
+    assert _sample_alpha(canvas, cache0, old_world_r0) > 0, "robot 0 keeps its old geometry"
+    assert _sample_alpha(canvas, cache0, new_world_r0) > 0, "robot 0 also gets the new sweep"
+    assert _sample_alpha(canvas, cache1, old_world_r1) > 0, "robot 1 keeps its full geometry"
 
 
 # ---------------------------------------------------------------------------

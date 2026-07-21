@@ -328,6 +328,26 @@ class SimulationCanvas(QWidget):
         self._explored_area_seed_resolution: float | None = None
         self._explored_area_seed_bounds: tuple[float, float, float, float] | None = None
 
+        # Continuous, world-coordinate FoV sweep geometry -- the
+        # AUTHORITATIVE visual source once any sweep has been painted this
+        # session (see append_explored_area_polygon()/rebuild_explored_
+        # area_cache()). Keyed by robot_index (int) for multi-robot mode,
+        # or None for single-robot mode -- the same robot_index=None
+        # convention used throughout this file. Takes priority over
+        # _explored_area_seed_mask during a rebuild, per robot: the mask
+        # stays as a fallback only for a robot that has no continuous path
+        # of its own yet (e.g. right after a snapshot restore -- see
+        # clear_explored_area_geometry()). Never truncated (unlike
+        # explored_area_polygons/EXPLORED_POLYGON_HISTORY_LIMIT) -- that is
+        # the whole point: a theme toggle/resize/pan/zoom must never
+        # degrade smooth diagonal FoV sweeps into grid-cell-quantized
+        # squares just because the bounded python-side polygon list was
+        # trimmed. Cleared only by clear_explored_area_geometry() (a fresh
+        # run/reset/restore) -- never by invalidate_explored_area_cache()
+        # (theme toggle/resize/pan/zoom), which only drops the QPixmap
+        # render caches built FROM this geometry, not the geometry itself.
+        self._explored_area_paths_by_robot: dict[int | None, QPainterPath] = {}
+
         # Mapped obstacle points can become thousands of tiny ellipses. Drawing
         # each point every paintEvent is expensive, so they are rasterized into
         # a transparent cache and updated only when new points arrive.
@@ -651,9 +671,14 @@ class SimulationCanvas(QWidget):
         bounds: tuple[float, float, float, float],
     ) -> None:
         """Point the live explored-area cache at an authoritative
-        belief_map.explored_by_robot mask -- the source rebuild_explored_
-        area_cache() replays whenever the cache is invalidated (theme
-        toggle/resize/pan-zoom -- see invalidate_explored_area_cache()).
+        belief_map.explored_by_robot mask -- the DISCRETE source
+        rebuild_explored_area_cache() replays whenever the cache is
+        invalidated (theme toggle/resize/pan-zoom -- see invalidate_
+        explored_area_cache()) and the robot in question has no continuous
+        path of its own yet (see _explored_area_paths_by_robot -- the
+        smooth, continuous geometry painted per FoV sweep via append_
+        explored_area_polygon() takes priority over this mask, per robot,
+        once it exists).
 
         Not exclusively a restored-snapshot seed: engine.py calls this once
         per fresh run too, right after (re)creating BeliefMap (see engine.
@@ -699,6 +724,27 @@ class SimulationCanvas(QWidget):
         self._explored_area_seed_mask = None
         self._explored_area_seed_resolution = None
         self._explored_area_seed_bounds = None
+
+    def clear_explored_area_geometry(self) -> None:
+        """Drop the authoritative continuous-path coverage and the bounded
+        polygon history for a fresh run/reset/restore.
+
+        Unlike invalidate_explored_area_cache() (safe to call on every
+        resize/pan/zoom/theme toggle, since it only drops rendering-cache
+        QPixmaps that get rebuilt from the geometry below), this drops the
+        geometry itself, so a previous run's coverage can never bleed into
+        a new one -- see _explored_area_paths_by_robot's docstring.
+
+        Does not touch _explored_area_seed_mask or the BeliefMap: callers
+        are responsible for publishing the new run's belief_map.
+        explored_by_robot as the discrete fallback afterward (see engine.
+        _publish_explored_area_source_to_canvas() / restore_navigation_
+        debug_snapshot()) -- invalidate_explored_area_cache() must never
+        be used as a substitute for this method.
+        """
+        self._explored_area_paths_by_robot = {}
+        self.explored_area_polygons = []
+        self.invalidate_explored_area_cache()
 
     def invalidate_mapped_points_cache(self):
         self._mapped_points_cache = None
@@ -884,6 +930,24 @@ class SimulationCanvas(QWidget):
         self.explored_area_polygons.append(polygon_copy)
         if len(self.explored_area_polygons) > EXPLORED_POLYGON_HISTORY_LIMIT:
             self.explored_area_polygons = self.explored_area_polygons[-EXPLORED_POLYGON_HISTORY_LIMIT:]
+
+        # Continuous, world-coordinate geometry -- the authoritative visual
+        # source (see _explored_area_paths_by_robot's docstring). O(1): just
+        # adds this one polygon as a new closed subpath onto whatever this
+        # robot's QPainterPath already has. Never unions/simplifies/rebuilds
+        # the accumulated path here -- that cost must never scale with
+        # sweep count on every single sweep, only rebuild_explored_area_
+        # cache() (an invalidation-triggered, not per-sweep, event) pays
+        # the cost of rasterizing the whole path to screen space.
+        world_path = self._explored_area_paths_by_robot.get(robot_index)
+        if world_path is None:
+            world_path = QPainterPath()
+            world_path.setFillRule(Qt.WindingFill)
+            self._explored_area_paths_by_robot[robot_index] = world_path
+        world_path.moveTo(polygon_copy[0][0], polygon_copy[0][1])
+        for x, y in polygon_copy[1:]:
+            world_path.lineTo(x, y)
+        world_path.closeSubpath()
 
         # A stale cache (invalidate_explored_area_cache() -- theme toggle,
         # resize, pan/zoom) means whatever is cached, combined or
@@ -2122,6 +2186,53 @@ class SimulationCanvas(QWidget):
             color=color, cell_bounds=cell_bounds,
         )
 
+    def _world_explored_path_to_screen_path(self, world_path: QPainterPath) -> QPainterPath:
+        """Transform a world-coordinate explored-area QPainterPath into
+        screen coordinates for the canvas's CURRENT view transform (pan/
+        zoom/plot_rect/Y-axis inversion) -- reuses world_to_screen() per
+        path element rather than duplicating its math. `world_path` itself
+        is never modified; a new QPainterPath is returned."""
+        screen_path = QPainterPath()
+        screen_path.setFillRule(Qt.WindingFill)
+        for i in range(world_path.elementCount()):
+            element = world_path.elementAt(i)
+            sx, sy = self.world_to_screen(element.x, element.y)
+            if element.type == QPainterPath.ElementType.MoveToElement:
+                screen_path.moveTo(sx, sy)
+            else:
+                screen_path.lineTo(sx, sy)
+        return screen_path
+
+    def _paint_explored_path_to_cache(
+        self,
+        cache_painter: QPainter,
+        world_path: QPainterPath,
+        *,
+        color: QColor,
+        alpha: int,
+    ) -> None:
+        """Rasterize one robot's continuous, world-coordinate explored-area
+        geometry into screen space -- see
+        _world_explored_path_to_screen_path().
+
+        Antialiased, like paint_explored_polygon_to_cache()'s single-sweep
+        painter: smooth edges are the entire point of this continuous
+        geometry (vs. the discrete mask's blocky per-cell rects, which
+        stay non-antialiased). This also keeps the very first rebuild
+        triggered by append_explored_area_polygon() (which repaints the
+        same just-added polygon a second time via paint_explored_polygon_
+        to_cache(), see its docstring) idempotent -- both passes must use
+        the same antialiasing setting or the two would disagree on
+        boundary-pixel coverage.
+        """
+        screen_path = self._world_explored_path_to_screen_path(world_path)
+        fill_color = QColor(color)
+        fill_color.setAlpha(alpha)
+        cache_painter.setRenderHint(QPainter.Antialiasing)
+        cache_painter.setPen(Qt.NoPen)
+        cache_painter.setBrush(QBrush(fill_color))
+        cache_painter.drawPath(screen_path)
+
     def rebuild_explored_area_cache(self):
         cache = QPixmap(self.size())
         cache.fill(Qt.transparent)
@@ -2132,39 +2243,71 @@ class SimulationCanvas(QWidget):
         self._explored_area_cache_sizes_by_robot = {}
 
         mask = self._explored_area_seed_mask
+        paths_by_robot = self._explored_area_paths_by_robot
+        int_path_indices = {
+            key for key, path in paths_by_robot.items()
+            if isinstance(key, int) and not path.isEmpty()
+        }
+        multi_robot_mask_indices = set(range(mask.shape[0])) if (mask is not None and mask.shape[0] > 1) else set()
+        multi_robot_indices = int_path_indices | multi_robot_mask_indices
 
-        if mask is not None and mask.shape[0] > 1:
-            # Multi-robot: each robot gets its own attributed cache,
-            # rebuilt straight from its own slice of the live authoritative
-            # mask, so historical coverage never depends on the bounded
-            # explored_area_polygons history (see EXPLORED_POLYGON_
-            # HISTORY_LIMIT) or on another robot's cache already existing.
-            # explored_area_polygons is not replayed here -- it is not
-            # reliably attributable per robot, and the mask already is the
-            # complete authoritative state (new sweeps still paint on top
-            # afterwards -- see append_explored_area_polygon()).
-            for robot_index in range(mask.shape[0]):
+        if multi_robot_indices:
+            # Multi-robot: one attributed cache per robot. Continuous
+            # geometry takes priority over the discrete mask, per robot --
+            # never both painted for the same robot in the same rebuild
+            # (see _explored_area_paths_by_robot's docstring). A robot with
+            # no continuous path yet (e.g. right after a snapshot restore
+            # -- see clear_explored_area_geometry()) falls back to its mask
+            # slice, same as before this geometry existed.
+            for robot_index in sorted(multi_robot_indices):
                 robot_cache = QPixmap(self.size())
                 robot_cache.fill(Qt.transparent)
                 cache_painter = QPainter(robot_cache)
                 cache_painter.save()
                 cache_painter.setClipRect(self.plot_rect())
-                self._paint_explored_mask_robot_slice_to_cache(
-                    cache_painter,
-                    mask,
-                    robot_index,
-                    self._explored_area_seed_resolution,
-                    self._explored_area_seed_bounds,
-                    alpha=self._explored_area_alpha(24),
-                )
+                world_path = paths_by_robot.get(robot_index)
+                if world_path is not None and not world_path.isEmpty():
+                    self._paint_explored_path_to_cache(
+                        cache_painter, world_path,
+                        color=robot_color(robot_index),
+                        alpha=self._explored_area_alpha(24),
+                    )
+                elif mask is not None and 0 <= robot_index < mask.shape[0]:
+                    self._paint_explored_mask_robot_slice_to_cache(
+                        cache_painter,
+                        mask,
+                        robot_index,
+                        self._explored_area_seed_resolution,
+                        self._explored_area_seed_bounds,
+                        alpha=self._explored_area_alpha(24),
+                    )
                 cache_painter.restore()
                 cache_painter.end()
                 self._explored_area_caches_by_robot[robot_index] = robot_cache
                 self._explored_area_cache_sizes_by_robot[robot_index] = QSize(self.size())
             return
 
+        single_path = paths_by_robot.get(None)
+        if single_path is not None and not single_path.isEmpty():
+            # Single-robot: the continuous path is authoritative once it
+            # exists -- the mask/explored_area_polygons are not replayed on
+            # top of it here (same "one source of truth per rebuild" rule
+            # as the multi-robot branch above).
+            cache_painter = QPainter(cache)
+            cache_painter.save()
+            cache_painter.setClipRect(self.plot_rect())
+            self._paint_explored_path_to_cache(
+                cache_painter, single_path,
+                color=QColor(BLUE), alpha=self._explored_area_alpha(24),
+            )
+            cache_painter.restore()
+            cache_painter.end()
+            self._explored_area_cached_count = len(self.explored_area_polygons)
+            return
+
         if mask is not None:
-            # Single-robot: the mask already represents the complete
+            # Single-robot, no continuous path yet (e.g. right after a
+            # snapshot restore): the mask already represents the complete
             # authoritative coverage, so it alone rebuilds the cache --
             # explored_area_polygons (bounded to EXPLORED_POLYGON_HISTORY_
             # LIMIT sweeps) is not replayed on top of it here, only
@@ -2184,10 +2327,10 @@ class SimulationCanvas(QWidget):
             self._explored_area_cached_count = len(self.explored_area_polygons)
             return
 
-        # Legacy fallback: no authoritative mask has ever been published
-        # (see set_explored_area_seed()'s docstring) -- e.g. isolated
-        # tests/callers that only ever set polygons directly. Replay the
-        # bounded polygon history exactly as before.
+        # Legacy fallback: no continuous path and no authoritative mask has
+        # ever been published (see set_explored_area_seed()'s docstring)
+        # -- e.g. isolated tests/callers that only ever set polygons
+        # directly. Replay the bounded polygon history exactly as before.
         for polygon in self.explored_area_polygons:
             self.paint_explored_polygon_to_cache(polygon)
         self._explored_area_cached_count = len(self.explored_area_polygons)
@@ -3147,6 +3290,7 @@ class SimulationCanvas(QWidget):
             and self._explored_area_seed_mask is None
             and not self._explored_area_caches_by_robot
             and self._explored_area_cache is None
+            and not self._explored_area_paths_by_robot
         ):
             return
 

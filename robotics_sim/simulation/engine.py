@@ -754,23 +754,31 @@ class SimulationControllerMixin:
 
     def _publish_explored_area_source_to_canvas(self) -> None:
         """Point the canvas at this run's live belief_map.explored_by_robot
-        mask -- the authoritative source rebuild_explored_area_cache() uses
-        to reconstruct the visible explored-area layer after any cache
-        invalidation (theme toggle/resize/pan-zoom), instead of the bounded
+        mask -- the authoritative DISCRETE source rebuild_explored_area_
+        cache() uses to reconstruct the visible explored-area layer after
+        any cache invalidation (theme toggle/resize/pan-zoom), for any
+        robot that has no continuous FoV-sweep geometry of its own yet
+        (see canvas._explored_area_paths_by_robot) -- never the bounded
         explored_area_polygons history (see EXPLORED_POLYGON_HISTORY_LIMIT).
 
         Call once per fresh run, right after reset_belief_map() replaces
         self.belief_map with a new instance, so the canvas is never left
         pointing at a previous run's (already-replaced) BeliefMap -- see
-        this method's callers. canvas.set_explored_area_seed() keeps only
-        the ndarray reference (no copy), and belief_map's own mutating
-        methods write into it in place, so this needs calling only once per
-        BeliefMap instance, not once per tick. See canvas.
-        set_explored_area_seed()'s docstring for the full contract.
+        this method's callers. Clears the canvas's continuous-path/bounded-
+        polygon coverage first (clear_explored_area_geometry()) so a
+        previous run's smooth geometry can never bleed into this new,
+        empty one -- invalidate_explored_area_cache() alone would drop only
+        the render-cache pixmaps, not that authoritative geometry.
+        canvas.set_explored_area_seed() then keeps only the ndarray
+        reference (no copy), and belief_map's own mutating methods write
+        into it in place, so this needs calling only once per BeliefMap
+        instance, not once per tick. See canvas.set_explored_area_seed()'s
+        docstring for the full contract.
         """
         canvas = getattr(self, "canvas", None)
         if canvas is None:
             return
+        canvas.clear_explored_area_geometry()
         belief = self.belief_map
         canvas.set_explored_area_seed(belief.explored_by_robot, belief.resolution, belief.bounds)
 
@@ -5043,6 +5051,19 @@ class SimulationControllerMixin:
         # sensor sweeps recorded after this point paint on top of the seed
         # as usual. The executed-path trail has no equivalent authoritative
         # source to reseed from, so it resets to the single restored point.
+        #
+        # clear_explored_area_geometry() also drops any continuous FoV-
+        # sweep QPainterPath geometry the canvas built up before this
+        # restore (see canvas._explored_area_paths_by_robot) -- navigation-
+        # debug snapshots do not store that continuous geometry, only the
+        # discrete belief.explored_by_robot mask, so there is nothing to
+        # rebuild it from. A restored run therefore falls back to the
+        # discrete mask's grid-cell-quantized rendering (exactly like
+        # 31a1e4b's behavior) until new live sweeps rebuild smooth
+        # geometry going forward. Legacy snapshots preserve full LOGICAL
+        # coverage (nothing is actually un-explored) but not continuous
+        # geometric fidelity -- never invent smooth paths from cells.
+        self.canvas.clear_explored_area_geometry()
         self.explored_area_polygons = []
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_explored_area_seed(explored, float(frame.resolution), belief.bounds)

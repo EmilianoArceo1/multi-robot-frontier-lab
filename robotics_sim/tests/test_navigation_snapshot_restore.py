@@ -262,6 +262,7 @@ class _FakeCanvas:
         self.discovered_hazard_frames: list = []
         self.exploration_target = "unset"
         self.explored_area_seed = None
+        self.explored_area_geometry_clear_count = 0
 
     def set_status(self, message):
         self.status_messages.append(message)
@@ -280,6 +281,13 @@ class _FakeCanvas:
 
     def set_explored_area_seed(self, mask, resolution, bounds):
         self.explored_area_seed = (mask, resolution, bounds)
+
+    def clear_explored_area_geometry(self):
+        # Real SimulationCanvas.clear_explored_area_geometry() also drops
+        # explored_area_polygons -- see restore_navigation_debug_snapshot(),
+        # which calls this before set_explored_area_polygons([]) anyway.
+        self.explored_area_geometry_clear_count += 1
+        self.explored_area_polygons = []
 
     def set_mapped_obstacle_points(self, points):
         self.mapped_obstacle_points = list(points)

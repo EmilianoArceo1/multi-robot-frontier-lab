@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import math
 from typing import Iterable, Sequence
 
+from robotics_interfaces.frontiers import FrontierCluster, ViewpointCandidate
 from robotics_sim.planning.exploration_planners import FrontierCandidate
 
 
@@ -293,14 +294,27 @@ def _occupied_cells_from_points(
 
 
 def _cluster_cells(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """8-connected components of `cells`, fully deterministic.
+
+    `cells` is a set, so its own iteration order can depend on the set's
+    internal hash-table history (insertion/deletion order), not just its
+    final membership. Seeding each component from `sorted(cells)` instead
+    of `set.pop()`, and sorting each component's cells before returning,
+    means the same cell membership always produces the same components in
+    the same order with the same cell order -- regardless of what order
+    the cells were originally added in. No hash() or hash-order dependence
+    anywhere in this function.
+    """
     offsets = (
         (1, 0), (-1, 0), (0, 1), (0, -1),
         (1, 1), (1, -1), (-1, 1), (-1, -1),
     )
     remaining = set(cells)
     clusters: list[list[tuple[int, int]]] = []
-    while remaining:
-        start = remaining.pop()
+    for start in sorted(cells):
+        if start not in remaining:
+            continue
+        remaining.discard(start)
         cluster = [start]
         queue: deque[tuple[int, int]] = deque([start])
         while queue:
@@ -309,36 +323,41 @@ def _cluster_cells(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
                 neighbor = (cell[0] + dx, cell[1] + dy)
                 if neighbor not in remaining:
                     continue
-                remaining.remove(neighbor)
+                remaining.discard(neighbor)
                 queue.append(neighbor)
                 cluster.append(neighbor)
-        clusters.append(cluster)
+        clusters.append(sorted(cluster))
     return clusters
 
 
-def _detect_global_frontier_viewpoints(
+def _frontier_cells_from_map(
     *,
     explored_points: Sequence[tuple[float, float]],
     mapped_obstacle_points: Sequence[tuple[float, float]],
     bounds: tuple[float, float, float, float],
     resolution: float,
     robot_radius: float,
-    sensor_range: float,
-) -> list[FrontierCandidate]:
-    """Detect frontiers once from the shared map and return viewpoint candidates."""
-    resolution = max(float(resolution), 1e-6)
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]], set[tuple[int, int]]]:
+    """Shared first stage of frontier detection: discretize the map and
+    return (frontier_cells, explored, occupied). A cell is frontier iff it
+    is explored, free (not occupied), and has at least one in-bounds
+    4-connected (cardinal) neighbor that is not in `explored` -- i.e. its
+    status is genuinely unknown, not merely occupied. This is pure set
+    membership, so the result never depends on the order of
+    explored_points/mapped_obstacle_points, only on which points they
+    contain."""
     explored = {
         _cell_key(point, resolution)
         for point in explored_points
         if _inside_bounds(point, bounds)
     }
     if not explored:
-        return []
+        return set(), explored, set()
 
     occupied = _occupied_cells_from_points(mapped_obstacle_points, resolution, robot_radius)
     explored_free = explored - occupied
     if not explored_free:
-        return []
+        return set(), explored, occupied
 
     frontier_cells: set[tuple[int, int]] = set()
     for cell in explored_free:
@@ -351,35 +370,93 @@ def _detect_global_frontier_viewpoints(
                 frontier_cells.add(cell)
                 break
 
-    if not frontier_cells:
-        return []
+    return frontier_cells, explored, occupied
 
-    candidates: list[FrontierCandidate] = []
-    for cluster in _cluster_cells(frontier_cells):
-        if not cluster:
+
+def _component_slices(
+    cluster_world: Sequence[tuple[float, float]], *, resolution: float
+) -> list[list[tuple[float, float]]]:
+    """Split one connected component into up to three viewpoint slices.
+
+    Preserves the existing heuristic exactly: components under 8 cells, or
+    whose bounding-box extent is under 1.5*resolution in both axes, get a
+    single slice (one viewpoint). Larger/elongated components are cut into
+    up to three slices along their longer axis, so one big frontier is
+    covered by more than one viewpoint instead of a single one far from
+    most of it. Ties in the sort key are broken by `cluster_world`'s own
+    (already-deterministic) order, since sorted() is stable.
+    """
+    if len(cluster_world) >= 8:
+        min_x = min(point[0] for point in cluster_world)
+        max_x = max(point[0] for point in cluster_world)
+        min_y = min(point[1] for point in cluster_world)
+        max_y = max(point[1] for point in cluster_world)
+        width = max_x - min_x
+        height = max_y - min_y
+        if max(width, height) >= 1.5 * resolution:
+            sort_key = (lambda point: point[0]) if width >= height else (lambda point: point[1])
+            sorted_points = sorted(cluster_world, key=sort_key)
+            slices = [
+                sorted_points[i * len(sorted_points) // 3 : (i + 1) * len(sorted_points) // 3]
+                for i in range(3)
+            ]
+            return [slice_points for slice_points in slices if slice_points]
+    return [list(cluster_world)]
+
+
+def detect_connected_frontier_components(
+    *,
+    explored_points: Sequence[tuple[float, float]],
+    mapped_obstacle_points: Sequence[tuple[float, float]],
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    robot_radius: float,
+    sensor_range: float,
+) -> tuple[FrontierCluster, ...]:
+    """Detect connected frontier components from the shared map, once, and
+    return them as real FrontierCluster objects.
+
+    Pure function: no engine/Qt/MainWindow/canvas import, no global mutable
+    state -- everything it needs is passed in. Reuses the exact same
+    discretization/occupied-cell/frontier-cell/8-connectivity/information-
+    gain/viewpoint-slicing semantics `_detect_global_frontier_viewpoints`
+    used to implement directly (see _frontier_cells_from_map(),
+    _cluster_cells(), _component_slices(), _estimate_information_gain());
+    this commit only changes what those cells/slices are packaged into.
+
+    Determinism: `_cluster_cells()` returns components (and cells within
+    each component) sorted lexicographically by discrete (int, int)
+    coordinate, seeded from `sorted(cells)` rather than `set.pop()` -- so
+    the same map always yields the same components in the same order,
+    regardless of explored_points/mapped_obstacle_points input order. IDs
+    are assigned after that ordering as frontier-component-0000,
+    frontier-component-0001, ... and are only stable for one observation;
+    this commit does not track cluster identity across calls.
+    """
+    resolution = max(float(resolution), 1e-6)
+    frontier_cells, explored, occupied = _frontier_cells_from_map(
+        explored_points=explored_points,
+        mapped_obstacle_points=mapped_obstacle_points,
+        bounds=bounds,
+        resolution=resolution,
+        robot_radius=robot_radius,
+    )
+    if not frontier_cells:
+        return ()
+
+    clusters: list[FrontierCluster] = []
+    for component_index, component_cells in enumerate(_cluster_cells(frontier_cells)):
+        if not component_cells:
             continue
-        cluster_world = [_cell_center(cell, resolution) for cell in cluster]
+        cluster_world = [_cell_center(cell, resolution) for cell in component_cells]
         centroid = (
             sum(point[0] for point in cluster_world) / len(cluster_world),
             sum(point[1] for point in cluster_world) / len(cluster_world),
         )
-        if len(cluster_world) >= 8:
-            if max(max(point[0] for point in cluster_world) - min(point[0] for point in cluster_world),
-                   max(point[1] for point in cluster_world) - min(point[1] for point in cluster_world)) >= 1.5 * resolution:
-                if max(point[0] for point in cluster_world) - min(point[0] for point in cluster_world) >= \
-                   max(point[1] for point in cluster_world) - min(point[1] for point in cluster_world):
-                    sorted_points = sorted(cluster_world, key=lambda point: point[0])
-                    slices = [sorted_points[i * len(sorted_points) // 3:(i + 1) * len(sorted_points) // 3] for i in range(3)]
-                else:
-                    sorted_points = sorted(cluster_world, key=lambda point: point[1])
-                    slices = [sorted_points[i * len(sorted_points) // 3:(i + 1) * len(sorted_points) // 3] for i in range(3)]
-                cluster_slices = [slice_points for slice_points in slices if slice_points]
-            else:
-                cluster_slices = [cluster_world]
-        else:
-            cluster_slices = [cluster_world]
+        cluster_id = f"frontier-component-{component_index:04d}"
 
-        for slice_world in cluster_slices:
+        viewpoints: list[ViewpointCandidate] = []
+        for slice_index, slice_world in enumerate(_component_slices(cluster_world, resolution=resolution)):
             if not slice_world:
                 continue
             target = min(slice_world, key=lambda point: _distance(point, centroid))
@@ -393,14 +470,82 @@ def _detect_global_frontier_viewpoints(
                 resolution=resolution,
                 sensor_range=sensor_range,
             )
+            viewpoints.append(
+                ViewpointCandidate(
+                    xy=(float(target[0]), float(target[1])),
+                    information_gain=information_gain,
+                    visible_cell_count=len(slice_world),
+                    metadata={
+                        "component_id": cluster_id,
+                        "slice_index": slice_index,
+                        "slice_cell_count": len(slice_world),
+                    },
+                )
+            )
+
+        cluster_information_gain = max((vp.information_gain for vp in viewpoints), default=0.0)
+
+        clusters.append(
+            FrontierCluster(
+                cluster_id=cluster_id,
+                cells=tuple((float(point[0]), float(point[1])) for point in cluster_world),
+                centroid=(float(centroid[0]), float(centroid[1])),
+                viewpoints=tuple(viewpoints),
+                information_gain=cluster_information_gain,
+                metadata={
+                    "source": "connected_frontier_component",
+                    "frontier_cell_count": len(component_cells),
+                    "resolution": resolution,
+                    "viewpoint_count": len(viewpoints),
+                },
+                valid=True,
+            )
+        )
+
+    return tuple(clusters)
+
+
+def _detect_global_frontier_viewpoints(
+    *,
+    explored_points: Sequence[tuple[float, float]],
+    mapped_obstacle_points: Sequence[tuple[float, float]],
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    robot_radius: float,
+    sensor_range: float,
+) -> list[FrontierCandidate]:
+    """Legacy flat-candidate view over detect_connected_frontier_components().
+
+    Kept as a module-level function (rather than folded into
+    detect_global_frontier_candidates()) because it is directly monkeypatched
+    and called by name from legacy callers/tests that predate FrontierCluster
+    -- assign_frontier_viewpoints() below, and
+    robotics_sim/tests/test_noic_frontier_regressions.py. One FrontierCandidate
+    is emitted per cluster viewpoint (slice), matching what this function
+    returned before clusters existed.
+    """
+    clusters = detect_connected_frontier_components(
+        explored_points=explored_points,
+        mapped_obstacle_points=mapped_obstacle_points,
+        bounds=bounds,
+        resolution=resolution,
+        robot_radius=robot_radius,
+        sensor_range=sensor_range,
+    )
+
+    candidates: list[FrontierCandidate] = []
+    for cluster in clusters:
+        for viewpoint in cluster.viewpoints:
+            slice_cell_count = int(viewpoint.metadata.get("slice_cell_count", viewpoint.visible_cell_count))
+            information_gain = float(viewpoint.information_gain)
             candidates.append(
                 FrontierCandidate(
-                    target=(float(target[0]), float(target[1])),
-                    size=len(slice_world),
+                    target=(float(viewpoint.xy[0]), float(viewpoint.xy[1])),
+                    size=slice_cell_count,
                     distance_from_robot=0.0,
                     information_gain=information_gain,
                     score=information_gain,
-                    reason=f"frontier size={len(slice_world)}, info_gain={information_gain:.1f}",
+                    reason=f"frontier size={slice_cell_count}, info_gain={information_gain:.1f}",
                 )
             )
     return candidates

@@ -28,7 +28,9 @@ from robotics_interfaces import (
     CoordinationRequest,
     CoordinationServices,
     ExplorationCandidate,
+    FrontierCluster,
     RobotCoordinationState,
+    ViewpointCandidate,
     WorldSnapshot,
 )
 
@@ -399,6 +401,61 @@ class StaticFrontierProvider:
 
 
 # ---------------------------------------------------------------------------
+# StaticFrontierInformationService -- robotics_interfaces.services.FrontierInformationService
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StaticFrontierInformationService:
+    """FrontierInformationService backed directly by a StaticScenario's
+    frontier_components -- no detection, no clustering, one FrontierCluster
+    per ScenarioFrontierComponent.
+
+    Unlike StaticFrontierProvider, this never filters valid=False components
+    out: a future plugin consuming FrontierInformationService must be able
+    to observe every scenario component and decide for itself which ones to
+    exclude, instead of having that decision baked into this adapter.
+    """
+
+    components: tuple[ScenarioFrontierComponent, ...]
+
+    def get_frontier_clusters(self, robot_id: int | None = None) -> tuple[FrontierCluster, ...]:
+        return tuple(_frontier_cluster_from_component(component) for component in self.components)
+
+
+def _frontier_cluster_from_component(component: ScenarioFrontierComponent) -> FrontierCluster:
+    if component.viewpoints:
+        viewpoints = tuple(
+            ViewpointCandidate(
+                xy=point,
+                information_gain=component.information_gain,
+                metadata={"source": "static_scenario"},
+            )
+            for point in component.viewpoints
+        )
+    elif component.centroid is not None:
+        viewpoints = (
+            ViewpointCandidate(
+                xy=component.centroid,
+                information_gain=component.information_gain,
+                metadata={"source": "static_scenario", "synthetic_centroid_viewpoint": True},
+            ),
+        )
+    else:
+        viewpoints = ()
+
+    return FrontierCluster(
+        cluster_id=component.cluster_id,
+        cells=component.cells,
+        centroid=component.centroid,
+        viewpoints=viewpoints,
+        information_gain=component.information_gain,
+        metadata={"source": "static_scenario"},
+        valid=component.valid,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CoordinationRequest construction
 # ---------------------------------------------------------------------------
 
@@ -480,7 +537,10 @@ def build_coordination_request(
         existing_targets_by_robot=dict(scenario.current_targets),
         blocked_targets_by_robot=dict(scenario.invalidated_targets_by_robot),
         route_points_by_robot=(),
-        services=CoordinationServices(frontier_provider=frontier_provider),
+        services=CoordinationServices(
+            frontier_provider=frontier_provider,
+            frontier_information_service=StaticFrontierInformationService(scenario.frontier_components),
+        ),
         parameters=dict(scenario.parameters),
         shared={},
         time_s=0.0,

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from robotics_interfaces.frontiers import FrontierCluster, ViewpointCandidate
@@ -26,7 +26,7 @@ from robotics_interfaces.results import (
     PathPlanningResponse,
 )
 from robotics_sim.planning.coordinated_frontier_planner import (
-    _detect_global_frontier_viewpoints,
+    detect_connected_frontier_components,
     validate_multi_robot_corridor,
 )
 from robotics_sim.planning.planner_registry import compute_planned_waypoints
@@ -179,7 +179,13 @@ def frontier_clusters_from_candidates(
     -- so a FrontierInformationService consumer has something usable even
     when fresh map-based frontier detection has not found anything yet (e.g.
     a plugin that only knows about FrontierInformationService and does not
-    want to reach for team/single-robot providers itself).
+    want to reach for team/single-robot providers itself). These are
+    adapters, not real connected components: cells is always empty and
+    metadata always marks legacy_adapter=True so a consumer can tell the
+    difference from a detect_connected_frontier_components() result.
+    cluster_id ends up in each viewpoint's metadata via
+    FrontierCluster.as_exploration_candidate(), so callers do not need it
+    stamped here too.
     """
     clusters = []
     for index, candidate in enumerate(candidates):
@@ -194,10 +200,12 @@ def frontier_clusters_from_candidates(
         clusters.append(
             FrontierCluster(
                 cluster_id=f"{id_prefix}-{index}",
+                cells=(),
                 centroid=candidate.target,
                 viewpoints=(viewpoint,),
                 information_gain=float(candidate.information_gain),
-                metadata={"source": candidate.source},
+                metadata={"source": candidate.source, "legacy_adapter": True},
+                valid=True,
             )
         )
     return tuple(clusters)
@@ -205,17 +213,21 @@ def frontier_clusters_from_candidates(
 
 @dataclass(frozen=True)
 class RuntimeFrontierInformationService:
-    """FrontierInformationService backed by the same frontier detector the
-    coordinated frontier planner uses. Each detected candidate becomes one
-    single-viewpoint FrontierCluster -- this is not yet FUEL-style
-    multi-viewpoint sampling per cluster, it exists so the contract is real
-    and invocable today.
+    """FrontierInformationService backed by the same connected-component
+    frontier detector the coordinated frontier planner uses
+    (detect_connected_frontier_components()). Each call runs the detector at
+    most once and returns its real FrontierCluster objects unmodified --
+    full cells, real centroid, one or more viewpoints per component -- so a
+    FUEL/RACER-style plugin can observe the same geometry the legacy
+    candidate pipeline is flattened from.
 
     If map-based detection finds nothing (e.g. not enough explored_points
     yet), it falls back to converting whatever legacy_candidates_by_robot was
     supplied at construction time (typically pre-computed from
     RuntimeTeamFrontierProvider/RuntimeFrontierProvider) instead of returning
-    empty. If there is truly no data anywhere, it returns an empty tuple
+    empty. Real detected components and legacy adapter clusters are never
+    mixed in one response: if the detector found anything, that is the whole
+    response. If there is truly no data anywhere, it returns an empty tuple
     instead of raising.
     """
 
@@ -229,7 +241,7 @@ class RuntimeFrontierInformationService:
 
     def get_frontier_clusters(self, robot_id: int | None = None) -> tuple[FrontierCluster, ...]:
         if self.bounds is not None and self.explored_points:
-            candidates = _detect_global_frontier_viewpoints(
+            clusters = detect_connected_frontier_components(
                 explored_points=self.explored_points,
                 mapped_obstacle_points=self.mapped_obstacle_points,
                 bounds=self.bounds,
@@ -237,28 +249,20 @@ class RuntimeFrontierInformationService:
                 robot_radius=self.robot_radius,
                 sensor_range=self.sensor_range,
             )
-            if candidates:
-                clusters = []
-                for index, candidate in enumerate(candidates):
-                    viewpoint = ViewpointCandidate(
-                        xy=candidate.target,
-                        information_gain=float(candidate.information_gain),
-                        visible_cell_count=int(candidate.size),
-                        metadata={"reason": candidate.reason},
+            if clusters:
+                if robot_id is None:
+                    return clusters
+                # Only metadata is annotated per-robot -- cluster_id, cells,
+                # centroid, viewpoints, information_gain, and valid are the
+                # detector's geometry and must stay identical regardless of
+                # which robot asked.
+                return tuple(
+                    replace(
+                        cluster,
+                        metadata={**dict(cluster.metadata), "requested_for_robot_id": robot_id},
                     )
-                    metadata: dict = {"reason": candidate.reason}
-                    if robot_id is not None:
-                        metadata["requested_for_robot_id"] = robot_id
-                    clusters.append(
-                        FrontierCluster(
-                            cluster_id=f"frontier-{index}",
-                            centroid=candidate.target,
-                            viewpoints=(viewpoint,),
-                            information_gain=float(candidate.information_gain),
-                            metadata=metadata,
-                        )
-                    )
-                return tuple(clusters)
+                    for cluster in clusters
+                )
 
         if robot_id is not None:
             legacy = self.legacy_candidates_by_robot.get(robot_id, ())

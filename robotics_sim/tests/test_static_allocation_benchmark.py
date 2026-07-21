@@ -35,7 +35,12 @@ from experiments.run_experiment import (
     run_static_allocation_benchmark,
     write_experiment_record,
 )
-from experiments.static_services import ScenarioConfigError, StaticScenario, scenario_from_dict
+from experiments.static_services import (
+    ScenarioConfigError,
+    StaticFrontierInformationService,
+    StaticScenario,
+    scenario_from_dict,
+)
 from robotics_interfaces.coordination import CoordinationAssignment, CoordinationResult
 from robotics_interfaces.proposals import ExplorationCandidate
 
@@ -1015,3 +1020,62 @@ def test_shipped_config_stays_healthy_after_normalization():
     assert record_1.unassigned_robot_count == 0
     assert record_1.assigned_robot_count + record_1.unassigned_robot_count == record_1.robot_count
     assert record_1.deterministic_fingerprint == record_2.deterministic_fingerprint
+
+
+# ---------------------------------------------------------------------------
+# 51-52. StaticFrontierInformationService (Commit 2): converts scenario
+#    frontier components into real FrontierCluster objects, and injecting an
+#    unconsumed frontier_information_service must never change
+#    IndependentBaselinePlugin's result (it only reads frontier_provider).
+# ---------------------------------------------------------------------------
+
+
+def test_static_frontier_information_service_converts_shipped_components():
+    scenario = load_scenario(str(RAPID_ALLOCATION_CONFIG))
+    service = StaticFrontierInformationService(scenario.frontier_components)
+
+    clusters = service.get_frontier_clusters()
+
+    assert len(clusters) == 5
+    by_id = {cluster.cluster_id: cluster for cluster in clusters}
+    assert set(by_id) == {"f0", "f1", "f2", "f3", "f4"}
+
+    for component in scenario.frontier_components:
+        cluster = by_id[component.cluster_id]
+        assert cluster.cells == component.cells
+        assert cluster.centroid == component.centroid
+        assert cluster.valid == component.valid
+        assert cluster.information_gain == component.information_gain
+
+    # f3 is the shipped scenario's only valid=False component.
+    assert by_id["f3"].valid is False
+
+    # f1 has an explicit viewpoint -- no synthetic one should be added.
+    f1 = by_id["f1"]
+    assert len(f1.viewpoints) == 1
+    assert f1.viewpoints[0].xy == (1.2, 4.2)
+    assert "synthetic_centroid_viewpoint" not in f1.viewpoints[0].metadata
+
+    # f0/f2/f3/f4 have no explicit viewpoints but do have a centroid, so
+    # each must get exactly one synthetic centroid viewpoint.
+    for cluster_id in ("f0", "f2", "f3", "f4"):
+        cluster = by_id[cluster_id]
+        assert len(cluster.viewpoints) == 1
+        assert cluster.viewpoints[0].xy == cluster.centroid
+        assert cluster.viewpoints[0].metadata["synthetic_centroid_viewpoint"] is True
+
+
+def test_unconsumed_frontier_information_service_does_not_change_benchmark_result():
+    """IndependentBaselinePlugin only ever reads services.frontier_provider
+    -- injecting frontier_information_service alongside it must be inert."""
+    scenario = load_scenario(str(RAPID_ALLOCATION_CONFIG))
+
+    record = run_static_allocation_benchmark(scenario)
+
+    assert record.success is True
+    assert record.assigned_robot_count == 3
+    assert record.unassigned_robot_count == 0
+    assert record.duplicate_target_count == 0
+    assert record.deterministic_fingerprint == (
+        "15bdb9ded076c922aac314972a9f97b05e404e9ec0fca6e0217b76a3408e04f3"
+    )

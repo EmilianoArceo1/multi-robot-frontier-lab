@@ -190,6 +190,22 @@ VISION_OPTIONS = [
     "Omnidirectional",
 ]
 
+MAP_VISUALIZATION_OPTIONS = [
+    "Current",
+    "Monochrome Discovery",
+    "Custom Discovery",
+]
+DEFAULT_MAP_VISUALIZATION = MAP_VISUALIZATION_OPTIONS[0]
+DEFAULT_CUSTOM_UNEXPLORED_COLOR = "#000000"
+DEFAULT_CUSTOM_EXPLORED_COLOR = "#F8F9FB"
+
+ROBOT_ICON_OPTIONS = [
+    "Circle",
+    "Drone",
+    "Wheeled Robot",
+]
+DEFAULT_ROBOT_ICON = ROBOT_ICON_OPTIONS[0]
+
 DEFAULT_OBSTACLES: list[tuple[float, float, float, float]] = [
     (-7.0, 5.4, 1.0, 1.0),
     (-7.5, -6.4, 3.3, 1.2),
@@ -347,6 +363,13 @@ class SimulationConfig:
     agent_mode: str = "Single Robot Mode"
     grid_resolution: float = 0.5
 
+    # Rendering-only presentation choices. They never affect belief-map,
+    # planning, coordination, or robot dynamics.
+    map_visualization: str = DEFAULT_MAP_VISUALIZATION
+    custom_unexplored_color: str = DEFAULT_CUSTOM_UNEXPLORED_COLOR
+    custom_explored_color: str = DEFAULT_CUSTOM_EXPLORED_COLOR
+    robot_icon: str = DEFAULT_ROBOT_ICON
+
     # Dynamic fire/hazard layer. Occupancy remains UNKNOWN/FREE/OCCUPIED;
     # these parameters control a separate continuous thermal field.
     default_fire_intensity: float = 1.0
@@ -433,6 +456,14 @@ def _as_float(value, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(fallback)
+
+
+def _as_hex_color(value, fallback: str) -> str:
+    """Return a normalized #RRGGBB color or a known-good fallback."""
+    color = QColor(str(value))
+    if not color.isValid():
+        color = QColor(str(fallback))
+    return color.name().upper()
 
 
 def _as_obstacle_list(raw_obstacles) -> list[tuple[float, float, float, float]]:
@@ -654,6 +685,10 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
         },
         "simulation": {
             "agent_mode": config.agent_mode,
+            "map_visualization": config.map_visualization,
+            "custom_unexplored_color": config.custom_unexplored_color,
+            "custom_explored_color": config.custom_explored_color,
+            "robot_icon": config.robot_icon,
             "show_goal_preview": config.show_goal_preview,
             "show_path": config.show_path,
             "show_vision": config.show_vision,
@@ -731,6 +766,25 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     if agent_mode not in ("Single Robot Mode", "Multiple Robot Mode"):
         agent_mode = default.agent_mode
 
+    map_visualization = str(
+        simulation.get("map_visualization", default.map_visualization)
+    )
+    if map_visualization not in MAP_VISUALIZATION_OPTIONS:
+        map_visualization = default.map_visualization
+
+    custom_unexplored_color = _as_hex_color(
+        simulation.get("custom_unexplored_color", default.custom_unexplored_color),
+        default.custom_unexplored_color,
+    )
+    custom_explored_color = _as_hex_color(
+        simulation.get("custom_explored_color", default.custom_explored_color),
+        default.custom_explored_color,
+    )
+
+    robot_icon = str(simulation.get("robot_icon", default.robot_icon))
+    if robot_icon not in ROBOT_ICON_OPTIONS:
+        robot_icon = default.robot_icon
+
     return SimulationConfig(
         x=_as_float(robot.get("x", default.x), default.x),
         y=_as_float(robot.get("y", default.y), default.y),
@@ -797,6 +851,10 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
             map_data.get("grid_resolution", default.grid_resolution),
             default.grid_resolution,
         ),
+        map_visualization=map_visualization,
+        custom_unexplored_color=custom_unexplored_color,
+        custom_explored_color=custom_explored_color,
+        robot_icon=robot_icon,
         default_fire_intensity=min(
             1.0,
             max(

@@ -1808,7 +1808,7 @@ class SimulationControllerMixin:
         A. NEW runtime path -- obstacle_points is None (the caller did not
            pass it at all): routes through PlanningCostmapBuilder via
            _planning_costmap_inputs_for_robot()/_planning_grid_from_
-           costmap_snapshot(). This is what all four production callers
+           costmap_snapshot(). This is what all production callers
            use today: build_planner_kwargs(), build_planner_kwargs_for_
            goal(), build_planner_kwargs_for_multi_robot() (dynamic_
            obstacle_points = other runtime robots), and make_exploration_
@@ -1868,6 +1868,75 @@ class SimulationControllerMixin:
                 inflate_radius=max(0.0, radius),
             )
         return planning_grid
+
+    def build_refined_static_planning_grid_for_robot(
+        self,
+        robot,
+        *,
+        robot_radius: float,
+        refinement_factor: float = 2.0,
+    ) -> OccupancyGrid:
+        """Build an on-demand finer grid from observed continuous geometry.
+
+        Obstacle samples are inflated conservatively by the cell footprint.
+        That error shrinks with resolution, but at the configured resolution
+        it can close a passage that is wider than the robot's continuous
+        safety diameter.  This grid is only used after both the dynamic and
+        normal static grids report no path, so ordinary planning keeps its
+        lower cost.  Runtime segment/predicted-motion checks still use the
+        original continuous obstacle geometry.
+        """
+        belief = self.ensure_belief_map()
+        factor = max(1.0, float(refinement_factor))
+        base_resolution = max(1e-6, float(self.config.grid_resolution))
+        refined_resolution = max(0.05, base_resolution / factor)
+        radius = max(0.0, float(robot_radius))
+        hazard_service = getattr(self, "hazard_service", None)
+        hazard_revision = (
+            int(hazard_service.belief.revision)
+            if hazard_service is not None
+            else -1
+        )
+        cache_key = (
+            id(belief),
+            int(getattr(self, "mapped_obstacle_revision", 0)),
+            len(getattr(self, "mapped_obstacle_points", ())),
+            round(radius, 9),
+            round(refined_resolution, 9),
+            hazard_revision,
+            tuple(float(value) for value in belief.bounds),
+        )
+        if getattr(self, "_refined_static_grid_cache_key", None) == cache_key:
+            cached = getattr(self, "_refined_static_grid_cache", None)
+            if cached is not None:
+                return cached.copy()
+
+        bounds = tuple(float(value) for value in belief.bounds)
+        grid = OccupancyGrid.from_bounds(
+            x_min=bounds[0],
+            x_max=bounds[1],
+            y_min=bounds[2],
+            y_max=bounds[3],
+            resolution=refined_resolution,
+            initial_value=UNKNOWN,
+            unknown_is_traversable=True,
+        )
+        static_points, _ = self.sanitize_planner_obstacle_points(
+            list(self.mapped_obstacle_points),
+            start_xy=(float(robot.x), float(robot.y)),
+            robot_radius=radius,
+            resolution=refined_resolution,
+        )
+        if static_points:
+            grid.add_obstacle_points(static_points, padding=radius)
+        if hazard_service is not None:
+            hazard_points = hazard_service.observed_blocked_world_points()
+            if hazard_points:
+                grid.add_obstacle_points(hazard_points, padding=radius)
+
+        self._refined_static_grid_cache_key = cache_key
+        self._refined_static_grid_cache = grid.copy()
+        return grid
 
     def planner_accepts_path_simplifier(self) -> bool:
         """Return True when the installed planner registry supports path_simplifier."""
@@ -2774,6 +2843,67 @@ class SimulationControllerMixin:
                 debug_capture=debug_capture,
             )
             current_captures[robot_index] = debug_capture
+
+            # Teammates are transient obstacles, but their sampled safety
+            # rings live in the global planning grid for the duration of an
+            # A* call.  In a narrow doorway those rings can disconnect the
+            # whole grid and make every robot wait for another robot that is
+            # waiting in turn.  If (and only if) that dynamic grid has no path,
+            # retry the same goal against static topology.  The resulting path
+            # is not blindly activated: immediate-corridor validation below
+            # and the per-frame exact disk checks still veto motion until the
+            # occupied doorway is actually clear.
+            dynamic_points = self.dynamic_robot_obstacle_points_for_robot(robot_index)
+            if not success and dynamic_points:
+                static_kwargs = dict(planner_kwargs)
+                robot = self.robots[robot_index]
+                static_kwargs["planning_grid"] = self.build_planning_grid_for_robot(
+                    robot,
+                    robot_radius=float(planner_kwargs["robot_radius"]),
+                    dynamic_obstacle_points=(),
+                )
+                static_capture = PlanDebugCapture()
+                static_success, static_reason, static_waypoints = self.call_compute_planned_waypoints(
+                    static_kwargs,
+                    path_simplifier=self.config.path_simplifier,
+                    debug_capture=static_capture,
+                )
+                if static_success and static_waypoints:
+                    current_captures[robot_index] = static_capture
+                    return (
+                        True,
+                        f"{goal_reason}; dynamic occupancy disconnected planning grid ({reason}); "
+                        f"static-topology fallback: {static_reason}",
+                        static_waypoints,
+                    )
+                refined_kwargs = dict(static_kwargs)
+                refined_grid = self.build_refined_static_planning_grid_for_robot(
+                    robot,
+                    robot_radius=float(planner_kwargs["robot_radius"]),
+                )
+                refined_kwargs["planning_grid"] = refined_grid
+                refined_kwargs["resolution"] = float(refined_grid.resolution)
+                refined_capture = PlanDebugCapture()
+                refined_success, refined_reason, refined_waypoints = self.call_compute_planned_waypoints(
+                    refined_kwargs,
+                    path_simplifier=self.config.path_simplifier,
+                    debug_capture=refined_capture,
+                )
+                if refined_success and refined_waypoints:
+                    current_captures[robot_index] = refined_capture
+                    return (
+                        True,
+                        f"{goal_reason}; dynamic occupancy disconnected planning grid ({reason}); "
+                        f"static grid also disconnected ({static_reason}); "
+                        f"refined static-topology fallback ({refined_grid.resolution:.3f} m): "
+                        f"{refined_reason}",
+                        refined_waypoints,
+                    )
+                reason = (
+                    f"{reason}; static-topology fallback: {static_reason}; "
+                    f"refined static-topology fallback ({refined_grid.resolution:.3f} m): "
+                    f"{refined_reason}"
+                )
 
             return success, f"{goal_reason}; {reason}", waypoints
 
@@ -6087,6 +6217,17 @@ class SimulationControllerMixin:
         )
 
         if (not success or not waypoints) and self.is_exploration_mode():
+            # At this point the dynamic-grid planner and its static-topology
+            # fallback both failed.  This is a target-specific reachability
+            # failure, not evidence that the robot arrived at the frontier.
+            # Blacklist it for the current coordination round before clearing
+            # the host target so the coordinator can choose another candidate.
+            self.ensure_multi_exploration_target_slots()
+            if (
+                0 <= robot_index < len(self.multi_exploration_targets)
+                and self.multi_exploration_targets[robot_index] is not None
+            ):
+                self.invalidate_current_multi_frontier(robot_index, route_reason)
             held = self.hold_multi_robot_position(
                 robot_index,
                 f"no valid exploration route; {route_reason}",
@@ -6161,17 +6302,17 @@ class SimulationControllerMixin:
                     )
                     return held
 
-        # Validate the FULL corridor against teammates before this route is
-        # allowed to become ACTIVE. This runs earlier and stricter than the
-        # per-frame movement safety veto (segment_violates_other_robot_clearance
-        # in the movement loop), which only checks the immediate next segment
-        # once a route is already active -- that veto remains as a final
-        # backstop, it is just no longer the first place a conflict is caught.
-        # Direct is included: a single-segment route is still a full corridor.
+        # Validate the segment that can actually execute now against current
+        # teammate positions.  A disk has no time dimension; applying it to
+        # every future segment treats a moving teammate as if it permanently
+        # occupied that position and creates circular waits in narrow aisles.
+        # Each later segment is checked when it becomes active, and predicted
+        # motion plus the final pairwise-clearance guard remain exact runtime
+        # backstops. Direct is included: its one segment is its full corridor.
         if self.is_exploration_mode():
             corridor_check = validate_multi_robot_corridor(
                 start=(float(robot.x), float(robot.y)),
-                waypoints=waypoints,
+                waypoints=waypoints[:1],
                 ego_safety_radius=float(self.safety_radius_for_robot(robot)),
                 other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
                 # Future polylines have no timing information. Treating them
@@ -6216,7 +6357,7 @@ class SimulationControllerMixin:
                     if fb_success and fb_waypoints:
                         fb_corridor_check = validate_multi_robot_corridor(
                             start=(float(robot.x), float(robot.y)),
-                            waypoints=fb_waypoints,
+                            waypoints=fb_waypoints[:1],
                             ego_safety_radius=float(self.safety_radius_for_robot(robot)),
                             other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
                             other_routes=[],
@@ -7914,6 +8055,27 @@ class SimulationControllerMixin:
                 return
 
             self.robot = robot
+
+            # A hold waypoint is the robot's current pose. Without this
+            # explicit WAITING branch, the generic "target reached" code below
+            # reports a frontier arrival that never happened. Retry corridor
+            # coordination without completion semantics instead; a successful
+            # assignment becomes ACTIVE and moves on the next tick.
+            if (
+                self.is_exploration_mode()
+                and 0 <= index < len(getattr(self, "multi_route_states", []))
+                and self.multi_route_states[index] == self.ROUTE_STATE_WAITING_FOR_CORRIDOR
+            ):
+                if self.multi_exploration_target_replan_allowed(index):
+                    self.assign_route_to_multi_robot(
+                        index,
+                        reason="Retrying transient corridor occupancy",
+                        force_new_exploration_target=False,
+                    )
+                control = self.brake_control_for_collision()
+                new_controls.append(control)
+                continue
+
             target = self.active_target_xy()
             if target is not None:
                 # obstacle_points_for_segment_safety_check() (not the raw

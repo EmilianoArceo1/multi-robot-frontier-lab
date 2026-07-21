@@ -249,9 +249,12 @@ def test_hold_no_frontier_only_when_no_candidates_exist(monkeypatch):
 
 
 def test_route_conflict_does_not_report_no_frontier(monkeypatch):
-    """A real target exists but every corridor candidate crosses a teammate's
-    safety zone -- this must be reported as HOLD_ROUTE_BLOCKED, not
-    HOLD_NO_FRONTIER (the exact bug this commit fixes)."""
+    """A real frontier can have no currently safe departure corridor.
+
+    After bounded alternative-target retries this is HOLD_ROUTE_BLOCKED, not
+    the semantically false HOLD_NO_FRONTIER. CQLite separately guarantees that
+    clearing this failed target is not learned as successful exploration.
+    """
     fake = _build_fake_engine(
         planner_type="A*",
         route_plan_responses=[(True, "target found", [(4.0, 0.0)])],
@@ -273,6 +276,8 @@ def test_route_conflict_does_not_report_no_frontier(monkeypatch):
     assert result is True
     assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_HOLD_ROUTE_BLOCKED
     assert fake.multi_route_states[0] != SimulationControllerMixin.ROUTE_STATE_HOLD_NO_FRONTIER
+    assert fake.multi_exploration_targets[0] is None
+    assert fake.multi_invalidated_exploration_targets[0] == [(4.0, 0.0)]
     assert any("HOLD_ROUTE_BLOCKED" in message for message in fake.console_logs)
 
 
@@ -317,17 +322,22 @@ def test_recovery_tries_multiple_candidate_targets_before_hold(monkeypatch):
     )
 
     def fake_validate(**kwargs):
-        # candidate 1/2 each have a teammate parked right on their target, far
-        # enough from `start` that the spawn-formation exemption does not
-        # apply; candidate 3 has no conflicting disk at all.
+        # candidate 1/2 conflict with a non-transient reserved corridor;
+        # candidate 3 is clear. This isolates the bounded alternative-target
+        # recovery path from the current-disk case covered by the prior test.
         blocked = {(4.0, 0.0), (0.0, 4.0)}
         target = tuple(kwargs["waypoints"][-1])
         if target in blocked:
+            reservation = (
+                [(2.0, -1.0), (2.0, 1.0)]
+                if target == (4.0, 0.0)
+                else [(-1.0, 2.0), (1.0, 2.0)]
+            )
             return validate_multi_robot_corridor(
                 start=kwargs["start"],
                 waypoints=kwargs["waypoints"],
                 ego_safety_radius=kwargs["ego_safety_radius"],
-                other_robot_disks=[target + (0.9,)],
+                reserved_corridors=[reservation],
                 margin=kwargs.get("margin", 0.25),
             )
         return validate_multi_robot_corridor(
@@ -348,6 +358,136 @@ def test_recovery_tries_multiple_candidate_targets_before_hold(monkeypatch):
     assert any("trying alternative target 3/3" in message for message in fake.console_logs)
 
 
+def test_current_robot_disks_only_gate_the_immediately_executable_segment(monkeypatch):
+    """An untimed current pose must not reserve every future route segment.
+
+    The second segment passes through where a teammate is now, but the first
+    segment is clear. Runtime safety will re-check the second segment later.
+    """
+    fake = _build_fake_engine(
+        planner_type="A*",
+        route_plan_responses=[(True, "detour", [(0.0, 2.0), (4.0, 0.0)])],
+    )
+    fake._preserve_next_route_waypoints = True
+    seen_waypoints = []
+
+    def capture_validation(**kwargs):
+        seen_waypoints.append(list(kwargs["waypoints"]))
+        return validate_multi_robot_corridor(
+            start=kwargs["start"],
+            waypoints=kwargs["waypoints"],
+            ego_safety_radius=kwargs["ego_safety_radius"],
+            other_robot_disks=[(2.0, 0.0, 0.35)],
+            margin=kwargs.get("margin", 0.25),
+        )
+
+    monkeypatch.setattr(engine_module, "validate_multi_robot_corridor", capture_validation)
+
+    result = fake.assign_route_to_multi_robot(0)
+
+    assert result is True
+    assert seen_waypoints == [[(0.0, 2.0)]]
+    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_ACTIVE
+    assert fake.multi_planned_path_points[0] == [(0.0, 0.0), (0.0, 2.0), (4.0, 0.0)]
+
+
+def test_astar_retries_static_topology_when_teammates_disconnect_dynamic_grid():
+    """Dynamic robot rings may close a doorway globally, but safety is handled
+    later by exact corridor/disk checks, so A* retains the static route for a
+    transient wait instead of reporting that no route exists."""
+    robot = _FakeRobot(x=0.0, y=0.0)
+    dynamic_grid = object()
+    static_grid = object()
+    planner_calls = []
+    static_grid_calls = []
+    fake = SimpleNamespace(
+        robots=[robot],
+        config=SimpleNamespace(planner_type="A*", path_simplifier="Direction changes"),
+        multi_robot_commands_by_id={},
+    )
+    fake.build_planner_kwargs_for_multi_robot = lambda index, force_new_exploration_target=False: (
+        {
+            "planner_type": "A*",
+            "start_xy": (0.0, 0.0),
+            "goal_xy": (4.0, 0.0),
+            "robot_radius": 0.35,
+            "planning_grid": dynamic_grid,
+        },
+        "frontier assigned",
+    )
+    fake.dynamic_robot_obstacle_points_for_robot = lambda index: [(1.0, 0.0)]
+
+    def build_grid(robot_arg, *, robot_radius, dynamic_obstacle_points):
+        static_grid_calls.append((robot_arg, robot_radius, dynamic_obstacle_points))
+        return static_grid
+
+    def compute_waypoints(kwargs, *, path_simplifier, debug_capture):
+        planner_calls.append(kwargs["planning_grid"])
+        if kwargs["planning_grid"] is dynamic_grid:
+            return False, "no path in dynamic grid", []
+        return True, "path found", [(2.0, 1.0), (4.0, 0.0)]
+
+    fake.build_planning_grid_for_robot = build_grid
+    fake.call_compute_planned_waypoints = compute_waypoints
+    fake.coordinator_runtime_profile = lambda: SimpleNamespace(owns_path_planning=False)
+    fake.log_console_message = lambda message: None
+    fake.compute_route_for_multi_robot = SimulationControllerMixin.compute_route_for_multi_robot.__get__(fake)
+
+    success, reason, waypoints = fake.compute_route_for_multi_robot(0)
+
+    assert success is True
+    assert planner_calls == [dynamic_grid, static_grid]
+    assert static_grid_calls == [(robot, 0.35, ())]
+    assert waypoints == [(2.0, 1.0), (4.0, 0.0)]
+    assert "dynamic occupancy disconnected planning grid" in reason
+
+
+def test_astar_refines_static_grid_when_coarse_rasterization_closes_passage():
+    robot = _FakeRobot(x=0.0, y=0.0)
+    dynamic_grid = object()
+    coarse_static_grid = object()
+    refined_static_grid = SimpleNamespace(resolution=0.125)
+    planner_calls = []
+    fake = SimpleNamespace(
+        robots=[robot],
+        config=SimpleNamespace(planner_type="A*", path_simplifier="Direction changes"),
+        multi_robot_commands_by_id={},
+    )
+    fake.build_planner_kwargs_for_multi_robot = lambda index, force_new_exploration_target=False: (
+        {
+            "planner_type": "A*",
+            "start_xy": (0.0, 0.0),
+            "goal_xy": (4.0, 0.0),
+            "robot_radius": 0.22,
+            "planning_grid": dynamic_grid,
+            "resolution": 0.25,
+        },
+        "frontier assigned",
+    )
+    fake.dynamic_robot_obstacle_points_for_robot = lambda index: [(1.0, 0.0)]
+    fake.build_planning_grid_for_robot = lambda *args, **kwargs: coarse_static_grid
+    fake.build_refined_static_planning_grid_for_robot = lambda *args, **kwargs: refined_static_grid
+
+    def compute_waypoints(kwargs, *, path_simplifier, debug_capture):
+        planner_calls.append(kwargs["planning_grid"])
+        if kwargs["planning_grid"] is refined_static_grid:
+            assert kwargs["resolution"] == 0.125
+            return True, "path found through geometric gap", [(2.0, -1.0), (4.0, 0.0)]
+        return False, "no path found", []
+
+    fake.call_compute_planned_waypoints = compute_waypoints
+    fake.coordinator_runtime_profile = lambda: SimpleNamespace(owns_path_planning=False)
+    fake.log_console_message = lambda message: None
+    fake.compute_route_for_multi_robot = SimulationControllerMixin.compute_route_for_multi_robot.__get__(fake)
+
+    success, reason, waypoints = fake.compute_route_for_multi_robot(0)
+
+    assert success is True
+    assert planner_calls == [dynamic_grid, coarse_static_grid, refined_static_grid]
+    assert waypoints == [(2.0, -1.0), (4.0, 0.0)]
+    assert "refined static-topology fallback (0.125 m)" in reason
+
+
 def test_direct_route_rejected_can_try_astar_fallback(monkeypatch):
     """Direct's straight-line corridor is blocked, but the grid-safe A*
     fallback route is clear -- the runtime must use the fallback instead of
@@ -356,6 +496,10 @@ def test_direct_route_rejected_can_try_astar_fallback(monkeypatch):
         planner_type="Direct",
         route_plan_responses=[(True, "direct route", [(4.0, 0.0)])],
     )
+
+    # Keep the synthetic detour vertices: this test's mocked validator, rather
+    # than a mapped point cloud, is the source of the straight-line obstacle.
+    fake._preserve_next_route_waypoints = True
 
     def fake_validate(**kwargs):
         if tuple(kwargs["waypoints"]) == ((4.0, 0.0),):

@@ -145,14 +145,26 @@ class CQLitePlugin:
             ),
             1e-6,
         )
+        # The host clears ``current_target`` both after arrival and after an
+        # unsuccessful route/corridor attempt.  Target disappearance alone is
+        # therefore not completion evidence.  Use the same spatial scale as
+        # the runtime's reached-target gate before permanently publishing an
+        # explored CQLite state to every communication neighbor.
+        completion_radius = max(
+            self._positive_parameter(request, "goal_tolerance", 0.25),
+            0.25,
+            1e-6,
+        )
 
         neighbors = self._neighbor_graph(robots_by_id, communication_range)
         call_messages = 0
         call_bytes = 0
 
         # Reassignment after a target disappears means the previous frontier
-        # was reached, unless the host explicitly blacklisted that target.
+        # may have been reached.  Route failure and dynamic-corridor rejection
+        # also clear the host target, so arrival must be confirmed from pose.
         completed_by_robot: dict[int, tuple[StateKey, Point2D]] = {}
+        cleared_without_arrival: list[int] = []
         for robot_id in requested_ids:
             learner = self._learners.get(robot_id)
             robot = robots_by_id.get(robot_id)
@@ -161,15 +173,24 @@ class CQLitePlugin:
             point = learner.last_assigned_point
             if robot.current_target is not None or point is None:
                 continue
-            if self._point_near_any(
+            host_blacklisted = self._point_near_any(
                 point,
                 request.blocked_targets_by_robot.get(robot_id, ()),
                 reservation_radius,
-            ):
-                continue
-            learner.explored.add(learner.last_assigned_key)
-            learner.state_points[learner.last_assigned_key] = point
-            completed_by_robot[robot_id] = (learner.last_assigned_key, point)
+            )
+            arrived = self._distance(robot.xy, point) <= completion_radius
+            if arrived and not host_blacklisted:
+                learner.explored.add(learner.last_assigned_key)
+                learner.state_points[learner.last_assigned_key] = point
+                completed_by_robot[robot_id] = (learner.last_assigned_key, point)
+            elif not host_blacklisted:
+                cleared_without_arrival.append(robot_id)
+
+            # Consume the lifecycle edge exactly once.  Leaving this pointer
+            # armed caused an already-completed state to be announced again on
+            # every HOLD retry when no replacement candidate was selected.
+            learner.last_assigned_key = None
+            learner.last_assigned_point = None
 
         # Algorithm 1 lines 22--24: share only the newly explored state and
         # the current Q update with graph neighbors, never the complete table.
@@ -238,14 +259,18 @@ class CQLitePlugin:
             if not eligible and voronoi_fallback:
                 eligible = list(scored)
                 used_voronoi_fallback = bool(eligible)
-            eligible.sort(
-                key=lambda item: (
+
+            def _allocation_key(item: _ScoredCandidate) -> tuple[float, float, float, float, float]:
+                return (
                     item.priority,
                     item.q_after,
                     -item.travel_time,
                     -item.candidate.target[0],
                     -item.candidate.target[1],
-                ),
+                )
+
+            eligible.sort(
+                key=_allocation_key,
                 reverse=True,
             )
             selected = next(
@@ -256,6 +281,33 @@ class CQLitePlugin:
                 ),
                 None,
             )
+
+            # A robot can have a non-empty Voronoi set whose every viewpoint
+            # is already reserved by active teammates.  The old fallback only
+            # ran when the Voronoi set itself was empty, so such a robot held
+            # forever despite having many feasible candidates elsewhere.  In
+            # that case use the configured fallback over the remaining scored
+            # pool, preserving reservations and the same deterministic order.
+            if selected is None and voronoi_fallback:
+                eligible_ids = {id(item) for item in eligible}
+                fallback = [item for item in scored if id(item) not in eligible_ids]
+                fallback.sort(
+                    key=_allocation_key,
+                    reverse=True,
+                )
+                selected = next(
+                    (
+                        item
+                        for item in fallback
+                        if not self._point_near_any(
+                            item.candidate.target,
+                            reserved_points,
+                            reservation_radius,
+                        )
+                    ),
+                    None,
+                )
+                used_voronoi_fallback = selected is not None
             if selected is not None:
                 chosen_by_robot[robot_id] = selected
                 reserved_points.append(selected.candidate.target)
@@ -409,6 +461,11 @@ class CQLitePlugin:
                 "payload_bytes_cumulative": self._communication_bytes,
                 "map_merge_requests_cumulative": self._map_merge_requests,
                 "payload_model": "compact fields only; excludes middleware/transport overhead",
+            },
+            "target_lifecycle": {
+                "confirmed_completed_robot_ids": sorted(completed_by_robot),
+                "cleared_without_arrival_robot_ids": sorted(cleared_without_arrival),
+                "completion_radius": completion_radius,
             },
             "q_table_sizes": {
                 str(robot_id): len(learner.q_values)

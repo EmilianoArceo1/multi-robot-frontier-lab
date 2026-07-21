@@ -162,6 +162,29 @@ def test_voronoi_allocation_gives_distinct_local_targets_to_team() -> None:
     assert all(command.metadata["cqlite_in_voronoi_region"] for command in result.commands)
 
 
+def test_voronoi_fallback_runs_when_local_candidates_are_all_reserved() -> None:
+    plugin = CQLitePlugin()
+    reserved_local = _candidate(0.8, 0.0)
+    free_nonlocal = _candidate(3.0, 0.0)
+    request = CoordinationRequest(
+        robot_states=(
+            _robot(0, 0.0, 0.0),
+            _robot(1, 2.0, 0.0, current_target=reserved_local.target),
+        ),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (reserved_local, free_nonlocal)},
+        existing_targets_by_robot={1: reserved_local.target},
+        parameters=_parameters(cqlite_voronoi_fallback=True),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets[0] == free_nonlocal.target
+    assert result.commands[0].metadata["cqlite_in_voronoi_region"] is False
+    assert result.debug["per_robot"]["0"]["voronoi_fallback"] is True
+
+
 def test_lite_messages_only_follow_communication_graph_edges() -> None:
     plugin = CQLitePlugin()
     robots = (_robot(0, 0.0, 0.0), _robot(1, 2.0, 0.0), _robot(2, 20.0, 0.0))
@@ -208,6 +231,35 @@ def test_completed_frontier_is_learned_and_not_selected_again() -> None:
     assert result.targets == ((2.0, 0.0),)
     assert result.debug["per_robot"]["0"]["rejected"]["already_explored"] == 1
     assert result.debug["q_updates"]["0"] == 3
+
+
+def test_cleared_target_without_arrival_is_not_falsely_learned_as_explored() -> None:
+    plugin = CQLitePlugin()
+    failed_target = _candidate(3.0, 0.0)
+    first = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (failed_target,)},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+    assert plugin.assign(first).targets == ((3.0, 0.0),)
+
+    # This is the host state after A* or corridor validation rejects the
+    # route: current_target was cleared, but the robot never reached F_i.
+    retry = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0, current_target=None),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (failed_target, _candidate(4.0, 0.0))},
+        parameters=_parameters(),
+        time_s=2.0,
+    )
+    result = plugin.assign(retry)
+
+    assert result.debug["per_robot"]["0"]["rejected"]["already_explored"] == 0
+    assert result.debug["target_lifecycle"]["confirmed_completed_robot_ids"] == []
+    assert result.debug["target_lifecycle"]["cleared_without_arrival_robot_ids"] == [0]
+    assert plugin._learners[0].explored == set()
 
 
 def test_paper_presets_pin_parameters_and_round_trip_coordination_settings() -> None:

@@ -209,7 +209,7 @@ def _capture_calls(fake: SimpleNamespace, method_name: str) -> list[dict]:
 
     obstacle_points is captured RAW (None stays None) -- under the runtime
     costmap-builder integration, obstacle_points is None whenever a
-    production caller uses the NEW path (the four production call sites
+    production caller uses the NEW path (the audited production call sites
     all do), so `is None` is itself the signal that the new path was
     taken, not an accident to normalize away like the old None-vs-empty-
     list ambiguity this used to guard against.
@@ -808,17 +808,17 @@ def _find_planning_grid_calls(path: Path) -> list[dict]:
 
 def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_composition_detail():
     """Under the runtime costmap-builder integration, obstacle_points is
-    never passed at these 4 call sites anymore -- that IS the signal that
+    never passed at these audited call sites anymore -- that IS the signal that
     routes each of them through PlanningCostmapBuilder inside
     build_planning_grid_for_robot() itself (obstacle_points is None
     triggers the new path; see that method's own docstring). What
-    distinguishes the 4 call sites now is dynamic_obstacle_points instead.
+    distinguishes the call sites now is dynamic_obstacle_points instead.
     """
     calls = _find_planning_grid_calls(_ENGINE_PATH)
     enclosing_names = [call["enclosing_function"] for call in calls]
 
-    assert len(calls) == 4, (
-        f"expected exactly 4 build_planning_grid_for_robot() call sites in engine.py, "
+    assert len(calls) == 6, (
+        f"expected exactly 6 build_planning_grid_for_robot() call sites in engine.py, "
         f"found {len(calls)}: {calls!r}"
     )
     assert len(enclosing_names) == len(set(enclosing_names)), (
@@ -829,6 +829,8 @@ def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_compositi
         "build_planner_kwargs",
         "build_planner_kwargs_for_goal",
         "build_planner_kwargs_for_multi_robot",
+        "_legacy_route",
+        "_provider",
         "_build_context",
     }
 
@@ -837,7 +839,13 @@ def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_compositi
     for name, call in by_function.items():
         assert call["obstacle_points_is_keyword"] is False, (name, call)
         assert call["robot_radius_is_keyword"] is True, (name, call)
-        assert call["robot_radius_call_expr"] == "robot_radius", (name, call)
+
+    assert by_function["build_planner_kwargs"]["robot_radius_call_expr"] == "robot_radius"
+    assert by_function["build_planner_kwargs_for_goal"]["robot_radius_call_expr"] == "robot_radius"
+    assert by_function["build_planner_kwargs_for_multi_robot"]["robot_radius_call_expr"] == "robot_radius"
+    assert by_function["_build_context"]["robot_radius_call_expr"] == "robot_radius"
+    assert "planner_kwargs" in (by_function["_legacy_route"]["robot_radius_call_expr"] or "")
+    assert "safety_radius_for_robot" in (by_function["_provider"]["robot_radius_call_expr"] or "")
 
     # Only build_planner_kwargs_for_multi_robot() and _build_context()
     # (reachability) pass dynamic_obstacle_points at all -- the single-
@@ -846,11 +854,9 @@ def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_compositi
     for name in ("build_planner_kwargs", "build_planner_kwargs_for_goal"):
         assert by_function[name]["dynamic_obstacle_points_is_keyword"] is False, name
 
-    for name in ("build_planner_kwargs_for_multi_robot", "_build_context"):
+    for name in ("build_planner_kwargs_for_multi_robot", "_legacy_route", "_provider", "_build_context"):
         call = by_function[name]
         assert call["dynamic_obstacle_points_is_keyword"] is True, name
-        expr = call["dynamic_obstacle_points_call_expr"] or ""
-        assert "dynamic_points" in expr, (name, expr)
 
     # build_planner_kwargs_for_multi_robot() wraps its dynamic points in
     # tuple(...) right at the call site -- visible directly, no need to
@@ -859,6 +865,14 @@ def test_build_planning_grid_for_robot_call_sites_are_inventoried_with_compositi
         by_function["build_planner_kwargs_for_multi_robot"]["dynamic_obstacle_points_call_expr"]
         == "tuple(dynamic_points)"
     )
+
+    # The fallback call intentionally removes transient robot disks while
+    # retaining the same observed static/hazard costmap composition. The
+    # resulting route still goes through exact corridor/runtime disk checks.
+    assert by_function["_legacy_route"]["dynamic_obstacle_points_call_expr"] == "()"
+
+    provider_expr = by_function["_provider"]["dynamic_obstacle_points_call_expr"] or ""
+    assert "_dynamic_obstacle_points_for_robot_object" in provider_expr
 
     # _build_context()'s dynamic_obstacle_points is a bare identifier --
     # trace it back to its own assignment to confirm it comes from
@@ -928,6 +942,8 @@ def test_all_production_build_planning_grid_for_robot_call_sites_are_the_audited
             ("robotics_sim.simulation.engine", "build_planner_kwargs", _TARGET_METHOD): 1,
             ("robotics_sim.simulation.engine", "build_planner_kwargs_for_goal", _TARGET_METHOD): 1,
             ("robotics_sim.simulation.engine", "build_planner_kwargs_for_multi_robot", _TARGET_METHOD): 1,
+            ("robotics_sim.simulation.engine", "_legacy_route", _TARGET_METHOD): 1,
+            ("robotics_sim.simulation.engine", "_provider", _TARGET_METHOD): 1,
             ("robotics_sim.simulation.engine", "_build_context", _TARGET_METHOD): 1,
         }
     )

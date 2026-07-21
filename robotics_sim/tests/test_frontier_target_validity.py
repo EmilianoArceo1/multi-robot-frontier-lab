@@ -449,8 +449,22 @@ def test_bootstrap_fallback_target_is_not_misclassified_as_frontier():
 # since the robot's heading/position had not changed, re-selection kept
 # proposing the exact same point, so the agent never reached ordinary
 # FOLLOW_PATH long enough to actually move -- an infinite REQUEST_PLAN loop
-# with the robot frozen in place. Fix: step 5 now restores and follows an
-# unchanged re-selected target instead of looping.
+# with the robot frozen in place.
+#
+# Two layered fixes now guard this:
+#   1. Step 5 restores and follows an unchanged re-selected target instead
+#      of looping (this file's earlier commit).
+#   2. _pick_next_target()/_pick_map_wide_fallback_target() now reject any
+#      candidate that _excluded_targets() already flagged -- including the
+#      robot's own active_path_goal_xy -- even when the candidate SOURCE
+#      (e.g. _forward_candidate(), a pure function of robot pose/heading)
+#      cannot itself honor exclusions (fix/exploration-candidate-exclusion-
+#      enforcement). In this test's scenario the bootstrap target IS the
+#      active path goal, so re-selection now correctly returns None (not
+#      the same point), which yields one HOLD tick before step 5's re-check
+#      guard (agent.exploration_target_xy is not None) goes false and
+#      subsequent ticks fall through to plain FOLLOW_PATH -- still no
+#      REQUEST_PLAN loop, just via a different, more defensive path.
 # ---------------------------------------------------------------------------
 
 
@@ -477,16 +491,89 @@ def test_unchanged_bootstrap_fallback_target_does_not_loop_request_plan():
     # Several consecutive ticks with the robot never actually moving
     # (matching the real bug: the loop repeated so fast within one
     # wall-clock second that the robot never got a physics tick's worth of
-    # forward progress) -- the target must settle into FOLLOW_PATH, not
-    # cycle through REQUEST_PLAN indefinitely.
+    # forward progress) -- the decision must never REQUEST_PLAN the exact
+    # same stale point twice in a row, and must settle into a stable
+    # FOLLOW_PATH rather than oscillating forever.
+    kinds = []
     for _ in range(5):
         decision = behavior.update(agent, observation, services)
-        assert decision.kind == "FOLLOW_PATH", (
-            "an unchanged bootstrap/fallback target must be followed, not "
-            f"endlessly re-planned; got {decision.kind}: {decision.reason}"
+        kinds.append(decision.kind)
+        assert decision.kind != "REQUEST_PLAN" or decision.target != first_target, (
+            "must never re-request a plan for the exact same stale target "
+            f"tick after tick; got {decision.kind}: {decision.reason}"
         )
-        assert decision.target == first_target
-        assert agent.exploration_target_xy == first_target
+
+    assert kinds[-1] == "FOLLOW_PATH", f"must settle into FOLLOW_PATH, not oscillate forever; got {kinds}"
+    assert kinds.count("HOLD") <= 1, f"must not repeatedly HOLD on the same unresolved target; got {kinds}"
+
+
+# ---------------------------------------------------------------------------
+# 5c. Regression: a target already marked failed (e.g. by engine.py's
+# repeated_safety_replan handling, which calls RobotAgent.invalidate_failed_
+# exploration_route() -> mark_exploration_target_failed()) must not come
+# straight back from _pick_next_target()/_pick_map_wide_fallback_target()
+# while the robot's pose is unchanged.
+#
+# Root cause: _forward_candidate() (exploration_planners.py) is a pure
+# function of belief/robot_xy/robot_heading -- it takes no excluded_targets
+# parameter at all, unlike _frontier_candidates(), so it cannot itself skip
+# a point _excluded_targets() already flagged. On a map with no genuine
+# frontier nearby, the forward ray-cast is the ONLY candidate available, so
+# a target invalidated this tick came right back unchanged next tick,
+# defeating the exclusion and reproducing the exact live freeze this test
+# guards against: REPLAN_FOR_SAFETY -> repeated_safety_replan -> invalidate
+# -> "recovered after planner failure; requesting fresh frontier" -> the
+# identical point -> REPLAN_FOR_SAFETY again, forever, robot frozen in
+# place. Fix: _pick_next_target()/_pick_map_wide_fallback_target() now
+# reject any candidate matching an excluded target as a defensive floor,
+# regardless of whether the candidate's own source could honor exclusions.
+# ---------------------------------------------------------------------------
+
+
+def test_forward_candidate_is_not_reselected_after_being_marked_failed():
+    belief = _empty_belief(robot_count=1)
+    _fill_free(belief)  # no UNKNOWN anywhere -- zero genuine frontier candidates
+    robot_xy = (0.0, 0.0)
+    belief.force_free_point(robot_xy)
+
+    agent = RobotAgent(robot_id=0, position=robot_xy, planner_mode="FoV-aware directional frontier")
+    behavior = ExplorationBehavior()
+    services = PlannerServices()
+    observation = _make_observation(belief, robot_xy)
+
+    first_target = behavior._pick_next_target(agent, observation, services)
+    assert first_target is not None
+    assert _kind_from_reason(agent.last_frontier_selection_reason) == "forward", (
+        "test setup must produce a non-frontier bootstrap/fallback target"
+    )
+
+    # Simulate what engine.py's repeated-safety-replan handling does when a
+    # route to this exact target keeps failing: invalidate_failed_
+    # exploration_route() clears the target and records it as failed.
+    agent.exploration_target_xy = first_target
+    agent.invalidate_failed_exploration_route(
+        reason="repeated safety replan: predicted collision",
+        current_time=observation.current_time,
+        map_signature=len(observation.mapped_obstacle_points),
+    )
+    assert first_target in agent.recently_failed_exploration_targets(
+        current_time=observation.current_time, cooldown=999.0
+    )
+
+    # Robot pose is unchanged (matches the real bug: the robot never got a
+    # physics tick's worth of forward progress), so a naive re-selection
+    # would recompute to the exact same point.
+    reselected = behavior._pick_next_target(agent, observation, services)
+    assert reselected != first_target, (
+        "a target just marked failed must not be re-proposed by "
+        "_pick_next_target() while the robot's pose is unchanged"
+    )
+
+    fallback_reselected = behavior._pick_map_wide_fallback_target(agent, observation, services)
+    assert fallback_reselected != first_target, (
+        "a target just marked failed must not be re-proposed by "
+        "_pick_map_wide_fallback_target() either"
+    )
 
 
 # ---------------------------------------------------------------------------

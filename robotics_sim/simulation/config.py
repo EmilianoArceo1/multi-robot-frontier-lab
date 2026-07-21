@@ -120,6 +120,31 @@ def robot_color(index: int) -> QColor:
     return QColor(ROBOT_COLOR_HEXES[int(index) % len(ROBOT_COLOR_HEXES)])
 
 
+def camera_viewport_bounds(
+    center_x: float, center_y: float, width: float, height: float
+) -> tuple[float, float, float, float]:
+    """Left, right, bottom, top world bounds of a camera_center_x/y +
+    camera_width/height rectangle.
+
+    The one canonical, render-independent formula for SimulationConfig's
+    four camera_* fields -- the LOGICAL viewport / exploration-metric ROI,
+    never the canvas's render-only aspect-ratio-fit viewport (see
+    SimulationCanvas.render_view_bounds_world()). Kept here, not
+    duplicated, so a consumer that only has a SimulationConfig (e.g.
+    engine.py's exploration-coverage metric) does not need a
+    SimulationCanvas instance to compute the same rectangle
+    SimulationCanvas.camera_bounds_world() draws as the editable frame.
+    """
+    width = max(0.50, float(width))
+    height = max(0.50, float(height))
+    return (
+        float(center_x) - width / 2.0,
+        float(center_x) + width / 2.0,
+        float(center_y) - height / 2.0,
+        float(center_y) + height / 2.0,
+    )
+
+
 # ============================================================
 # LAYOUT
 # ============================================================
@@ -352,9 +377,14 @@ class SimulationConfig:
     hazard_cbf_acceleration_weight: float = 1.0
     hazard_cbf_angular_weight: float = 0.35
 
-    # Simulation camera/view rectangle. In editor mode this is shown as a
-    # red adjustable frame. In simulation mode this rectangle is the world area
-    # mapped to the canvas viewport.
+    # Simulation camera/view rectangle -- the LOGICAL viewport (also the
+    # exploration-metric ROI, see camera_viewport_bounds() below). In editor
+    # mode this is shown as a red adjustable frame. In simulation mode this
+    # rectangle is the configured world area of interest; SimulationCanvas
+    # may render a larger area than exactly this rectangle when the canvas's
+    # aspect ratio does not match width:height (see SimulationCanvas.
+    # render_view_bounds_world()), so geometry never distorts -- that
+    # render-only expansion never changes these four fields.
     camera_center_x: float = (WORLD_X_MIN + WORLD_X_MAX) / 2.0
     camera_center_y: float = (WORLD_Y_MIN + WORLD_Y_MAX) / 2.0
     camera_width: float = WORLD_X_MAX - WORLD_X_MIN

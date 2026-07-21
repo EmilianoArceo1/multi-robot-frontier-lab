@@ -66,6 +66,56 @@ FRONTIER_OR_ENDPOINT_MARKER_RADIUS = 7
 DEFAULT_RENDER_THROTTLE_FPS = 30.0
 
 
+def _fit_world_span_to_plot_aspect(
+    span_x: float,
+    span_y: float,
+    plot_width: float,
+    plot_height: float,
+) -> tuple[float, float]:
+    """Expand a logical world viewport span to match the plot area's
+    aspect ratio, growing only the one axis that needs it.
+
+    world_to_screen()/screen_to_world() use rect.width()/span_x and
+    rect.height()/span_y as their X/Y scale factors. Those two are only
+    equal (uniform scale -- circles stay circles, squares stay squares)
+    when span_x/span_y already equals plot_width/plot_height. Rather than
+    stretch X and Y independently (the previous behavior, which distorted
+    all rendered geometry whenever the configured viewport's aspect ratio
+    did not match the canvas's), this instead grows span_x or span_y just
+    enough to match the plot's aspect ratio -- so the canvas fills
+    completely (no letterboxing) without ever cropping or shrinking the
+    logical viewport, and without stretching either axis independently.
+
+    Symmetric by construction: the caller re-centers the result on the
+    same world point as the logical viewport (see
+    render_view_bounds_world()), so the added margin is split evenly
+    left/right or top/bottom -- never a one-sided crop.
+
+    Guarantees render_span_x >= span_x and render_span_y >= span_y.
+
+    Falls back to the logical span unchanged when plot_width/plot_height
+    are not yet valid (e.g. before the widget's first layout pass) --
+    better to render at the logical, possibly momentarily non-uniform,
+    scale for one frame than divide by zero.
+    """
+    span_x = max(1e-6, float(span_x))
+    span_y = max(1e-6, float(span_y))
+    if plot_width <= 0.0 or plot_height <= 0.0:
+        return span_x, span_y
+
+    logical_aspect = span_x / span_y
+    plot_aspect = float(plot_width) / float(plot_height)
+
+    if plot_aspect > logical_aspect:
+        # Canvas is proportionally wider than the logical viewport --
+        # keep height, expand width.
+        return span_y * plot_aspect, span_y
+
+    # Canvas is proportionally taller than (or as tall as) the logical
+    # viewport -- keep width, expand height.
+    return span_x, span_x / plot_aspect
+
+
 class RenderThrottler:
     """Decides whether a high-frequency, simulation-driven repaint request
     should actually trigger self.update() right now, or be coalesced
@@ -1202,6 +1252,66 @@ class SimulationCanvas(QWidget):
             center_y + span_y / 2.0,
         )
 
+    # ------------------------------------------------------------------
+    # Logical viewport vs. render viewport.
+    #
+    # The LOGICAL viewport (logical_view_span_world()/logical_view_bounds_
+    # world(), currently plain aliases of active_view_span_world()/
+    # active_view_bounds_world() above) is the user-configured/pan-zoom-
+    # navigated rectangle: camera_center_x/y +/- camera_width/height/2 in
+    # simulation mode, or the editor pan/zoom rectangle in editor mode. It
+    # is what the editable viewport frame draws, what persists in
+    # SimulationConfig/.sim files, and what the exploration-coverage
+    # metric's ROI is built from (see engine.estimated_explored_percent())
+    # -- it must never change just because the canvas resized, the theme
+    # toggled, or a panel opened/closed.
+    #
+    # The RENDER viewport (render_view_span_world()/render_view_bounds_
+    # world()) is that same rectangle expanded (via
+    # _fit_world_span_to_plot_aspect(), never cropped, never independently
+    # stretched) to match plot_rect()'s aspect ratio, so world_to_screen()/
+    # screen_to_world() apply a uniform X/Y scale and geometry never
+    # distorts. It is recomputed on demand from the logical viewport plus
+    # plot_rect() -- never written back to SimulationConfig -- and is what
+    # every render/culling call actually uses.
+    # ------------------------------------------------------------------
+
+    def logical_view_span_world(self) -> tuple[float, float]:
+        """The configured/navigated logical viewport span -- see
+        active_view_span_world(). Distinct name for clarity against
+        render_view_span_world()."""
+        return self.active_view_span_world()
+
+    def logical_view_bounds_world(self) -> tuple[float, float, float, float]:
+        """The configured/navigated logical viewport bounds -- see
+        active_view_bounds_world(). Distinct name for clarity against
+        render_view_bounds_world()."""
+        return self.active_view_bounds_world()
+
+    def render_view_span_world(self) -> tuple[float, float]:
+        """logical_view_span_world(), expanded to plot_rect()'s aspect
+        ratio (see _fit_world_span_to_plot_aspect()) -- what world_to_
+        screen()/screen_to_world() actually use, so rendered geometry
+        (circles, squares, FoV footprints, obstacles, routes) never
+        distorts just because the configured viewport's aspect ratio
+        differs from the canvas's."""
+        span_x, span_y = self.logical_view_span_world()
+        rect = self.plot_rect()
+        return _fit_world_span_to_plot_aspect(span_x, span_y, rect.width(), rect.height())
+
+    def render_view_bounds_world(self) -> tuple[float, float, float, float]:
+        """render_view_span_world(), centered on the same world point as
+        logical_view_bounds_world() -- the expansion is always symmetric
+        around the unchanged logical center, never a one-sided crop."""
+        center_x, center_y = self.active_view_center_world()
+        span_x, span_y = self.render_view_span_world()
+        return (
+            center_x - span_x / 2.0,
+            center_x + span_x / 2.0,
+            center_y - span_y / 2.0,
+            center_y + span_y / 2.0,
+        )
+
     def _view_transform_signature(self) -> tuple:
         """Cheap signature capturing everything world_to_screen() depends
         on (widget size, view center/zoom/pan) -- any screen-space cache
@@ -1210,13 +1320,13 @@ class SimulationCanvas(QWidget):
         return (
             self.width(),
             self.height(),
-            tuple(round(float(bound), 3) for bound in self.active_view_bounds_world()),
+            tuple(round(float(bound), 3) for bound in self.render_view_bounds_world()),
         )
 
     def world_to_screen(self, x: float, y: float):
         rect = self.plot_rect()
         center_x, center_y = self.active_view_center_world()
-        span_x, span_y = self.active_view_span_world()
+        span_x, span_y = self.render_view_span_world()
         sx = rect.left() + (rect.width() / 2.0) + (float(x) - center_x) * (rect.width() / span_x)
         sy = rect.bottom() - (rect.height() / 2.0) - (float(y) - center_y) * (rect.height() / span_y)
         return sx, sy
@@ -1224,7 +1334,7 @@ class SimulationCanvas(QWidget):
     def screen_to_world(self, sx: float, sy: float):
         rect = self.plot_rect()
         center_x, center_y = self.active_view_center_world()
-        span_x, span_y = self.active_view_span_world()
+        span_x, span_y = self.render_view_span_world()
         x = center_x + ((float(sx) - (rect.left() + rect.width() / 2.0)) / rect.width()) * span_x
         y = center_y - ((float(sy) - (rect.bottom() - rect.height() / 2.0)) / rect.height()) * span_y
         return x, y
@@ -1288,7 +1398,7 @@ class SimulationCanvas(QWidget):
         return positions
 
     def pixels_per_meter(self) -> float:
-        span_x, _ = self.active_view_span_world()
+        span_x, _ = self.render_view_span_world()
         return max(1.0, self.plot_rect().width() / max(0.1, span_x))
 
     def robot_index_at_screen_position(self, sx: float, sy: float) -> tuple[int, RobotStartConfig] | None:
@@ -2642,7 +2752,7 @@ class SimulationCanvas(QWidget):
         world-axis line itself (GRID_AXIS) is semantic and deliberately
         untouched -- see theme.py's module docstring."""
         c = theme_colors(self._theme_mode)
-        left, right, bottom, top = self.active_view_bounds_world()
+        left, right, bottom, top = self.render_view_bounds_world()
         span_x = max(0.1, right - left)
         span_y = max(0.1, top - bottom)
         step = self.nice_grid_step(min(span_x, span_y), min(rect.width(), rect.height()))
@@ -2753,7 +2863,7 @@ class SimulationCanvas(QWidget):
             return
 
         resolution = self._grid_resolution_preview_resolution
-        left, right, bottom, top = self.active_view_bounds_world()
+        left, right, bottom, top = self.render_view_bounds_world()
 
         painter.save()
         painter.setClipRect(rect)
@@ -3046,7 +3156,7 @@ class SimulationCanvas(QWidget):
             return None
 
         x_min, x_max, y_min, y_max = bounds
-        left, right, bottom, top = self.active_view_bounds_world()
+        left, right, bottom, top = self.render_view_bounds_world()
 
         col_start = max(0, int(math.floor((left - x_min) / snapshot_resolution)))
         col_end = min(grid.shape[1] - 1, int(math.ceil((right - x_min) / snapshot_resolution)))
@@ -3125,7 +3235,7 @@ class SimulationCanvas(QWidget):
             round(float(resolution), 3),
             self.width(),
             self.height(),
-            tuple(round(float(bound), 2) for bound in self.active_view_bounds_world()),
+            tuple(round(float(bound), 2) for bound in self.render_view_bounds_world()),
             snapshot_version if cell_bounds is not None else -1,
         )
 
@@ -3176,7 +3286,7 @@ class SimulationCanvas(QWidget):
         return cache
 
     def _draw_grid_overlay_lines(self, painter: QPainter, rect, resolution: float) -> None:
-        left, right, bottom, top = self.active_view_bounds_world()
+        left, right, bottom, top = self.render_view_bounds_world()
 
         painter.setPen(QPen(QColor(90, 90, 90, 70), 1))
 

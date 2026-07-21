@@ -196,24 +196,40 @@ def _valid_cell(belief: BeliefMap, cell: tuple[int, int]) -> bool:
     return 0 <= r < belief.height and 0 <= c < belief.width
 
 
+def is_frontier_cell(belief: BeliefMap, cell: tuple[int, int]) -> bool:
+    """The project's one definition of "frontier" cell: FREE/observed with
+    at least one UNKNOWN 4-neighbor.
+
+    A single O(1) local check -- not a map scan -- so it is cheap enough to
+    call once per tick to revalidate an already-assigned target (see
+    ExplorationBehavior.update()'s active-target staleness check and
+    _current_candidate() below), unlike _frontier_cells(), which scans the
+    whole grid to build the full candidate set from scratch.
+    """
+    if not _valid_cell(belief, cell):
+        return False
+    row, col = cell
+    if int(belief.grid[row, col]) != FREE:
+        return False
+
+    for neighbor in _neighbors4(cell):
+        if not _valid_cell(belief, neighbor):
+            continue
+        nr, nc = neighbor
+        if int(belief.grid[nr, nc]) == UNKNOWN:
+            return True
+
+    return False
+
+
 def _frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
     frontiers: set[tuple[int, int]] = set()
 
     for row in range(belief.height):
         for col in range(belief.width):
-            if int(belief.grid[row, col]) != FREE:
-                continue
-
             cell = (row, col)
-
-            for neighbor in _neighbors4(cell):
-                if not _valid_cell(belief, neighbor):
-                    continue
-
-                nr, nc = neighbor
-                if int(belief.grid[nr, nc]) == UNKNOWN:
-                    frontiers.add(cell)
-                    break
+            if is_frontier_cell(belief, cell):
+                frontiers.add(cell)
 
     return frontiers
 
@@ -529,6 +545,21 @@ def _current_candidate(
 
     r, c = cell
     if int(belief.grid[r, c]) == OCCUPIED:
+        return None
+
+    # A target only remains eligible for hysteresis "keep current target"
+    # reuse while it is still an actual frontier cell (see is_frontier_
+    # cell()'s docstring for the definition). Without this, once every
+    # UNKNOWN neighbor around a previously selected target has since been
+    # observed (by this robot or a teammate), it keeps being treated as a
+    # live "current" candidate purely because it is not OCCUPIED -- and
+    # once it is the only candidate left (e.g. the rest of the map is now
+    # fully explored too), select_goal() below still picks it as "best",
+    # with a reason string ("selected best FoV-aware target") that reads
+    # like a fresh, informed choice instead of a zero-information repeat
+    # of a dead cell. This is a single local neighbor check, not a fresh
+    # full-map frontier scan.
+    if not is_frontier_cell(belief, cell):
         return None
 
     target = belief.cell_to_world(cell)

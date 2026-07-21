@@ -4575,8 +4575,54 @@ class SimulationControllerMixin:
             return f"{reason}\nStatus: {status}"
         return reason or status or "--"
 
+    def logical_exploration_viewport_bounds(self) -> tuple[float, float, float, float]:
+        """The user-configured metric ROI: left, right, bottom, top of the
+        camera_center_x/y +/- camera_width/height/2 rectangle -- see
+        config.camera_viewport_bounds()'s docstring. Independent of any
+        canvas render state (theme, resize, the render-only aspect-ratio-
+        fit viewport, editor pan/zoom): only an explicit camera_width/
+        camera_height/camera_center_x/camera_center_y change moves this.
+        """
+        return camera_viewport_bounds(
+            self.config.camera_center_x,
+            self.config.camera_center_y,
+            self.config.camera_width,
+            self.config.camera_height,
+        )
+
     def estimated_explored_percent(self) -> float:
-        return self.ensure_belief_map().stats().coverage_percent
+        """Percent of the logical viewport (see
+        logical_exploration_viewport_bounds()) currently known FREE.
+
+        BeliefMapStats.coverage_percent (free_cells / total_cells) is NOT
+        used directly here because belief_map.grid always spans the full
+        WORLD_X/Y extent, not the user-configured camera viewport -- using
+        it as-is would silently ignore a narrower/wider configured
+        viewport entirely, and reading `total_cells` from the render
+        viewport instead would make this move on resize/theme/aspect-fit,
+        none of which represent real exploration progress. This replicates
+        the exact same FREE-cell-counting criterion, just restricted to
+        the belief cells whose centers fall inside the logical viewport
+        rectangle -- resolved via the same clamped cell-index-range
+        pattern SimulationCanvas._grid_overlay_cell_bounds() uses for
+        culling, so it stays a fast vectorized numpy slice rather than a
+        per-cell Python loop.
+        """
+        belief = self.ensure_belief_map()
+        left, right, bottom, top = self.logical_exploration_viewport_bounds()
+
+        col_start = max(0, int(math.floor((left - belief.x_min) / belief.resolution)))
+        col_end = min(belief.width - 1, int(math.ceil((right - belief.x_min) / belief.resolution)))
+        row_start = max(0, int(math.floor((bottom - belief.y_min) / belief.resolution)))
+        row_end = min(belief.height - 1, int(math.ceil((top - belief.y_min) / belief.resolution)))
+
+        if col_start > col_end or row_start > row_end:
+            return 0.0
+
+        roi = belief.grid[row_start:row_end + 1, col_start:col_end + 1]
+        total = int(roi.size)
+        free = int(np.count_nonzero(roi == FREE))
+        return 100.0 * free / max(1, total)
 
     def point_inside_ground_truth_obstacle(self, point: tuple[float, float]) -> bool:
         """Return True if a world point is inside a scenario obstacle.
@@ -4681,7 +4727,7 @@ class SimulationControllerMixin:
             ("Belief OCCUPIED cells", str(stats.occupied_cells)),
             ("Belief UNKNOWN cells", str(stats.unknown_cells)),
             ("Belief known cells", str(stats.known_cells)),
-            ("Belief coverage of rectangle", f"{stats.coverage_percent:.1f}%"),
+            ("Belief coverage of rectangle", f"{self.estimated_explored_percent():.1f}%"),
             ("Free-space coverage", f"{self.estimated_free_space_coverage_percent():.1f}%"),
             ("Revisited free cells", str(stats.revisited_cells)),
             ("Revisit ratio", f"{100.0 * stats.revisit_ratio:.1f}%"),

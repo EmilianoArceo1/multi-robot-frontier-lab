@@ -262,6 +262,7 @@ class _FakeCanvas:
         self.discovered_hazard_frames: list = []
         self.exploration_target = "unset"
         self.explored_area_seed = None
+        self.explored_area_geometry_clear_count = 0
 
     def set_status(self, message):
         self.status_messages.append(message)
@@ -280,6 +281,13 @@ class _FakeCanvas:
 
     def set_explored_area_seed(self, mask, resolution, bounds):
         self.explored_area_seed = (mask, resolution, bounds)
+
+    def clear_explored_area_geometry(self):
+        # Real SimulationCanvas.clear_explored_area_geometry() also drops
+        # explored_area_polygons -- see restore_navigation_debug_snapshot(),
+        # which calls this before set_explored_area_polygons([]) anyway.
+        self.explored_area_geometry_clear_count += 1
+        self.explored_area_polygons = []
 
     def set_mapped_obstacle_points(self, points):
         self.mapped_obstacle_points = list(points)
@@ -430,6 +438,11 @@ def _build_fake_engine(
         "_invalidate_all_prefetch_requests",
         "_restore_final_goal_into_config_and_widgets",
         "final_goal_xy",
+        # restore_navigation_debug_snapshot() now truncates mapped_obstacle_
+        # points via this real helper (see engine.py) instead of an inline
+        # copy of its policy -- bound here so this fixture keeps exercising
+        # the real restore path end to end.
+        "_truncate_mapped_obstacle_points",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     fake.agent = agent

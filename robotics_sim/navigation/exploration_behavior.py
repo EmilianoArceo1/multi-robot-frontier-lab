@@ -30,6 +30,7 @@ from robotics_sim.navigation.navigation_decision import (
     request_plan,
 )
 from robotics_sim.navigation.recovery_policy import RecoveryPolicy
+from robotics_sim.planning.exploration_planners import is_frontier_cell
 from robotics_sim.simulation.navigation_modes import is_goal_seeking_planner
 
 if TYPE_CHECKING:
@@ -322,6 +323,35 @@ class ExplorationBehavior:
 
         # ── 5. Follow current path ───────────────────────────────────────
         if target is not None:
+            # The active exploration target can stop being a genuine
+            # frontier (every neighboring UNKNOWN cell observed, by this
+            # robot or a teammate) before the robot physically arrives.
+            # Steps 3/4 above already revalidate via a fresh planner call
+            # once the robot has reached the goal or is close enough to
+            # prefetch, but a robot still far away would otherwise just
+            # keep FOLLOW_PATH-ing here for many more ticks toward a cell
+            # the belief map already proves is fully explored. A single
+            # O(1) local neighbor check (is_frontier_cell()), not a fresh
+            # frontier scan, so safe to run every tick.
+            if (
+                agent.exploration_target_xy is not None
+                and observation.belief_map is not None
+                and not self._active_target_is_frontier(agent, observation)
+            ):
+                agent.target_switch_count += 1
+                agent.exploration_target_xy = None
+                next_target = self._pick_next_target(agent, observation, planner_services)
+                if next_target is None:
+                    next_target = self._pick_map_wide_fallback_target(agent, observation, planner_services)
+                if next_target is None:
+                    agent.stop_count_exploration += 1
+                    return hold(reason="active target no longer a frontier; no valid next frontier available")
+                agent.clear_recovery_memory()
+                return request_plan(
+                    next_target,
+                    reason="active target no longer a frontier; requesting fresh frontier",
+                    force_new_target=True,
+                )
             return follow(target, reason="following active path to frontier")
 
         # ── 6. No path — need first plan ─────────────────────────────────
@@ -451,6 +481,21 @@ class ExplorationBehavior:
     # target-selection path already goes through -- no new planner code,
     # no A* changes, just an existing, already-registered planner_name.
     _MAP_WIDE_FALLBACK_PLANNER: str = "Nearest frontier"
+
+    def _active_target_is_frontier(
+        self,
+        agent: "RobotAgent",
+        observation: "RobotObservation",
+    ) -> bool:
+        """True while agent.exploration_target_xy is still a genuine
+        frontier cell (see is_frontier_cell()'s definition) in
+        observation.belief_map. A single O(1) local neighbor check, not a
+        fresh full-map frontier scan -- callers must guard belief_map/
+        exploration_target_xy for None themselves."""
+        cell = observation.belief_map.world_to_cell(agent.exploration_target_xy, clamp=True)
+        if cell is None:
+            return False
+        return is_frontier_cell(observation.belief_map, cell)
 
     def _excluded_targets(
         self,

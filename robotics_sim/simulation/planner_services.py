@@ -113,6 +113,7 @@ class TargetSelectionRequest:
     excluded_targets: tuple[Point2D, ...] = ()
     target_exclusion_radius: float = 0.0
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
+    planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -151,6 +152,19 @@ class PlannerServices:
     reject exploration candidates the real navigation A* would immediately
     fail on, without exploration_planners.py importing engine internals.
     Left as None, behavior is unchanged from before this existed.
+
+    planning_grid_provider follows the exact same pattern: an optional
+    Callable[[], OccupancyGrid] the engine host may refresh each tick (see
+    engine.ensure_planner_services()) so a planner that actually needs a
+    real planning grid (today, only FoVAwareDirectionalFrontierPlanner) can
+    build one lazily -- called at most once per select_goal() invocation,
+    and never called at all by planners that never read it. This is
+    deliberately a PROVIDER (a callable), not a pre-built grid: building an
+    OccupancyGrid is not free, and most ticks never need one (target
+    selection may not even run every tick, and non-FoV planners never
+    consume it), so nothing here should build one until a planner that
+    actually wants one asks for it. Left as None, behavior is unchanged
+    from before this existed.
     """
 
     allowed_parameter_prefixes = (
@@ -165,6 +179,7 @@ class PlannerServices:
     )
 
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
+    planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None
 
     # ------------------------------------------------------------------ path
 
@@ -262,6 +277,7 @@ class PlannerServices:
         excluded_targets: list[Point2D] | None = None,
         target_exclusion_radius: float | None = None,
         is_candidate_reachable: "Callable[[Point2D], bool] | None" = None,
+        planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None,
     ):
         """
         Select the next exploration frontier target.
@@ -278,6 +294,14 @@ class PlannerServices:
         never passes it), falls back to self.is_candidate_reachable, which
         the engine host may refresh every tick with a check backed by the
         real navigation planning grid.
+
+        planning_grid_provider: optional per-call override, same fallback
+        pattern as is_candidate_reachable -- when omitted, falls back to
+        self.planning_grid_provider. Forwarded to select_exploration_goal()
+        as-is; THIS METHOD NEVER CALLS IT. Only a planner that actually
+        wants a real planning grid (today, only
+        FoVAwareDirectionalFrontierPlanner) invokes it, at most once, deep
+        inside select_goal().
         """
         excluded = tuple(excluded_targets or ())
         exclusion_radius = (
@@ -287,6 +311,9 @@ class PlannerServices:
         )
         reachability_check = (
             is_candidate_reachable if is_candidate_reachable is not None else self.is_candidate_reachable
+        )
+        grid_provider = (
+            planning_grid_provider if planning_grid_provider is not None else self.planning_grid_provider
         )
 
         return self.select_exploration_target_request(
@@ -304,6 +331,7 @@ class PlannerServices:
                 excluded_targets=excluded,
                 target_exclusion_radius=exclusion_radius,
                 is_candidate_reachable=reachability_check,
+                planning_grid_provider=grid_provider,
             )
         )
 
@@ -327,6 +355,7 @@ class PlannerServices:
             excluded_targets=list(request.excluded_targets),
             target_exclusion_radius=request.target_exclusion_radius,
             is_candidate_reachable=request.is_candidate_reachable,
+            planning_grid_provider=request.planning_grid_provider,
         )
 
     # ------------------------------------------------------------------ coordination / control hooks

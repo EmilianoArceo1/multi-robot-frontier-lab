@@ -196,24 +196,40 @@ def _valid_cell(belief: BeliefMap, cell: tuple[int, int]) -> bool:
     return 0 <= r < belief.height and 0 <= c < belief.width
 
 
+def is_frontier_cell(belief: BeliefMap, cell: tuple[int, int]) -> bool:
+    """The project's one definition of "frontier" cell: FREE/observed with
+    at least one UNKNOWN 4-neighbor.
+
+    A single O(1) local check -- not a map scan -- so it is cheap enough to
+    call once per tick to revalidate an already-assigned target (see
+    ExplorationBehavior.update()'s active-target staleness check and
+    _current_candidate() below), unlike _frontier_cells(), which scans the
+    whole grid to build the full candidate set from scratch.
+    """
+    if not _valid_cell(belief, cell):
+        return False
+    row, col = cell
+    if int(belief.grid[row, col]) != FREE:
+        return False
+
+    for neighbor in _neighbors4(cell):
+        if not _valid_cell(belief, neighbor):
+            continue
+        nr, nc = neighbor
+        if int(belief.grid[nr, nc]) == UNKNOWN:
+            return True
+
+    return False
+
+
 def _frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
     frontiers: set[tuple[int, int]] = set()
 
     for row in range(belief.height):
         for col in range(belief.width):
-            if int(belief.grid[row, col]) != FREE:
-                continue
-
             cell = (row, col)
-
-            for neighbor in _neighbors4(cell):
-                if not _valid_cell(belief, neighbor):
-                    continue
-
-                nr, nc = neighbor
-                if int(belief.grid[nr, nc]) == UNKNOWN:
-                    frontiers.add(cell)
-                    break
+            if is_frontier_cell(belief, cell):
+                frontiers.add(cell)
 
     return frontiers
 
@@ -529,6 +545,21 @@ def _current_candidate(
 
     r, c = cell
     if int(belief.grid[r, c]) == OCCUPIED:
+        return None
+
+    # A target only remains eligible for hysteresis "keep current target"
+    # reuse while it is still an actual frontier cell (see is_frontier_
+    # cell()'s docstring for the definition). Without this, once every
+    # UNKNOWN neighbor around a previously selected target has since been
+    # observed (by this robot or a teammate), it keeps being treated as a
+    # live "current" candidate purely because it is not OCCUPIED -- and
+    # once it is the only candidate left (e.g. the rest of the map is now
+    # fully explored too), select_goal() below still picks it as "best",
+    # with a reason string ("selected best FoV-aware target") that reads
+    # like a fresh, informed choice instead of a zero-information repeat
+    # of a dead cell. This is a single local neighbor check, not a fresh
+    # full-map frontier scan.
+    if not is_frontier_cell(belief, cell):
         return None
 
     target = belief.cell_to_world(cell)
@@ -998,10 +1029,40 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         candidates = self._preselect(candidates, robot_xy, max_candidates)
         max_frontier_size = max((c.size for c in candidates), default=1)
 
-        planning_grid = belief.to_planning_grid(
-            unknown_is_traversable=True,
-            inflate_radius=max(0.0, robot_radius + safety_margin),
-        )
+        # Three-tier grid source, in priority order -- both #1 and #2 carry
+        # sanitized static observed geometry, other-robot dynamic points,
+        # and observed hazard (built by engine.py via the SAME
+        # PlanningCostmapBuilder-backed adapter build_planner_kwargs()/
+        # make_exploration_reachability_check() already use -- see
+        # SimulationControllerMixin.build_planning_grid_for_robot()), never
+        # just the belief map alone:
+        #   1. kwargs["planning_grid"] -- an already-built grid, when a
+        #      caller happens to have one on hand.
+        #   2. kwargs["planning_grid_provider"] -- a Callable[[], grid],
+        #      invoked HERE, at most once, only by this planner. Other
+        #      planners in this module receive the same kwarg but never
+        #      read it, so they never trigger this build. This keeps grid
+        #      construction lazy: engine.py registers the provider once per
+        #      tick (see ensure_planner_services()) but nothing actually
+        #      builds a grid unless FoV scoring is genuinely reached.
+        #   3. Neither supplied (e.g. direct/test callers, or callers with
+        #      no live robot object to build one from): falls back to the
+        #      belief-only grid this planner has always built on its own --
+        #      this fallback's behavior is unchanged from before.
+        # #1/#2 are copied here so this function never mutates whatever the
+        # caller's grid/provider produced.
+        supplied_planning_grid = kwargs.get("planning_grid")
+        if supplied_planning_grid is not None:
+            planning_grid = supplied_planning_grid.copy()
+        else:
+            planning_grid_provider = kwargs.get("planning_grid_provider")
+            if callable(planning_grid_provider):
+                planning_grid = planning_grid_provider().copy()
+            else:
+                planning_grid = belief.to_planning_grid(
+                    unknown_is_traversable=True,
+                    inflate_radius=max(0.0, robot_radius + safety_margin),
+                )
 
         scored: list[FrontierCandidate] = []
 

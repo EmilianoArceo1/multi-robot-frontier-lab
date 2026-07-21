@@ -18,6 +18,7 @@ import functools
 import json
 import logging
 import math
+import numbers
 import os
 import time
 import zlib
@@ -134,6 +135,12 @@ from robotics_sim.diagnostics.navigation_snapshot import (
 )
 from robotics_sim.environment.hazard_belief import HazardBeliefFrame
 from robotics_sim.environment.hazard_field import FireSource
+from robotics_sim.environment.map_snapshots import ObservedObstacleSnapshot
+from robotics_sim.environment.occupancy_grid import OccupancyGrid
+from robotics_sim.planning.planning_costmap_builder import (
+    PlanningCostmapBuilder,
+    PlanningCostmapPolicy,
+)
 
 # Minimum wall-clock gap between pushing occupancy snapshots into the
 # canvas's grid overlay. The belief grid can be large, and copying it more
@@ -681,18 +688,43 @@ class SimulationControllerMixin:
                     for source in previous_service.sources()
                 ]
 
+        # A new BeliefMap object replaces self.belief_map on every reset, but
+        # its revision must never regress just because the underlying
+        # instance changed -- a consumer that saw revision 850 before a
+        # reset must never see revision 0 after it. The first-ever creation
+        # (no previous belief_map) legitimately starts at 0; every later
+        # replacement seeds strictly above whatever the outgoing instance
+        # had reached. Never derived from known-cell count, wall-clock time,
+        # object id, a hash, or robot_count.
+        previous_belief = getattr(self, "belief_map", None)
+        next_initial_revision = 0 if previous_belief is None else previous_belief.revision + 1
+
         self.belief_map = BeliefMap(
             bounds=(WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX),
             resolution=max(float(self.config.grid_resolution), 0.10),
             robot_count=max(1, int(robot_count)),
+            initial_revision=next_initial_revision,
         )
         self.explored_free_points = set()
         # Dense, visible obstacle-boundary samples. This is intentionally
         # separate from belief_map.grid OCCUPIED cells; the grid is logical,
         # while these samples preserve the obstacle contour for rendering and
         # local safety checks.
+        #
+        # mapped_obstacle_revision is a monotonic counter for this list's
+        # content, owned by this host object (there is no per-scenario
+        # object like BeliefMap to own it) -- see observed_obstacle_
+        # snapshot(). It is NOT reset to 0 here: a reset that actually
+        # clears prior points is itself a content change and must bump it
+        # forward, not restart it, so a consumer holding an old revision
+        # number never mistakes a post-reset state for one it already saw.
+        had_mapped_obstacle_points = bool(getattr(self, "mapped_obstacle_points", None))
         self.mapped_obstacle_points = []
         self.mapped_obstacle_point_keys: set[tuple[float, float]] = set()
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+        elif had_mapped_obstacle_points:
+            self.mapped_obstacle_revision += 1
 
         # Dynamic hazards are a parallel layer aligned with the belief map.
         # Recreating the service here gives start/reset the required ephemeral
@@ -719,6 +751,36 @@ class SimulationControllerMixin:
         # dirty -- there is nothing pending to flush right after a reset.
         self.push_discovered_hazard_frame()
         self._discovered_hazard_render_dirty = False
+
+    def _publish_explored_area_source_to_canvas(self) -> None:
+        """Point the canvas at this run's live belief_map.explored_by_robot
+        mask -- the authoritative DISCRETE source rebuild_explored_area_
+        cache() uses to reconstruct the visible explored-area layer after
+        any cache invalidation (theme toggle/resize/pan-zoom), for any
+        robot that has no continuous FoV-sweep geometry of its own yet
+        (see canvas._explored_area_paths_by_robot) -- never the bounded
+        explored_area_polygons history (see EXPLORED_POLYGON_HISTORY_LIMIT).
+
+        Call once per fresh run, right after reset_belief_map() replaces
+        self.belief_map with a new instance, so the canvas is never left
+        pointing at a previous run's (already-replaced) BeliefMap -- see
+        this method's callers. Clears the canvas's continuous-path/bounded-
+        polygon coverage first (clear_explored_area_geometry()) so a
+        previous run's smooth geometry can never bleed into this new,
+        empty one -- invalidate_explored_area_cache() alone would drop only
+        the render-cache pixmaps, not that authoritative geometry.
+        canvas.set_explored_area_seed() then keeps only the ndarray
+        reference (no copy), and belief_map's own mutating methods write
+        into it in place, so this needs calling only once per BeliefMap
+        instance, not once per tick. See canvas.set_explored_area_seed()'s
+        docstring for the full contract.
+        """
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return
+        canvas.clear_explored_area_geometry()
+        belief = self.belief_map
+        canvas.set_explored_area_seed(belief.explored_by_robot, belief.resolution, belief.bounds)
 
     def ensure_belief_map(self) -> BeliefMap:
         """Return the active belief map, creating it if needed."""
@@ -940,6 +1002,68 @@ class SimulationControllerMixin:
                 (round(float(p[0]), 3), round(float(p[1]), 3))
                 for p in self.mapped_obstacle_points
             }
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+
+    def observed_obstacle_snapshot(self) -> "ObservedObstacleSnapshot":
+        """Immutable snapshot of the shared, unprocessed observed-obstacle
+        geometry: mapped_obstacle_points as-is.
+
+        Deliberately excludes dynamic robot points, hazard points, and
+        ground-truth obstacles -- those are separate contracts/layers.
+        Per-robot sanitization (see sanitize_planner_obstacle_points())
+        still happens later, against this same shared source; this
+        snapshot is upstream of that, not a replacement for it.
+        """
+        belief = self.ensure_belief_map()
+        return ObservedObstacleSnapshot(
+            points=tuple(getattr(self, "mapped_obstacle_points", ())),
+            bounds=belief.bounds,
+            resolution=belief.resolution,
+            revision=int(getattr(self, "mapped_obstacle_revision", 0)),
+            source="mapped_obstacle_points",
+        )
+
+    def _truncate_mapped_obstacle_points(self, count: int) -> bool:
+        """Truncate self.mapped_obstacle_points to its own first `count`
+        points and bump mapped_obstacle_revision exactly once if that
+        changed the content. Returns True if it changed, False otherwise.
+
+        mapped_obstacle_points is append-only at runtime (see update_sensed_
+        obstacles()), so `count` is always a request for a plain PREFIX of
+        the current list -- comparing lengths before/after is equivalent to
+        comparing content for this specific operation. The single caller
+        today is navigation-debug-snapshot restore (truncating back to the
+        boundary-sample count captured at a historical revision), but
+        nothing here is specific to that caller.
+
+        count is validated as a real, non-boolean integer (a caller bug --
+        e.g. a float or a string -- raises TypeError). A NEGATIVE count is
+        clamped to 0 rather than rejected: count is expected to come from a
+        persisted snapshot field that could in principle be corrupted or
+        predate this field existing, and "truncate to nothing" is a safe,
+        recoverable interpretation of a bad count -- unlike raising and
+        aborting the caller's whole restore.
+        """
+        if isinstance(count, bool) or not isinstance(count, numbers.Integral):
+            raise TypeError(f"count must be a non-boolean integer, got {count!r} ({type(count).__name__}).")
+
+        normalized_count = max(0, int(count))
+        previous_points = getattr(self, "mapped_obstacle_points", [])
+        previous_length = len(previous_points)
+
+        self.mapped_obstacle_points = list(previous_points[:normalized_count])
+        self.mapped_obstacle_point_keys = {
+            (round(float(p[0]), 3), round(float(p[1]), 3)) for p in self.mapped_obstacle_points
+        }
+
+        changed = len(self.mapped_obstacle_points) != previous_length
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
+        elif changed:
+            self.mapped_obstacle_revision += 1
+
+        return changed
 
     # CONFIG
     # ========================================================
@@ -1299,6 +1423,18 @@ class SimulationControllerMixin:
             if agent.active_path_goal_xy is not None:
                 excluded_targets.append(agent.active_path_goal_xy)
 
+        robot_radius = float(self.safety_radius())
+        # LAZY: same _planning_grid_provider_for_robot() used to refresh
+        # PlannerServices.planning_grid_provider (see ensure_planner_
+        # services()) -- reused here, not duplicated, and not built eagerly.
+        # Only FoVAwareDirectionalFrontierPlanner.select_goal() ever calls
+        # this closure (at most once); every other exploration planner
+        # ignores the kwarg entirely, so no planning grid is built at all
+        # for those (unnecessary runtime work avoided). None when there is
+        # no live robot yet; the FoV planner falls back to its own
+        # belief-only grid in that case (unchanged prior behavior).
+        planning_grid_provider = self._planning_grid_provider_for_robot(self.robot)
+
         result = select_exploration_goal(
             planner_name,
             belief_map=belief,
@@ -1307,7 +1443,7 @@ class SimulationControllerMixin:
             current_target=current_target,
             final_goal_xy=final_goal,
             robot_count=1,
-            robot_radius=float(self.safety_radius()),
+            robot_radius=robot_radius,
             sensor_range=float(self.config.vision),
             vision_model=str(self.config.vision_model),
             ipp_distance_penalty=float(self.config.ipp_distance_penalty),
@@ -1317,6 +1453,7 @@ class SimulationControllerMixin:
                 if excluded_targets
                 else 0.0
             ),
+            planning_grid_provider=planning_grid_provider,
         )
 
         selected_score = None
@@ -1489,21 +1626,172 @@ class SimulationControllerMixin:
         )
         return points
 
+    def _planning_costmap_inputs_for_robot(
+        self,
+        robot,
+        *,
+        robot_radius: float,
+        dynamic_obstacle_points: tuple[tuple[float, float], ...] = (),
+    ):
+        """Build the PlanningCostmapSnapshot for ONE robot via
+        PlanningCostmapBuilder (robotics_sim/planning/planning_costmap_
+        builder.py), applying this robot's own per-robot
+        sanitize_planner_obstacle_points() to the static observed geometry
+        AND to dynamic_obstacle_points -- SEPARATELY, matching the
+        builder's own static/dynamic separation. Sanitizing them apart
+        (rather than concatenating first, then sanitizing once) is
+        equivalent in result -- sanitize_planner_obstacle_points() is a
+        per-point distance filter, independent of what else shares the
+        list -- but it is what lets the sanitized static view become its
+        own ephemeral ObservedObstacleSnapshot below, never merged with
+        dynamic points into one contract.
+
+        Never mutates self.mapped_obstacle_points or the shared
+        observed_obstacle_snapshot(): the sanitized static snapshot built
+        here is a fresh object, local to this one call, carrying the same
+        bounds/resolution/revision/source as the unsanitized snapshot
+        (sanitization removes near-start rendering artifacts, it is not a
+        new observation, so the revision does not change).
+
+        Hazard enters exclusively via hazard_service.belief.snapshot() +
+        hazard_service.belief.geometry -- never mapped_obstacle_points or
+        dynamic_obstacle_points. Ground truth (config.obstacles) never
+        enters at all.
+        """
+        belief = self.ensure_belief_map()
+        exploration = belief.snapshot()
+        observed_static = self.observed_obstacle_snapshot()
+
+        start_xy = (float(robot.x), float(robot.y))
+        resolution = float(self.config.grid_resolution)
+        radius = max(0.0, float(robot_radius))
+
+        sanitized_static_points, _ = self.sanitize_planner_obstacle_points(
+            list(observed_static.points), start_xy=start_xy, robot_radius=radius, resolution=resolution,
+        )
+        sanitized_dynamic_points, _ = self.sanitize_planner_obstacle_points(
+            list(dynamic_obstacle_points), start_xy=start_xy, robot_radius=radius, resolution=resolution,
+        )
+
+        sanitized_static_snapshot = ObservedObstacleSnapshot(
+            points=tuple(sanitized_static_points),
+            bounds=observed_static.bounds,
+            resolution=observed_static.resolution,
+            revision=observed_static.revision,
+            source=observed_static.source,
+        )
+
+        hazard_belief = None
+        hazard_geometry = None
+        hazard_block_threshold = None
+        hazard_service = getattr(self, "hazard_service", None)
+        if hazard_service is not None:
+            hazard_belief = hazard_service.belief.snapshot()
+            hazard_geometry = hazard_service.belief.geometry
+            hazard_block_threshold = float(hazard_service.block_threshold)
+
+        policy = PlanningCostmapPolicy(
+            unknown_is_traversable=True,
+            obstacle_padding=radius,
+            hazard_block_threshold=hazard_block_threshold,
+        )
+
+        return PlanningCostmapBuilder().build(
+            exploration=exploration,
+            observed_obstacles=sanitized_static_snapshot,
+            policy=policy,
+            dynamic_obstacle_points=tuple(sanitized_dynamic_points),
+            hazard_belief=hazard_belief,
+            hazard_geometry=hazard_geometry,
+        )
+
+    def _planning_grid_from_costmap_snapshot(self, snapshot) -> OccupancyGrid:
+        """Convert a PlanningCostmapSnapshot into the OccupancyGrid shape
+        every planner/reachability caller still expects, WITHOUT
+        re-rasterizing or re-inflating anything -- snapshot.grid is already
+        the final, fully-composed result PlanningCostmapBuilder.build()
+        produced; this only repackages it.
+        """
+        grid = OccupancyGrid.from_bounds(
+            x_min=snapshot.bounds[0],
+            x_max=snapshot.bounds[1],
+            y_min=snapshot.bounds[2],
+            y_max=snapshot.bounds[3],
+            resolution=snapshot.resolution,
+            initial_value=UNKNOWN,
+            unknown_is_traversable=snapshot.unknown_is_traversable,
+        )
+        grid.data = snapshot.grid.copy()
+        return grid
+
+    def _dynamic_obstacle_points_for_robot_object(self, robot) -> tuple[tuple[float, float], ...]:
+        """Resolve robot's own index within self.robots and return the same
+        other-runtime-robot dynamic obstacle points build_planner_kwargs_
+        for_multi_robot() would use for that robot -- empty whenever robot
+        is not found in self.robots, which is exactly true single-robot
+        mode (start_simulation() leaves self.robots == [] there; only
+        start_multi_robot_simulation() populates it). Identity comparison
+        (`is`), not `==`, so this never depends on Robot defining __eq__.
+        """
+        for index, candidate in enumerate(getattr(self, "robots", None) or []):
+            if candidate is robot:
+                return tuple(self.dynamic_robot_obstacle_points_for_robot(index))
+        return ()
+
     def build_planning_grid_for_robot(
         self,
         robot,
         *,
         obstacle_points: list[tuple[float, float]] | None = None,
         robot_radius: float | None = None,
+        dynamic_obstacle_points: tuple[tuple[float, float], ...] = (),
     ):
-        """Build a planning grid from BeliefMap plus dense mapped/dynamic samples.
+        """Build a planning grid for one robot -- two paths.
 
-        BeliefMap is the source of logical UNKNOWN/FREE/OCCUPIED state.
-        Dense boundary samples remain useful for route safety and are added only
-        to this derived planning grid, not to the belief map itself.
+        A. NEW runtime path -- obstacle_points is None (the caller did not
+           pass it at all): routes through PlanningCostmapBuilder via
+           _planning_costmap_inputs_for_robot()/_planning_grid_from_
+           costmap_snapshot(). This is what all four production callers
+           use today: build_planner_kwargs(), build_planner_kwargs_for_
+           goal(), build_planner_kwargs_for_multi_robot() (dynamic_
+           obstacle_points = other runtime robots), and make_exploration_
+           reachability_check()'s _build_context() (same, via
+           _dynamic_obstacle_points_for_robot_object()).
+        B. LEGACY compatibility path -- obstacle_points is not None (the
+           caller passed it explicitly, even an empty list): reproduces
+           exactly this method's PRE-migration behavior
+           (BeliefMap.to_planning_grid() + add_obstacle_points() + hazard).
+           Kept for tests/callers that still construct obstacle_points
+           themselves; dynamic_obstacle_points is ignored on this path --
+           the caller already decided everything to project. Not removed
+           in this phase; see the module-level migration notes near
+           PlanningCostmapBuilder for the plan to retire it.
+
+        BeliefMap.OCCUPIED does NOT mean the same thing on both paths:
+          - LEGACY path (B): belief.to_planning_grid() treats BeliefMap's
+            own UNKNOWN/FREE/OCCUPIED state exactly as before this
+            migration -- an OCCUPIED cell blocks by itself.
+          - NEW path (A): the ExplorationMapSnapshot PlanningCostmapBuilder
+            receives only ever contributes UNKNOWN-vs-observed knowledge
+            (see that module's "Legacy belief occupancy vs. observed
+            obstacle geometry"); a legacy BeliefMap.OCCUPIED cell does NOT
+            block on its own there. Physical occupancy on the new path
+            comes exclusively from ObservedObstacleSnapshot.points,
+            dynamic_obstacle_points, and HazardBeliefFrame.
+        Dense boundary samples remain useful for route safety and are only
+        ever added to this derived planning grid, not to the belief map
+        itself.
         """
-        belief = self.ensure_belief_map()
         radius = self.safety_radius_for_robot(robot) if robot_radius is None else float(robot_radius)
+
+        if obstacle_points is None:
+            snapshot = self._planning_costmap_inputs_for_robot(
+                robot, robot_radius=radius, dynamic_obstacle_points=dynamic_obstacle_points,
+            )
+            return self._planning_grid_from_costmap_snapshot(snapshot)
+
+        # LEGACY compatibility path -- unchanged from before this migration.
+        belief = self.ensure_belief_map()
         planning_grid = belief.to_planning_grid(
             unknown_is_traversable=True,
             inflate_radius=max(0.0, radius),
@@ -1583,7 +1871,15 @@ class SimulationControllerMixin:
                 obstacle_points=[],
             )
 
-        obstacle_points, removed = self.sanitize_planner_obstacle_points(
+        # Computed only for the diagnostic "ignored N own-start obstacle
+        # sample(s)" message below -- the actual planning grid now goes
+        # through the NEW runtime path (build_planning_grid_for_robot()
+        # called WITHOUT obstacle_points), which sanitizes this same
+        # geometry again internally (see _planning_costmap_inputs_for_
+        # robot()). sanitize_planner_obstacle_points() is a pure, per-point
+        # distance filter, so computing it twice here costs a little
+        # redundant work but never changes the result.
+        _, removed = self.sanitize_planner_obstacle_points(
             list(self.mapped_obstacle_points),
             start_xy=(float(start_xy[0]), float(start_xy[1])),
             robot_radius=robot_radius,
@@ -1595,7 +1891,6 @@ class SimulationControllerMixin:
 
         planning_grid = self.build_planning_grid_for_robot(
             self.robot,
-            obstacle_points=obstacle_points,
             robot_radius=robot_radius,
         )
 
@@ -1630,16 +1925,11 @@ class SimulationControllerMixin:
         resolution = float(self.config.grid_resolution)
         robot_radius = self.safety_radius_for_robot(robot)
 
-        obstacle_points, _ = self.sanitize_planner_obstacle_points(
-            list(self.mapped_obstacle_points),
-            start_xy=(float(start_xy[0]), float(start_xy[1])),
-            robot_radius=robot_radius,
-            resolution=resolution,
-        )
-
+        # NEW runtime path: no dynamic points for a known-goal single-robot
+        # plan (matches today's characterized behavior -- this call site
+        # never included other robots even before this migration).
         planning_grid = self.build_planning_grid_for_robot(
             robot,
-            obstacle_points=obstacle_points,
             robot_radius=robot_radius,
         )
 
@@ -2303,7 +2593,18 @@ class SimulationControllerMixin:
         dynamic_points = self.dynamic_robot_obstacle_points_for_robot(robot_index)
         resolution = float(self.config.grid_resolution)
         robot_radius = float(self.safety_radius_for_robot(robot))
-        obstacle_points, removed = self.sanitize_planner_obstacle_points(
+
+        # Computed only for the diagnostic "ignored N own-start obstacle
+        # sample(s)" message below -- the actual planning grid now goes
+        # through the NEW runtime path (build_planning_grid_for_robot()
+        # called WITHOUT obstacle_points, WITH dynamic_obstacle_points),
+        # which sanitizes the static and dynamic geometry again internally,
+        # separately (see _planning_costmap_inputs_for_robot()). Sanitizing
+        # the union here vs. sanitizing each part separately there produces
+        # the same removed count and the same kept points either way --
+        # sanitize_planner_obstacle_points() is a pure, per-point distance
+        # filter, unaffected by what else shares the list.
+        _, removed = self.sanitize_planner_obstacle_points(
             list(self.mapped_obstacle_points) + dynamic_points,
             start_xy=start_xy,
             robot_radius=robot_radius,
@@ -2315,8 +2616,8 @@ class SimulationControllerMixin:
 
         planning_grid = self.build_planning_grid_for_robot(
             robot,
-            obstacle_points=obstacle_points,
             robot_radius=robot_radius,
+            dynamic_obstacle_points=tuple(dynamic_points),
         )
 
         kwargs = dict(
@@ -4274,8 +4575,54 @@ class SimulationControllerMixin:
             return f"{reason}\nStatus: {status}"
         return reason or status or "--"
 
+    def logical_exploration_viewport_bounds(self) -> tuple[float, float, float, float]:
+        """The user-configured metric ROI: left, right, bottom, top of the
+        camera_center_x/y +/- camera_width/height/2 rectangle -- see
+        config.camera_viewport_bounds()'s docstring. Independent of any
+        canvas render state (theme, resize, the render-only aspect-ratio-
+        fit viewport, editor pan/zoom): only an explicit camera_width/
+        camera_height/camera_center_x/camera_center_y change moves this.
+        """
+        return camera_viewport_bounds(
+            self.config.camera_center_x,
+            self.config.camera_center_y,
+            self.config.camera_width,
+            self.config.camera_height,
+        )
+
     def estimated_explored_percent(self) -> float:
-        return self.ensure_belief_map().stats().coverage_percent
+        """Percent of the logical viewport (see
+        logical_exploration_viewport_bounds()) currently known FREE.
+
+        BeliefMapStats.coverage_percent (free_cells / total_cells) is NOT
+        used directly here because belief_map.grid always spans the full
+        WORLD_X/Y extent, not the user-configured camera viewport -- using
+        it as-is would silently ignore a narrower/wider configured
+        viewport entirely, and reading `total_cells` from the render
+        viewport instead would make this move on resize/theme/aspect-fit,
+        none of which represent real exploration progress. This replicates
+        the exact same FREE-cell-counting criterion, just restricted to
+        the belief cells whose centers fall inside the logical viewport
+        rectangle -- resolved via the same clamped cell-index-range
+        pattern SimulationCanvas._grid_overlay_cell_bounds() uses for
+        culling, so it stays a fast vectorized numpy slice rather than a
+        per-cell Python loop.
+        """
+        belief = self.ensure_belief_map()
+        left, right, bottom, top = self.logical_exploration_viewport_bounds()
+
+        col_start = max(0, int(math.floor((left - belief.x_min) / belief.resolution)))
+        col_end = min(belief.width - 1, int(math.ceil((right - belief.x_min) / belief.resolution)))
+        row_start = max(0, int(math.floor((bottom - belief.y_min) / belief.resolution)))
+        row_end = min(belief.height - 1, int(math.ceil((top - belief.y_min) / belief.resolution)))
+
+        if col_start > col_end or row_start > row_end:
+            return 0.0
+
+        roi = belief.grid[row_start:row_end + 1, col_start:col_end + 1]
+        total = int(roi.size)
+        free = int(np.count_nonzero(roi == FREE))
+        return 100.0 * free / max(1, total)
 
     def point_inside_ground_truth_obstacle(self, point: tuple[float, float]) -> bool:
         """Return True if a world point is inside a scenario obstacle.
@@ -4380,7 +4727,7 @@ class SimulationControllerMixin:
             ("Belief OCCUPIED cells", str(stats.occupied_cells)),
             ("Belief UNKNOWN cells", str(stats.unknown_cells)),
             ("Belief known cells", str(stats.known_cells)),
-            ("Belief coverage of rectangle", f"{stats.coverage_percent:.1f}%"),
+            ("Belief coverage of rectangle", f"{self.estimated_explored_percent():.1f}%"),
             ("Free-space coverage", f"{self.estimated_free_space_coverage_percent():.1f}%"),
             ("Revisited free cells", str(stats.revisited_cells)),
             ("Revisit ratio", f"{100.0 * stats.revisit_ratio:.1f}%"),
@@ -4632,11 +4979,12 @@ class SimulationControllerMixin:
         # so average_seen_penalty()/stats() (revisit_ratio, etc.) read the
         # exact historical values instead of whatever the live run had
         # accumulated past this point.
-        belief.grid = grid
-        belief.explored_by_robot = explored
-        belief.visit_count = visit_count
-        belief.last_seen = last_seen
-        belief.revision += 1
+        belief.restore_grid_state(
+            grid=grid,
+            explored_by_robot=explored,
+            visit_count=visit_count,
+            last_seen=last_seen,
+        )
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
         self.sync_legacy_map_views_from_belief()
@@ -4732,12 +5080,11 @@ class SimulationControllerMixin:
         # 5. mapped_obstacle_points is append-only at runtime (see
         # update_sensed_obstacles()), so truncating to the snapshot's own
         # count reproduces the exact boundary-sample set known at capture
-        # time without needing to store the points themselves.
-        count = max(0, int(snapshot.mapped_obstacle_points_count))
-        self.mapped_obstacle_points = list(self.mapped_obstacle_points[:count])
-        self.mapped_obstacle_point_keys = {
-            (round(float(p[0]), 3), round(float(p[1]), 3)) for p in self.mapped_obstacle_points
-        }
+        # time without needing to store the points themselves. See
+        # _truncate_mapped_obstacle_points() for the mapped_obstacle_
+        # revision policy this applies (bumped once iff content changed,
+        # never `revision = count`).
+        self._truncate_mapped_obstacle_points(int(snapshot.mapped_obstacle_points_count))
 
         # 6. Cosmetic trails. The bounded sensor-sweep polygon list itself
         # (self.explored_area_polygons, capped to EXPLORED_POLYGON_HISTORY_
@@ -4750,6 +5097,19 @@ class SimulationControllerMixin:
         # sensor sweeps recorded after this point paint on top of the seed
         # as usual. The executed-path trail has no equivalent authoritative
         # source to reseed from, so it resets to the single restored point.
+        #
+        # clear_explored_area_geometry() also drops any continuous FoV-
+        # sweep QPainterPath geometry the canvas built up before this
+        # restore (see canvas._explored_area_paths_by_robot) -- navigation-
+        # debug snapshots do not store that continuous geometry, only the
+        # discrete belief.explored_by_robot mask, so there is nothing to
+        # rebuild it from. A restored run therefore falls back to the
+        # discrete mask's grid-cell-quantized rendering (exactly like
+        # 31a1e4b's behavior) until new live sweeps rebuild smooth
+        # geometry going forward. Legacy snapshots preserve full LOGICAL
+        # coverage (nothing is actually un-explored) but not continuous
+        # geometric fidelity -- never invent smooth paths from cells.
+        self.canvas.clear_explored_area_geometry()
         self.explored_area_polygons = []
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_explored_area_seed(explored, float(frame.resolution), belief.bounds)
@@ -5563,9 +5923,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
@@ -5705,9 +6066,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.record_explored_area(force=True)
         self.update_sensed_obstacles(force_status=False)
         self.force_robot_pose_free_in_belief(None)
@@ -5807,9 +6169,10 @@ class SimulationControllerMixin:
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
-        # A previous run's restore must not leak its seeded explored-area
-        # coverage into this fresh one.
-        self.canvas.clear_explored_area_seed()
+        # A previous run's BeliefMap must never leak its seeded
+        # explored-area coverage into this fresh one -- point the canvas at
+        # THIS run's new (empty) belief_map.explored_by_robot mask instead.
+        self._publish_explored_area_source_to_canvas()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
 
@@ -6477,6 +6840,8 @@ class SimulationControllerMixin:
                 (round(float(p[0]), 3), round(float(p[1]), 3))
                 for p in self.mapped_obstacle_points
             }
+        if not hasattr(self, "mapped_obstacle_revision"):
+            self.mapped_obstacle_revision = 0
 
         spacing = max(float(self.config.mapping_point_spacing), 0.015)
         quantization = spacing
@@ -6515,6 +6880,7 @@ class SimulationControllerMixin:
         _record_perf(self, "obstacle_extract", time.perf_counter() - _obstacle_extract_perf_start)
 
         if newly_mapped:
+            self.mapped_obstacle_revision += 1
             _belief_update_perf_start = time.perf_counter()
             changed_cells = belief.mark_occupied_points(
                 newly_mapped,
@@ -7558,15 +7924,30 @@ class SimulationControllerMixin:
     # loops are untouched; call these from the new architecture incrementally.
     # ========================================================
 
-    def ensure_planner_services(self):
+    def ensure_planner_services(self, robot=None):
         """Return the shared PlannerServices instance, creating it if needed.
 
-        Refreshes is_candidate_reachable on every call so exploration target
-        selection always checks against the current robot pose and map --
-        see make_exploration_reachability_check(). The callback itself is
-        now LAZY (see that method's docstring): this call only captures a
-        snapshot of robot pose/config, it does not sanitize obstacles or
-        build a planning grid.
+        Refreshes is_candidate_reachable AND planning_grid_provider on every
+        call so exploration target selection always checks against the
+        current robot pose and map -- see make_exploration_reachability_
+        check() and _planning_grid_provider_for_robot(). Both are LAZY (see
+        their own docstrings): this call only captures a snapshot of robot
+        pose/config and builds a closure, it does not sanitize obstacles or
+        build a planning grid itself.
+
+        robot -- explicit target robot for this refresh. Defaults to
+        self.robot (single-robot compat: the sole existing call site,
+        simulation_step(), keeps calling this with no argument). A
+        multi-robot caller that loops over self.robots and calls
+        agent.step() once per robot MUST pass that robot explicitly here,
+        right before each agent.step() call -- self.robot is only ever ONE
+        of possibly several robots and does not track "the robot this
+        iteration is for", so relying on it there would silently hand every
+        robot's agent.step() a provider (and reachability check) built for
+        the same wrong robot. The PlannerServices instance itself stays
+        shared/reused across robots either way (never one per robot) --
+        only its two callbacks are refreshed per call, exactly like the
+        single-robot case.
 
         planner_services_refresh_ms times this ENTIRE method as a single
         top-level section for the optional [PERF] summary -- diagnosis-only
@@ -7577,24 +7958,55 @@ class SimulationControllerMixin:
         measures only the remaining cheap snapshot/closure-creation work --
         see make_exploration_reachability_check()'s own docstring for where
         the (now lazy) nested sub-timings are recorded instead. Reading/
-        recording this timing never changes what is_candidate_reachable
-        does or how often this method is called.
+        recording this timing never changes what is_candidate_reachable/
+        planning_grid_provider do or how often this method is called.
         """
         if PlannerServices is None:
             return None
         if not hasattr(self, "_planner_services") or self._planner_services is None:
             self._planner_services = PlannerServices()
         _refresh_start = time.perf_counter()
-        self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(
-            getattr(self, "robot", None)
-        )
+        target_robot = robot if robot is not None else getattr(self, "robot", None)
+        self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(target_robot)
+        self._planner_services.planning_grid_provider = self._planning_grid_provider_for_robot(target_robot)
         _record_perf(self, "planner_services_refresh", time.perf_counter() - _refresh_start)
         return self._planner_services
 
+    def _planning_grid_provider_for_robot(self, robot):
+        """Build a LAZY Callable[[], OccupancyGrid] for PlannerServices.
+        planning_grid_provider -- closes over robot, does nothing until
+        actually called, and every call routes through the same
+        build_planning_grid_for_robot() adapter build_planner_kwargs()/
+        select_navigation_goal() use (never obstacle_points=, so it always
+        takes the NEW PlanningCostmapBuilder-backed path): static observed
+        geometry sanitized for THIS robot, other-runtime-robot dynamic
+        points, observed hazard, and the same padding/radius. None when
+        there is no live robot, mirroring make_exploration_reachability_
+        check()'s own None-when-no-robot behavior -- callers must check for
+        None before calling.
+        """
+        if robot is None:
+            return None
+
+        def _provider():
+            return self.build_planning_grid_for_robot(
+                robot,
+                robot_radius=self.safety_radius_for_robot(robot),
+                dynamic_obstacle_points=self._dynamic_obstacle_points_for_robot_object(robot),
+            )
+
+        return _provider
+
     def make_exploration_reachability_check(self, robot):
         """Build an is_candidate_reachable(xy) callback for PlannerServices,
-        backed by the SAME planning grid (belief + dense mapped-obstacle
-        samples, robot-radius padded) real single-robot navigation A* uses.
+        backed by the SAME layered composition (belief + this robot's own
+        sanitized static observed geometry + other-runtime-robot dynamic
+        points, when robot is part of self.robots + observed hazard,
+        robot-radius padded) real navigation A* uses for this robot -- see
+        _dynamic_obstacle_points_for_robot_object(). Not necessarily the
+        SAME OccupancyGrid object as whatever the planner itself built this
+        tick (each is constructed independently), but the same layers, the
+        same padding, and the same per-robot sanitization.
 
         This is what lets FoV-aware target selection reject a candidate the
         real planner would immediately fail on with "no path found",
@@ -7650,20 +8062,21 @@ class SimulationControllerMixin:
         def _build_context() -> None:
             _context_build_start = time.perf_counter()
 
+            # Same other-runtime-robot dynamic points build_planner_kwargs_
+            # for_multi_robot() uses for this robot -- empty in single-robot
+            # mode (see _dynamic_obstacle_points_for_robot_object()). This
+            # is the fix for the previously-confirmed gap: reachability
+            # used to never include other robots at all, while the
+            # multi-robot planner did.
             _obstacle_prepare_start = time.perf_counter()
-            obstacle_points, _ = self.sanitize_planner_obstacle_points(
-                list(self.mapped_obstacle_points),
-                start_xy=start_xy,
-                robot_radius=robot_radius,
-                resolution=resolution,
-            )
+            dynamic_points = self._dynamic_obstacle_points_for_robot_object(robot)
             _record_perf(self, "reachability_obstacle_prepare", time.perf_counter() - _obstacle_prepare_start)
 
             _grid_build_start = time.perf_counter()
             planning_grid = self.build_planning_grid_for_robot(
                 robot,
-                obstacle_points=obstacle_points,
                 robot_radius=robot_radius,
+                dynamic_obstacle_points=dynamic_points,
             )
             _record_perf(self, "reachability_grid_build", time.perf_counter() - _grid_build_start)
 
@@ -7789,7 +8202,7 @@ class SimulationControllerMixin:
         form the new "engine as executor" contract:
 
             observation = self.build_observation(robot, agent, idx)
-            decision    = agent.step(observation, self.ensure_planner_services(), dt)
+            decision    = agent.step(observation, self.ensure_planner_services(robot), dt)
             should_brake = self.apply_navigation_decision(robot, agent, decision)
 
         Integration notes

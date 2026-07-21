@@ -69,6 +69,19 @@ def _make_fake_engine(*, monitor: PerfMonitor | None = None) -> SimpleNamespace:
         return list(points), 0
 
     def _fake_build_grid(robot, **kwargs):
+        # The real build_planning_grid_for_robot() now sanitizes internally
+        # (see engine.py's _planning_costmap_inputs_for_robot()) instead of
+        # the caller sanitizing first and passing obstacle_points= in --
+        # this stub replicates that one observable call so the existing
+        # sanitize_planner_obstacle_points_calls-based assertions below
+        # (content and count) still pin the same "when does the expensive
+        # work happen" behavior this file is about.
+        fake.sanitize_planner_obstacle_points(
+            list(fake.mapped_obstacle_points),
+            start_xy=(float(robot.x), float(robot.y)),
+            robot_radius=kwargs.get("robot_radius"),
+            resolution=float(fake.config.grid_resolution),
+        )
         fake.build_planning_grid_for_robot_calls.append((robot, kwargs))
         return object()
 
@@ -76,7 +89,21 @@ def _make_fake_engine(*, monitor: PerfMonitor | None = None) -> SimpleNamespace:
     fake.build_planning_grid_for_robot = _fake_build_grid
     if monitor is not None:
         fake.ensure_perf_monitor = lambda: monitor
-    for name in ("ensure_planner_services", "make_exploration_reachability_check"):
+    for name in (
+        "ensure_planner_services",
+        "make_exploration_reachability_check",
+        # Real, not stubbed: it is a cheap self.robots lookup (no belief/
+        # sanitize/grid work of its own -- see its own docstring), and this
+        # fake has no "robots" attribute at all, so it always resolves to
+        # the single-robot case (empty dynamic points) without needing any
+        # extra fixture state.
+        "_dynamic_obstacle_points_for_robot_object",
+        # Real, not stubbed: ensure_planner_services() now also refreshes
+        # PlannerServices.planning_grid_provider via this factory. It only
+        # returns a closure (or None) -- it never builds a grid itself --
+        # so binding it here adds no grid/belief work to this fixture.
+        "_planning_grid_provider_for_robot",
+    ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     return fake
 
@@ -294,6 +321,10 @@ def _make_real_fake_engine(*, obstacles: list[tuple[float, float, float, float]]
         "ensure_belief_map",
         "sanitize_planner_obstacle_points",
         "build_planning_grid_for_robot",
+        "_dynamic_obstacle_points_for_robot_object",
+        "_planning_costmap_inputs_for_robot",
+        "_planning_grid_from_costmap_snapshot",
+        "observed_obstacle_snapshot",
     ):
         setattr(fake, name, getattr(SimulationControllerMixin, name).__get__(fake))
     return fake

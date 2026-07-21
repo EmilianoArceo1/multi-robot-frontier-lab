@@ -15,15 +15,22 @@ Determinism contract (see run_experiment.py for where this is invoked):
      "deterministic_fingerprint" key itself and "diagnostics.wall_clock_ms"
      (if present) before hashing, so neither the field nor a wall-clock
      timing value can ever affect the hash.
-  4. Replace deterministic_fingerprint with the computed value and write
-     the final dict.
+  4. Replace deterministic_fingerprint with the computed value.
+
+run_static_allocation_benchmark() performs steps 1-4 itself via
+finalize_experiment_record() before returning, so every ExperimentRecord
+that leaves that function already carries a real 64-hex-character
+fingerprint -- never the "" placeholder. write_experiment_record() then
+calls finalize_record_json() (steps 2-4 again, producing the JSON-safe
+dict to write) which recomputes the same value, since step 3 never reads
+the incoming deterministic_fingerprint.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 SCHEMA_VERSION = "1.0"
@@ -254,3 +261,19 @@ def finalize_record_json(record: ExperimentRecord) -> dict[str, Any]:
     fingerprint = compute_fingerprint(json_dict)
     json_dict["deterministic_fingerprint"] = fingerprint
     return json_dict
+
+
+def finalize_experiment_record(record: ExperimentRecord) -> ExperimentRecord:
+    """Return a new ExperimentRecord equal to `record` except with a real,
+    64-hex-character deterministic_fingerprint computed over its
+    deterministic JSON payload (see finalize_record_json/compute_fingerprint).
+
+    This is the one place run_static_allocation_benchmark() should call
+    before returning a record -- callers must never see a record whose
+    deterministic_fingerprint is the "" placeholder. `record`'s own
+    deterministic_fingerprint (whatever it is) is ignored as input, exactly
+    like finalize_record_json().
+    """
+    json_dict = record_to_json_dict(record)
+    fingerprint = compute_fingerprint(json_dict)
+    return replace(record, deterministic_fingerprint=fingerprint)

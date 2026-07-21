@@ -323,11 +323,16 @@ def euclidean_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def _select_component_target(component: ScenarioFrontierComponent) -> tuple[float, float] | None:
+def component_assignment_target(component: ScenarioFrontierComponent) -> tuple[float, float] | None:
     """Target selection rule (fixed, documented in the task brief):
     1. first viewpoint, in scenario order, if any;
     2. else centroid, if present;
-    3. else no candidate for this component."""
+    3. else no candidate for this component.
+
+    Public so callers outside this module (see experiments/run_experiment.py's
+    provenance validation of ASSIGNED results) derive a component's target
+    with the exact same rule StaticFrontierProvider uses to build candidates,
+    instead of re-implementing it."""
     if component.viewpoints:
         return component.viewpoints[0]
     if component.centroid is not None:
@@ -367,7 +372,7 @@ class StaticFrontierProvider:
         for component in self._components:
             if not component.valid:
                 continue
-            target = _select_component_target(component)
+            target = component_assignment_target(component)
             if target is None:
                 continue
             if self._is_blocked(target, blocked_targets):

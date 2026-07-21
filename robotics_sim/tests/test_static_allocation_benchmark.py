@@ -24,11 +24,15 @@ import pytest
 
 from experiments.records import record_to_json_dict
 from experiments.run_experiment import (
+    _build_assignment_and_hold_records,
+    _compute_metrics,
     load_scenario,
     run_static_allocation_benchmark,
     write_experiment_record,
 )
-from experiments.static_services import ScenarioConfigError, scenario_from_dict
+from experiments.static_services import ScenarioConfigError, StaticScenario, scenario_from_dict
+from robotics_interfaces.coordination import CoordinationAssignment, CoordinationResult
+from robotics_interfaces.proposals import ExplorationCandidate
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAPID_ALLOCATION_CONFIG = REPO_ROOT / "experiments" / "configs" / "rapid_allocation.json"
@@ -564,3 +568,211 @@ def test_final_json_contains_schema_version_and_fingerprint_and_only_json_safe_t
     finally:
         if output_path.exists():
             output_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# 33-34. run_static_allocation_benchmark() itself returns a real, non-empty
+#    fingerprint that reacts to the seed (see experiments/records.py's
+#    finalize_experiment_record()).
+# ---------------------------------------------------------------------------
+
+
+def test_run_static_allocation_benchmark_returns_a_real_fingerprint():
+    scenario = scenario_from_dict(_base_scenario_dict())
+
+    record = run_static_allocation_benchmark(scenario)
+
+    assert len(record.deterministic_fingerprint) == 64
+    int(record.deterministic_fingerprint, 16)  # valid hex
+
+
+def test_run_static_allocation_benchmark_fingerprint_changes_with_seed():
+    data_a = _base_scenario_dict()
+    data_b = copy.deepcopy(data_a)
+    data_b["seed"] = data_a["seed"] + 1
+
+    record_a = run_static_allocation_benchmark(scenario_from_dict(data_a))
+    record_b = run_static_allocation_benchmark(scenario_from_dict(data_b))
+
+    assert record_a.deterministic_fingerprint != record_b.deterministic_fingerprint
+
+
+# ---------------------------------------------------------------------------
+# 35-42. Provenance validation of ASSIGNED results in
+#    _build_assignment_and_hold_records(), exercised with a small, explicit
+#    fake CoordinationResult built from the real robotics_interfaces
+#    dataclasses -- no new plugin needed for these (see this file's module
+#    docstring).
+# ---------------------------------------------------------------------------
+
+
+def _provenance_test_scenario() -> StaticScenario:
+    return scenario_from_dict(_base_scenario_dict())
+
+
+def _record_for(records, robot_id):
+    return next(item for item in records if item.robot_id == robot_id)
+
+
+def test_assigned_with_no_proposal_is_rejected():
+    scenario = _provenance_test_scenario()
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=None),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert assignments == []
+    assert problems != []
+    assert _record_for(holds, 0).decision == "FAILED"
+    assert len(assignments) + len(holds) == len(scenario.robots)
+
+
+def test_assigned_with_proposal_missing_cluster_id_is_rejected():
+    scenario = _provenance_test_scenario()
+    proposal = ExplorationCandidate(target=(1.2, 4.2), metadata={})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert assignments == []
+    assert problems != []
+    assert _record_for(holds, 0).decision == "FAILED"
+
+
+def test_assigned_with_unknown_cluster_id_is_rejected():
+    scenario = _provenance_test_scenario()
+    proposal = ExplorationCandidate(target=(1.2, 4.2), metadata={"cluster_id": "does-not-exist"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert assignments == []
+    assert problems != []
+    assert _record_for(holds, 0).decision == "FAILED"
+
+
+def test_assigned_with_invalid_component_cluster_id_is_rejected():
+    """f3 in the shipped scenario has valid=False -- its target must never
+    be accepted even though the component itself exists."""
+    scenario = _provenance_test_scenario()
+    proposal = ExplorationCandidate(target=(-3.25, -3.0), metadata={"cluster_id": "f3"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(-3.25, -3.0), reason="r", proposal=proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert assignments == []
+    assert problems != []
+    assert _record_for(holds, 0).decision == "FAILED"
+
+
+def test_assigned_with_valid_cluster_id_but_mismatched_target_is_rejected():
+    scenario = _provenance_test_scenario()
+    proposal = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(99.0, 99.0), reason="r", proposal=proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert assignments == []
+    assert problems != []
+    assert _record_for(holds, 0).decision == "FAILED"
+
+
+def test_assigned_with_valid_cluster_id_and_matching_target_is_accepted():
+    scenario = _provenance_test_scenario()
+    proposal = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert problems == []
+    assert len(assignments) == 1
+    assert assignments[0].cluster_id == "f1"
+    assert assignments[0].robot_id == 0
+
+
+def test_malformed_assignment_preserves_robot_count_invariant():
+    scenario = _provenance_test_scenario()
+    good_proposal = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=good_proposal
+            ),
+            CoordinationAssignment(
+                robot_id=1, status="ASSIGNED", target=(4.25, 2.0), reason="r", proposal=None
+            ),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="no candidates"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+    metrics = _compute_metrics(assignments, holds, tolerance=1e-6)
+
+    assert problems != []
+    assert metrics.assigned_robot_count == 1
+    assert metrics.unassigned_robot_count == 2
+    assert metrics.assigned_robot_count + metrics.unassigned_robot_count == len(scenario.robots)
+    assert _record_for(holds, 1).decision == "FAILED"
+
+
+def test_problems_appear_in_deterministic_robot_id_order():
+    scenario = _provenance_test_scenario()
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(robot_id=2, status="ASSIGNED", target=(0.0, 0.0), reason="r", proposal=None),
+            CoordinationAssignment(robot_id=0, status="ASSIGNED", target=(0.0, 0.0), reason="r", proposal=None),
+            CoordinationAssignment(robot_id=1, status="ASSIGNED", target=(0.0, 0.0), reason="r", proposal=None),
+        )
+    )
+
+    _, _, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert len(problems) == 3
+    assert problems[0].startswith("robot 0:")
+    assert problems[1].startswith("robot 1:")
+    assert problems[2].startswith("robot 2:")

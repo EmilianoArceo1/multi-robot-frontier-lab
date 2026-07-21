@@ -32,7 +32,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from experiments.records import (
     SCHEMA_VERSION,
@@ -40,6 +40,7 @@ from experiments.records import (
     AssignmentRecord,
     ExperimentRecord,
     HoldRecord,
+    finalize_experiment_record,
     finalize_record_json,
 )
 from experiments.static_services import (
@@ -48,6 +49,7 @@ from experiments.static_services import (
     StaticFrontierProvider,
     StaticScenario,
     build_coordination_request,
+    component_assignment_target,
     euclidean_distance,
     scenario_from_dict,
 )
@@ -85,29 +87,97 @@ def _robots_by_id(scenario: StaticScenario) -> dict[int, Any]:
     return {robot.robot_id: robot for robot in scenario.robots}
 
 
-def _valid_component_ids(scenario: StaticScenario) -> set[str]:
-    return {component.cluster_id for component in scenario.frontier_components if component.valid}
+def _valid_component_target_by_id(scenario: StaticScenario) -> dict[str, tuple[float, float]]:
+    """cluster_id -> derived target, for every valid=True component that has
+    one (see static_services.component_assignment_target() -- the single
+    place this selection rule is implemented). A cluster_id absent from this
+    dict is not assignable: either it names an invalid component or one with
+    no derivable target, which this benchmark treats identically."""
+    result: dict[str, tuple[float, float]] = {}
+    for component in scenario.frontier_components:
+        if not component.valid:
+            continue
+        target = component_assignment_target(component)
+        if target is None:
+            continue
+        result[component.cluster_id] = target
+    return result
+
+
+def _validate_assignment_provenance(
+    assignment: Any,
+    *,
+    valid_targets_by_cluster_id: Mapping[str, tuple[float, float]],
+    tolerance: float,
+) -> tuple[str | None, str | None]:
+    """Verify that an ASSIGNED CoordinationAssignment can be traced back to
+    a valid=True scenario frontier component's derived target.
+
+    Returns (cluster_id, None) on success, or (None, problem) when the
+    assignment's provenance cannot be verified. Never raises -- a malformed
+    assignment is a soft benchmark outcome (drives ExperimentRecord.success),
+    not a runner bug.
+    """
+    if assignment.target is None:
+        return None, f"robot {assignment.robot_id}: status ASSIGNED but target is None"
+
+    proposal = assignment.proposal
+    if proposal is None:
+        return None, (
+            f"robot {assignment.robot_id}: status ASSIGNED but proposal is None -- "
+            "target has no verifiable provenance"
+        )
+
+    metadata = getattr(proposal, "metadata", None) or {}
+    cluster_id = metadata.get("cluster_id")
+    if not isinstance(cluster_id, str) or not cluster_id:
+        return None, f"robot {assignment.robot_id}: proposal.metadata is missing a non-empty 'cluster_id'"
+
+    expected_target = valid_targets_by_cluster_id.get(cluster_id)
+    if expected_target is None:
+        return None, (
+            f"robot {assignment.robot_id}: cluster_id {cluster_id!r} is not a currently valid "
+            "frontier component with a derivable target"
+        )
+
+    if euclidean_distance(assignment.target, expected_target) > tolerance:
+        got = (float(assignment.target[0]), float(assignment.target[1]))
+        return None, (
+            f"robot {assignment.robot_id}: assigned target {got!r} does not match the target "
+            f"{expected_target!r} derived from cluster_id {cluster_id!r}"
+        )
+
+    return cluster_id, None
 
 
 def _build_assignment_and_hold_records(
-    result: Any, scenario: StaticScenario
+    result: Any, scenario: StaticScenario, *, tolerance: float
 ) -> tuple[list[AssignmentRecord], list[HoldRecord], list[str]]:
     """Normalize a CoordinationResult into (assignments, holds, problems).
 
-    problems is non-empty exactly when "CoordinationResult pudo
-    normalizarse" / "no hay targets inválidos asignados" fails -- these
-    drive ExperimentRecord.success, they never raise (a raised exception
-    here would be a plugin/runner bug, not a soft benchmark outcome).
+    problems is non-empty exactly when an ASSIGNED result's target
+    provenance cannot be verified against scenario.frontier_components (see
+    _validate_assignment_provenance()) or a robot is missing from the
+    result -- these drive ExperimentRecord.success, they never raise (a
+    raised exception here would be a plugin/runner bug, not a soft
+    benchmark outcome).
+
+    Every robot_id the CoordinationResult reports ends up in exactly one of
+    assignments/holds -- a malformed ASSIGNED entry becomes a HoldRecord
+    with decision="FAILED" rather than silently vanishing, so
+    assigned_robot_count + unassigned_robot_count always accounts for every
+    robot this function has seen.
     """
     robots_by_id = _robots_by_id(scenario)
-    valid_ids = _valid_component_ids(scenario)
+    valid_targets_by_cluster_id = _valid_component_target_by_id(scenario)
 
     assignments: list[AssignmentRecord] = []
     holds: list[HoldRecord] = []
     problems: list[str] = []
     seen_robot_ids: set[int] = set()
 
-    for assignment in result.assignments:
+    ordered_assignments = sorted(result.assignments, key=lambda item: item.robot_id)
+    for assignment in ordered_assignments:
         seen_robot_ids.add(assignment.robot_id)
 
         if assignment.status != "ASSIGNED":
@@ -116,31 +186,22 @@ def _build_assignment_and_hold_records(
             )
             continue
 
-        if assignment.target is None:
-            problems.append(f"robot {assignment.robot_id}: status ASSIGNED but target is None")
-            continue
-
         robot = robots_by_id.get(assignment.robot_id)
         if robot is None:
-            problems.append(f"robot {assignment.robot_id}: ASSIGNED but not present in scenario robots")
+            problem = f"robot {assignment.robot_id}: ASSIGNED but not present in scenario robots"
+            problems.append(problem)
+            holds.append(HoldRecord(robot_id=assignment.robot_id, decision="FAILED", reason=problem))
             continue
 
-        cluster_id: str | None = None
-        information_gain = 0.0
-        proposal = assignment.proposal
-        if proposal is not None:
-            metadata = getattr(proposal, "metadata", None) or {}
-            candidate_cluster_id = metadata.get("cluster_id")
-            if isinstance(candidate_cluster_id, str):
-                cluster_id = candidate_cluster_id
-            information_gain = float(getattr(proposal, "information_gain", 0.0))
+        cluster_id, problem = _validate_assignment_provenance(
+            assignment, valid_targets_by_cluster_id=valid_targets_by_cluster_id, tolerance=tolerance
+        )
+        if problem is not None:
+            problems.append(problem)
+            holds.append(HoldRecord(robot_id=assignment.robot_id, decision="FAILED", reason=problem))
+            continue
 
-        if cluster_id is not None and cluster_id not in valid_ids:
-            problems.append(
-                f"robot {assignment.robot_id}: assigned target belongs to cluster_id {cluster_id!r}, "
-                "which is not a currently valid frontier component"
-            )
-
+        information_gain = float(getattr(assignment.proposal, "information_gain", 0.0))
         assignments.append(
             AssignmentRecord(
                 robot_id=assignment.robot_id,
@@ -219,7 +280,9 @@ def run_static_allocation_benchmark(scenario: StaticScenario) -> ExperimentRecor
 
     result = plugin.assign(request)
 
-    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario)
+    assignments, holds, problems = _build_assignment_and_hold_records(
+        result, scenario, tolerance=duplicate_tolerance
+    )
     metrics = _compute_metrics(assignments, holds, tolerance=duplicate_tolerance)
 
     diagnostics: dict[str, Any] = {}
@@ -229,7 +292,7 @@ def run_static_allocation_benchmark(scenario: StaticScenario) -> ExperimentRecor
     if plugin_debug:
         diagnostics["plugin_debug"] = dict(plugin_debug)
 
-    return ExperimentRecord(
+    record = ExperimentRecord(
         schema_version=SCHEMA_VERSION,
         experiment_id=scenario.experiment_id,
         scenario_id=scenario.scenario_id,
@@ -249,6 +312,7 @@ def run_static_allocation_benchmark(scenario: StaticScenario) -> ExperimentRecor
         success=not problems,
         diagnostics=diagnostics,
     )
+    return finalize_experiment_record(record)
 
 
 # ---------------------------------------------------------------------------

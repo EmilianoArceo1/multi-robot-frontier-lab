@@ -19,6 +19,7 @@ from experiments.records import (
     HoldRecord,
     canonical_json,
     compute_fingerprint,
+    finalize_experiment_record,
     finalize_record_json,
     record_to_json_dict,
 )
@@ -269,3 +270,88 @@ def test_holds_are_sorted_by_robot_id():
     json_dict = record_to_json_dict(record)
 
     assert [item["robot_id"] for item in json_dict["holds"]] == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# 33-36. finalize_experiment_record(): the record-level (not just dict-level)
+#    fingerprint finalization used by run_static_allocation_benchmark().
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_experiment_record_produces_a_real_64_char_fingerprint():
+    record = _sample_record(deterministic_fingerprint="")
+
+    finalized = finalize_experiment_record(record)
+
+    assert len(finalized.deterministic_fingerprint) == 64
+    int(finalized.deterministic_fingerprint, 16)  # valid hex
+    assert finalized.deterministic_fingerprint != ""
+
+
+def test_finalize_experiment_record_is_stable_for_equivalent_records():
+    record_1 = _sample_record(deterministic_fingerprint="")
+    record_2 = _sample_record(deterministic_fingerprint="")
+
+    finalized_1 = finalize_experiment_record(record_1)
+    finalized_2 = finalize_experiment_record(record_2)
+
+    assert finalized_1.deterministic_fingerprint == finalized_2.deterministic_fingerprint
+
+
+def test_finalize_experiment_record_changes_when_an_assignment_changes():
+    record_a = _sample_record(deterministic_fingerprint="")
+    changed_assignment = AssignmentRecord(
+        robot_id=0, target=(9.0, 9.0), cluster_id="f1", decision="ASSIGNED",
+        reason="selected: highest information gain wins", distance=1.0, information_gain=3.5,
+    )
+    record_b = _sample_record(
+        assignments=(changed_assignment, record_a.assignments[1]), deterministic_fingerprint=""
+    )
+
+    fingerprint_a = finalize_experiment_record(record_a).deterministic_fingerprint
+    fingerprint_b = finalize_experiment_record(record_b).deterministic_fingerprint
+
+    assert fingerprint_a != fingerprint_b
+
+
+def test_finalize_experiment_record_changes_when_seed_changes():
+    record_a = _sample_record(seed=17, deterministic_fingerprint="")
+    record_b = _sample_record(seed=18, deterministic_fingerprint="")
+
+    fingerprint_a = finalize_experiment_record(record_a).deterministic_fingerprint
+    fingerprint_b = finalize_experiment_record(record_b).deterministic_fingerprint
+
+    assert fingerprint_a != fingerprint_b
+
+
+def test_finalize_experiment_record_ignores_wall_clock_ms():
+    record_fast = _sample_record(diagnostics={"wall_clock_ms": 1.0}, deterministic_fingerprint="")
+    record_slow = _sample_record(diagnostics={"wall_clock_ms": 987654.0}, deterministic_fingerprint="")
+
+    fingerprint_fast = finalize_experiment_record(record_fast).deterministic_fingerprint
+    fingerprint_slow = finalize_experiment_record(record_slow).deterministic_fingerprint
+
+    assert fingerprint_fast == fingerprint_slow
+
+
+def test_write_experiment_record_recomputes_the_same_fingerprint_already_on_the_record():
+    """write_experiment_record()'s finalize_record_json() step is allowed to
+    recompute the fingerprint, but must never produce a value different from
+    the one finalize_experiment_record() already put on the record."""
+    record = _sample_record(deterministic_fingerprint="")
+    finalized_record = finalize_experiment_record(record)
+
+    rewritten_json = finalize_record_json(finalized_record)
+
+    assert rewritten_json["deterministic_fingerprint"] == finalized_record.deterministic_fingerprint
+
+
+def test_two_real_run_records_are_no_longer_compared_as_empty_strings():
+    """Regression guard for the frozen contract's false positive: a real
+    fingerprint must never be the empty-string placeholder."""
+    record_1 = finalize_experiment_record(_sample_record(deterministic_fingerprint=""))
+    record_2 = finalize_experiment_record(_sample_record(deterministic_fingerprint=""))
+
+    assert record_1.deterministic_fingerprint == record_2.deterministic_fingerprint
+    assert record_1.deterministic_fingerprint != ""
+    assert record_2.deterministic_fingerprint != ""

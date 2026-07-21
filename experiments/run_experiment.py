@@ -150,74 +150,137 @@ def _validate_assignment_provenance(
     return cluster_id, None
 
 
+def _index_result_assignments(
+    result: Any, *, known_robot_ids: set[int]
+) -> tuple[dict[int, list[Any]], list[str]]:
+    """Group result.assignments by robot_id, preserving each robot_id's
+    entries in the order they appear in result.assignments.
+
+    scenario.robots is the sole authority on which robots this benchmark
+    measures -- never result.assignments. An entry whose robot_id is not in
+    known_robot_ids is excluded from the returned index (it must never
+    become an AssignmentRecord/HoldRecord or count toward assigned/
+    unassigned_robot_count) and is instead reported as a problem here, in
+    robot_id order.
+    """
+    by_robot_id: dict[int, list[Any]] = {}
+    unknown_ids: set[int] = set()
+    for assignment in result.assignments:
+        robot_id = assignment.robot_id
+        if robot_id not in known_robot_ids:
+            unknown_ids.add(robot_id)
+            continue
+        by_robot_id.setdefault(robot_id, []).append(assignment)
+
+    problems = [
+        f"robot {robot_id}: CoordinationResult contains an assignment for a robot_id "
+        "not in scenario.robots"
+        for robot_id in sorted(unknown_ids)
+    ]
+    return by_robot_id, problems
+
+
+def _normalize_single_assignment(
+    assignment: Any,
+    robot: Any,
+    *,
+    valid_targets_by_cluster_id: Mapping[str, tuple[float, float]],
+    tolerance: float,
+) -> tuple[AssignmentRecord | None, HoldRecord | None, str | None]:
+    """Normalize the one CoordinationAssignment a scenario robot has (see
+    _build_assignment_and_hold_records -- duplicate/missing entries never
+    reach this function). Returns exactly one of:
+      (AssignmentRecord, None, None)        -- accepted;
+      (None, HoldRecord, None)               -- plugin-reported HOLD/FAILED;
+      (None, HoldRecord, problem)            -- provenance rejected.
+    """
+    if assignment.status != "ASSIGNED":
+        hold = HoldRecord(robot_id=assignment.robot_id, decision=assignment.status, reason=assignment.reason)
+        return None, hold, None
+
+    cluster_id, problem = _validate_assignment_provenance(
+        assignment, valid_targets_by_cluster_id=valid_targets_by_cluster_id, tolerance=tolerance
+    )
+    if problem is not None:
+        hold = HoldRecord(robot_id=assignment.robot_id, decision="FAILED", reason=problem)
+        return None, hold, problem
+
+    information_gain = float(getattr(assignment.proposal, "information_gain", 0.0))
+    record = AssignmentRecord(
+        robot_id=assignment.robot_id,
+        target=(float(assignment.target[0]), float(assignment.target[1])),
+        cluster_id=cluster_id,
+        decision=assignment.status,
+        reason=assignment.reason,
+        distance=euclidean_distance(robot.position, assignment.target),
+        information_gain=information_gain,
+    )
+    return record, None, None
+
+
 def _build_assignment_and_hold_records(
     result: Any, scenario: StaticScenario, *, tolerance: float
 ) -> tuple[list[AssignmentRecord], list[HoldRecord], list[str]]:
     """Normalize a CoordinationResult into (assignments, holds, problems).
 
-    problems is non-empty exactly when an ASSIGNED result's target
-    provenance cannot be verified against scenario.frontier_components (see
-    _validate_assignment_provenance()) or a robot is missing from the
-    result -- these drive ExperimentRecord.success, they never raise (a
-    raised exception here would be a plugin/runner bug, not a soft
-    benchmark outcome).
+    scenario.robots is the sole authority on which robots this benchmark
+    measures -- never result.assignments. This function emits exactly one
+    record (an AssignmentRecord or a HoldRecord) per scenario robot, so
 
-    Every robot_id the CoordinationResult reports ends up in exactly one of
-    assignments/holds -- a malformed ASSIGNED entry becomes a HoldRecord
-    with decision="FAILED" rather than silently vanishing, so
-    assigned_robot_count + unassigned_robot_count always accounts for every
-    robot this function has seen.
+        len(assignments) + len(holds) == len(scenario.robots)
+
+    always holds, regardless of what a malformed CoordinationResult
+    contains:
+      - an entry whose robot_id is not in scenario.robots never becomes a
+        record -- only a problem (see _index_result_assignments());
+      - a scenario robot with zero CoordinationResult entries becomes
+        HoldRecord(decision="FAILED") ("missing");
+      - a scenario robot with two or more entries becomes exactly one
+        HoldRecord(decision="FAILED") ("duplicate") -- no entry is
+        arbitrarily preferred, "first wins"/"last wins" included;
+      - a scenario robot with exactly one entry is normalized by
+        _normalize_single_assignment() (ASSIGNED/HOLD/FAILED + provenance).
+
+    problems never raises (a raised exception here would be a plugin/runner
+    bug, not a soft benchmark outcome) and is built in a fixed order --
+    unknown robot_ids first (sorted), then scenario robots in robot_id
+    order -- so two CoordinationResults whose entries differ only in order
+    produce identical assignments/holds/problems and therefore an identical
+    fingerprint.
     """
     robots_by_id = _robots_by_id(scenario)
     valid_targets_by_cluster_id = _valid_component_target_by_id(scenario)
 
+    by_robot_id, problems = _index_result_assignments(result, known_robot_ids=set(robots_by_id))
+
     assignments: list[AssignmentRecord] = []
     holds: list[HoldRecord] = []
-    problems: list[str] = []
-    seen_robot_ids: set[int] = set()
 
-    ordered_assignments = sorted(result.assignments, key=lambda item: item.robot_id)
-    for assignment in ordered_assignments:
-        seen_robot_ids.add(assignment.robot_id)
+    for robot_id in sorted(robots_by_id):
+        robot = robots_by_id[robot_id]
+        entries = by_robot_id.get(robot_id, [])
 
-        if assignment.status != "ASSIGNED":
-            holds.append(
-                HoldRecord(robot_id=assignment.robot_id, decision=assignment.status, reason=assignment.reason)
-            )
-            continue
-
-        robot = robots_by_id.get(assignment.robot_id)
-        if robot is None:
-            problem = f"robot {assignment.robot_id}: ASSIGNED but not present in scenario robots"
+        if len(entries) > 1:
+            problem = f"CoordinationResult contains duplicate assignments for robot {robot_id}"
             problems.append(problem)
-            holds.append(HoldRecord(robot_id=assignment.robot_id, decision="FAILED", reason=problem))
+            holds.append(HoldRecord(robot_id=robot_id, decision="FAILED", reason=problem))
             continue
 
-        cluster_id, problem = _validate_assignment_provenance(
-            assignment, valid_targets_by_cluster_id=valid_targets_by_cluster_id, tolerance=tolerance
+        if not entries:
+            problem = f"CoordinationResult is missing an assignment for robot {robot_id}"
+            problems.append(problem)
+            holds.append(HoldRecord(robot_id=robot_id, decision="FAILED", reason=problem))
+            continue
+
+        assignment_record, hold_record, problem = _normalize_single_assignment(
+            entries[0], robot, valid_targets_by_cluster_id=valid_targets_by_cluster_id, tolerance=tolerance
         )
         if problem is not None:
             problems.append(problem)
-            holds.append(HoldRecord(robot_id=assignment.robot_id, decision="FAILED", reason=problem))
-            continue
-
-        information_gain = float(getattr(assignment.proposal, "information_gain", 0.0))
-        assignments.append(
-            AssignmentRecord(
-                robot_id=assignment.robot_id,
-                target=(float(assignment.target[0]), float(assignment.target[1])),
-                cluster_id=cluster_id,
-                decision=assignment.status,
-                reason=assignment.reason,
-                distance=euclidean_distance(robot.position, assignment.target),
-                information_gain=information_gain,
-            )
-        )
-
-    requested_ids = {robot.robot_id for robot in scenario.robots}
-    missing_ids = sorted(requested_ids - seen_robot_ids)
-    if missing_ids:
-        problems.append(f"CoordinationResult is missing assignments for robot_id(s): {missing_ids}")
+        if assignment_record is not None:
+            assignments.append(assignment_record)
+        if hold_record is not None:
+            holds.append(hold_record)
 
     return assignments, holds, problems
 

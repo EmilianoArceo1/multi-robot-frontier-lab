@@ -22,7 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from experiments.records import record_to_json_dict
+from experiments.records import (
+    SCHEMA_VERSION,
+    ExperimentRecord,
+    finalize_experiment_record,
+    record_to_json_dict,
+)
 from experiments.run_experiment import (
     _build_assignment_and_hold_records,
     _compute_metrics,
@@ -776,3 +781,237 @@ def test_problems_appear_in_deterministic_robot_id_order():
     assert problems[0].startswith("robot 0:")
     assert problems[1].startswith("robot 1:")
     assert problems[2].startswith("robot 2:")
+
+
+# ---------------------------------------------------------------------------
+# 43-50. Normalizing a CoordinationResult by scenario.robots -- the sole
+#    authority on which robots this benchmark measures. Missing, unknown,
+#    and duplicate robot_id entries must never break
+#    len(assignments) + len(holds) == len(scenario.robots).
+# ---------------------------------------------------------------------------
+
+
+def _finalized_record_from_result(scenario, result, *, tolerance: float = 1e-6) -> ExperimentRecord:
+    """Build the same ExperimentRecord run_static_allocation_benchmark()
+    would, but from a hand-built CoordinationResult instead of a real
+    plugin call -- lets these tests exercise normalization end to end
+    (including success/diagnostics/fingerprint) without a fake plugin."""
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=tolerance)
+    metrics = _compute_metrics(assignments, holds, tolerance=tolerance)
+    diagnostics = {"problems": list(problems)} if problems else {}
+    record = ExperimentRecord(
+        schema_version=SCHEMA_VERSION,
+        experiment_id=scenario.experiment_id,
+        scenario_id=scenario.scenario_id,
+        algorithm=scenario.algorithm,
+        seed=scenario.seed,
+        robot_count=len(scenario.robots),
+        raw_frontier_components=len(scenario.frontier_components),
+        valid_frontier_components=sum(1 for c in scenario.frontier_components if c.valid),
+        assignments=tuple(assignments),
+        holds=tuple(holds),
+        duplicate_target_count=metrics.duplicate_target_count,
+        assigned_robot_count=metrics.assigned_robot_count,
+        unassigned_robot_count=metrics.unassigned_robot_count,
+        total_assignment_distance=metrics.total_assignment_distance,
+        mean_assignment_distance=metrics.mean_assignment_distance,
+        blocked_assignment_count=metrics.blocked_assignment_count,
+        success=not problems,
+        diagnostics=diagnostics,
+    )
+    return finalize_experiment_record(record)
+
+
+def test_missing_scenario_robot_becomes_failed_hold_and_preserves_count():
+    """robots 0, 1, 2 in the scenario; the result only has entries for 0
+    and 1 -- robot 2 must surface as a FAILED hold, not vanish."""
+    scenario = _provenance_test_scenario()
+    proposal_0 = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    proposal_1 = ExplorationCandidate(target=(4.25, 2.0), information_gain=2.0, metadata={"cluster_id": "f0"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=proposal_0
+            ),
+            CoordinationAssignment(
+                robot_id=1, status="ASSIGNED", target=(4.25, 2.0), reason="r", proposal=proposal_1
+            ),
+        )
+    )
+
+    record = _finalized_record_from_result(scenario, result)
+
+    assert record.assigned_robot_count + record.unassigned_robot_count == record.robot_count == 3
+    assert _record_for(record.holds, 2).decision == "FAILED"
+    assert record.success is False
+
+
+def test_unknown_robot_id_is_excluded_from_records_and_metrics():
+    scenario = _provenance_test_scenario()
+    proposal_0 = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=proposal_0
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=99, status="ASSIGNED", target=(0.0, 0.0), reason="r", proposal=None),
+        )
+    )
+
+    record = _finalized_record_from_result(scenario, result)
+
+    seen_ids = {item.robot_id for item in record.assignments} | {item.robot_id for item in record.holds}
+    assert 99 not in seen_ids
+    assert record.assigned_robot_count + record.unassigned_robot_count == record.robot_count == 3
+    assert any("99" in problem for problem in record.diagnostics["problems"])
+    assert record.success is False
+
+
+def test_duplicate_assigned_assigned_becomes_single_failed_hold():
+    scenario = _provenance_test_scenario()
+    proposal_a = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    proposal_b = ExplorationCandidate(target=(4.25, 2.0), information_gain=2.0, metadata={"cluster_id": "f0"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r1", proposal=proposal_a
+            ),
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(4.25, 2.0), reason="r2", proposal=proposal_b
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert [item for item in assignments if item.robot_id == 0] == []
+    matches = [item for item in holds if item.robot_id == 0]
+    assert len(matches) == 1
+    assert matches[0].decision == "FAILED"
+    assert problems != []
+
+
+def test_duplicate_assigned_hold_becomes_single_failed_hold():
+    scenario = _provenance_test_scenario()
+    proposal_a = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r1", proposal=proposal_a
+            ),
+            CoordinationAssignment(robot_id=0, status="HOLD", target=None, reason="r2"),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    assert [item for item in assignments if item.robot_id == 0] == []
+    matches = [item for item in holds if item.robot_id == 0]
+    assert len(matches) == 1
+    assert matches[0].decision == "FAILED"
+    assert problems != []
+
+
+def test_duplicate_hold_hold_becomes_single_failed_hold():
+    scenario = _provenance_test_scenario()
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(robot_id=0, status="HOLD", target=None, reason="r1"),
+            CoordinationAssignment(robot_id=0, status="HOLD", target=None, reason="r2"),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r"),
+            CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r"),
+        )
+    )
+
+    assignments, holds, problems = _build_assignment_and_hold_records(result, scenario, tolerance=1e-6)
+
+    matches = [item for item in holds if item.robot_id == 0]
+    assert len(matches) == 1
+    assert matches[0].decision == "FAILED"
+    assert problems != []
+
+
+def test_entry_order_does_not_change_normalized_result_or_fingerprint():
+    scenario = _provenance_test_scenario()
+    proposal_0 = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    proposal_1 = ExplorationCandidate(target=(4.25, 2.0), information_gain=2.0, metadata={"cluster_id": "f0"})
+    entries = (
+        CoordinationAssignment(
+            robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r0", proposal=proposal_0
+        ),
+        CoordinationAssignment(
+            robot_id=1, status="ASSIGNED", target=(4.25, 2.0), reason="r1", proposal=proposal_1
+        ),
+        CoordinationAssignment(robot_id=2, status="HOLD", target=None, reason="r2"),
+    )
+    result_forward = CoordinationResult(assignments=entries)
+    result_reversed = CoordinationResult(assignments=tuple(reversed(entries)))
+
+    assignments_f, holds_f, problems_f = _build_assignment_and_hold_records(
+        result_forward, scenario, tolerance=1e-6
+    )
+    assignments_r, holds_r, problems_r = _build_assignment_and_hold_records(
+        result_reversed, scenario, tolerance=1e-6
+    )
+
+    assert assignments_f == assignments_r
+    assert holds_f == holds_r
+    assert problems_f == problems_r
+
+    fingerprint_forward = _finalized_record_from_result(scenario, result_forward).deterministic_fingerprint
+    fingerprint_reversed = _finalized_record_from_result(scenario, result_reversed).deterministic_fingerprint
+    assert fingerprint_forward == fingerprint_reversed
+
+
+def test_full_combination_of_missing_unknown_duplicate_and_valid_robots():
+    """robot 0: valid; robot 1: duplicate; robot 2: missing; robot 99:
+    unknown -- all four failure modes present in a single result."""
+    scenario = _provenance_test_scenario()
+    valid_proposal = ExplorationCandidate(target=(1.2, 4.2), information_gain=3.5, metadata={"cluster_id": "f1"})
+    dup_proposal = ExplorationCandidate(target=(4.25, 2.0), information_gain=2.0, metadata={"cluster_id": "f0"})
+    result = CoordinationResult(
+        assignments=(
+            CoordinationAssignment(
+                robot_id=0, status="ASSIGNED", target=(1.2, 4.2), reason="r", proposal=valid_proposal
+            ),
+            CoordinationAssignment(
+                robot_id=1, status="ASSIGNED", target=(4.25, 2.0), reason="r1", proposal=dup_proposal
+            ),
+            CoordinationAssignment(robot_id=1, status="HOLD", target=None, reason="r2"),
+            CoordinationAssignment(robot_id=99, status="ASSIGNED", target=(0.0, 0.0), reason="r", proposal=None),
+            # robot 2 has no entry at all -- missing.
+        )
+    )
+
+    record = _finalized_record_from_result(scenario, result)
+
+    assert len(record.assignments) + len(record.holds) == record.robot_count == 3
+    seen_ids = {item.robot_id for item in record.assignments} | {item.robot_id for item in record.holds}
+    assert seen_ids == {0, 1, 2}
+    assert 99 not in seen_ids
+    assert len(record.assignments) == 1
+    assert record.assignments[0].robot_id == 0
+    assert _record_for(record.holds, 1).decision == "FAILED"  # duplicate
+    assert _record_for(record.holds, 2).decision == "FAILED"  # missing
+    assert record.success is False
+
+
+def test_shipped_config_stays_healthy_after_normalization():
+    """The real rapid_allocation.json scenario has one entry per robot from
+    the real plugin, so normalization must be a no-op for it."""
+    scenario = load_scenario(str(RAPID_ALLOCATION_CONFIG))
+
+    record_1 = run_static_allocation_benchmark(scenario)
+    record_2 = run_static_allocation_benchmark(scenario)
+
+    assert record_1.success is True
+    assert record_1.assigned_robot_count == 3
+    assert record_1.unassigned_robot_count == 0
+    assert record_1.assigned_robot_count + record_1.unassigned_robot_count == record_1.robot_count
+    assert record_1.deterministic_fingerprint == record_2.deterministic_fingerprint

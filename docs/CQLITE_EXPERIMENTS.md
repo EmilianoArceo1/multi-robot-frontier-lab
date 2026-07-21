@@ -46,7 +46,14 @@ The output is written to `experiments/results/cqlite_native_proxy_summary.json`.
 The exact house and AWS bookstore Gazebo world files, random start poses, `rho`, `sigma`, map resolution, and baseline implementations were not published with the paper. The official repository's planner file also does not contain the distributed Q update shown in Algorithm 1; it ends in fixed goal commands and includes unfinished POMDP code. Therefore:
 
 - the three geometries here are independently created area-matched proxies;
-- A* is used for CQLite travel-cost queries and execution;
+- the interactive presets use Euclidean travel-time for the CQLite allocation
+  stage and A* once for execution of each selected target. This avoids the
+  synchronous `robots x frontiers` A* burst that previously froze the GUI;
+- exact CQLite travel-cost queries remain available with
+  `cqlite_use_path_service=true`, but are bounded by
+  `cqlite_path_service_candidate_limit` (default `4`) per robot;
+- obstacle boundary samples use `0.10 m` spacing in these large-range presets;
+  the logical occupancy/frontier grid remains at the configured grid resolution;
 - the simulator's occupancy/frontier services replace `gmapping`, ROS map merge, `move_base`, and DWA;
 - an ad-hoc merge request is represented as a HOLD/debug event because this simulator already exposes a shared team belief snapshot;
 - the wire payload count measures compact algorithm fields, excluding ROS and transport overhead;

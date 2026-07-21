@@ -128,6 +128,11 @@ class CQLitePlugin:
         speed = max(self._positive_parameter(request, "cqlite_nominal_speed", 0.5), 1e-6)
         information_weight = self._numeric_parameter(request, "cqlite_information_weight", 0.0)
         voronoi_fallback = self._bool_parameter(request, "cqlite_voronoi_fallback", True)
+        use_path_service = self._bool_parameter(request, "cqlite_use_path_service", False)
+        path_service_candidate_limit = max(
+            1,
+            int(self._positive_parameter(request, "cqlite_path_service_candidate_limit", 4.0)),
+        )
         min_travel = max(
             self._positive_parameter(request, "min_frontier_travel_distance", 0.75),
             0.0,
@@ -215,6 +220,8 @@ class CQLitePlugin:
                 information_weight=information_weight,
                 min_travel=min_travel,
                 reservation_radius=reservation_radius,
+                use_path_service=use_path_service,
+                path_service_candidate_limit=path_service_candidate_limit,
             )
             scored_by_robot[robot_id] = scored
             per_robot_debug[str(robot_id)] = {
@@ -388,6 +395,8 @@ class CQLitePlugin:
                 "nominal_speed": speed,
                 "information_weight": information_weight,
                 "voronoi_fallback": voronoi_fallback,
+                "use_path_service": use_path_service,
+                "path_service_candidate_limit": path_service_candidate_limit,
             },
             "network": {
                 "undirected_edge_count": edge_count,
@@ -440,6 +449,8 @@ class CQLitePlugin:
         information_weight: float,
         min_travel: float,
         reservation_radius: float,
+        use_path_service: bool,
+        path_service_candidate_limit: int,
     ) -> tuple[list[_ScoredCandidate], dict[str, int]]:
         learner = self._learners[robot.robot_id]
         rejected = {
@@ -448,6 +459,7 @@ class CQLitePlugin:
             "blocked": 0,
             "already_explored": 0,
             "unreachable": 0,
+            "path_prefiltered": 0,
         }
         normalized: list[ExplorationCandidate] = []
         seen: set[StateKey] = set()
@@ -487,6 +499,45 @@ class CQLitePlugin:
 
         if not normalized:
             return [], rejected
+
+        # An A* query for every robot/frontier pair blocks the simulator's GUI
+        # thread before any robot can receive its first route.  When exact path
+        # costs are explicitly requested, rank all candidates with the cheap
+        # paper-compatible Euclidean travel-time estimate and refine only a
+        # small deterministic shortlist.  The execution planner still checks
+        # the selected target normally, so this bound cannot bypass route
+        # feasibility or collision safety.
+        if use_path_service and len(normalized) > path_service_candidate_limit:
+            preliminary_max_information = max(
+                (max(float(item.information_gain), 0.0) for item in normalized),
+                default=1.0,
+            )
+            if preliminary_max_information <= 0.0:
+                preliminary_max_information = 1.0
+
+            def _preliminary_priority(candidate: ExplorationCandidate) -> tuple[float, float, float, float]:
+                point = candidate.target
+                key = self._state_key(point, request)
+                old_q = learner.q_values.get(key, 0.0)
+                overlap = self._overlap_probability(robot.robot_id, point, overlap_radius)
+                reward = step_cost - old_q + rho * (1.0 - overlap) + sigma * communication_range
+                estimated_q = (1.0 - alpha) * old_q + alpha * reward
+                information_bonus = (
+                    information_weight
+                    * max(float(candidate.information_gain), 0.0)
+                    / preliminary_max_information
+                )
+                distance = self._distance(robot.xy, point)
+                return (
+                    estimated_q - step_cost * (distance / speed) + information_bonus,
+                    -distance,
+                    -point[0],
+                    -point[1],
+                )
+
+            normalized.sort(key=_preliminary_priority, reverse=True)
+            rejected["path_prefiltered"] = len(normalized) - path_service_candidate_limit
+            normalized = normalized[:path_service_candidate_limit]
 
         prior_next_max = max(
             (learner.q_values.get(self._state_key(item.target, request), 0.0) for item in normalized),

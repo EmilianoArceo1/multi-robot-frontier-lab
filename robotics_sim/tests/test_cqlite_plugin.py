@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,17 @@ import pytest
 from algorithms.cqlite.plugin import CQLITE_COORDINATOR, CQLitePlugin
 from experiments.run_cqlite_experiments import run_matrix
 from robotics_interfaces.coordination import CoordinationRequest
-from robotics_interfaces.observations import RobotCoordinationState
+from robotics_interfaces.observations import RobotCoordinationState, WorldSnapshot
 from robotics_interfaces.plugins import PluginCapability
 from robotics_interfaces.proposals import ExplorationCandidate
-from robotics_sim.simulation.config import config_from_sim_payload, config_to_sim_payload
+from robotics_interfaces.results import PathPlanningResponse
+from robotics_interfaces.services import CoordinationServices
+from robotics_sim.environment.collision_checker import CollisionChecker
+from robotics_sim.simulation.config import (
+    config_from_sim_payload,
+    config_to_sim_payload,
+    normalized_robot_start_configs,
+)
 from robotics_sim.simulation.plugin_loader import list_coordination_plugin_names, load_coordination_plugin
 
 
@@ -104,6 +112,37 @@ def test_travel_time_priority_prefers_near_frontier_when_q_values_match() -> Non
     assert result.commands[0].metadata["cqlite_travel_time"] == pytest.approx(2.0)
 
 
+def test_optional_path_service_refines_only_a_bounded_shortlist() -> None:
+    class CountingPathService:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def plan_path(self, request):
+            self.requests.append(request)
+            return PathPlanningResponse(success=True, waypoints=(request.goal,))
+
+    service = CountingPathService()
+    candidates = tuple(_candidate(float(index), 0.0) for index in range(1, 13))
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: candidates},
+        world=WorldSnapshot(bounds=(-10.0, 20.0, -10.0, 10.0), resolution=0.5),
+        services=CoordinationServices(path_planning_service=service),
+        parameters=_parameters(
+            cqlite_use_path_service=True,
+            cqlite_path_service_candidate_limit=3,
+        ),
+        time_s=1.0,
+    )
+
+    result = CQLitePlugin().assign(request)
+
+    assert len(service.requests) == 3
+    assert result.debug["per_robot"]["0"]["rejected"]["path_prefiltered"] == 9
+    assert result.debug["per_robot"]["0"]["scored_candidates"] == 3
+
+
 def test_voronoi_allocation_gives_distinct_local_targets_to_team() -> None:
     plugin = CQLitePlugin()
     robots = (_robot(0, 0.0, 0.0), _robot(1, 4.0, 0.0))
@@ -183,9 +222,35 @@ def test_paper_presets_pin_parameters_and_round_trip_coordination_settings() -> 
         assert params["cqlite_gamma"] == 0.95
         assert params["cqlite_step_cost"] == 2.0
         assert params["cqlite_overlap_radius"] == 1.0
+        assert params["cqlite_use_path_service"] is False
+        assert params["cqlite_path_service_candidate_limit"] == 4
+        assert payload["simulation"]["mapping_point_spacing"] >= 0.1
         config = config_from_sim_payload(payload)
         assert config.coordination_parameters == params
         assert config_to_sim_payload(config)["coordination"]["parameters"] == params
+
+
+def test_paper_preset_start_poses_are_collision_free() -> None:
+    checker = CollisionChecker()
+    for preset in PRESETS:
+        payload = json.loads(preset.read_text(encoding="utf-8"))
+        config = config_from_sim_payload(payload)
+        starts = normalized_robot_start_configs(config)
+
+        for index, start in enumerate(starts):
+            report = checker.check_position(
+                position=(start.x, start.y),
+                obstacles=config.obstacles,
+                robot_radius=start.safety_radius,
+            )
+            assert not report.collision, f"{preset.name} R{index + 1}: {report.reason}"
+
+        for left_index, left in enumerate(starts):
+            for right_index, right in enumerate(starts[left_index + 1 :], start=left_index + 1):
+                distance = math.hypot(left.x - right.x, left.y - right.y)
+                assert distance > left.safety_radius + right.safety_radius, (
+                    f"{preset.name} R{left_index + 1}/R{right_index + 1} overlap at start"
+                )
 
 
 def test_native_proxy_matrix_is_deterministic_and_separates_published_results() -> None:

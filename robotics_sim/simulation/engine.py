@@ -1671,13 +1671,25 @@ class SimulationControllerMixin:
         near-start geometry.  In particular, this helper must never introduce
         a planner-only free disk around the robot.
         """
-        points, _ = self.sanitize_planner_obstacle_points(
-            list(self.mapped_obstacle_points),
-            start_xy=start_xy,
-            robot_radius=robot_radius,
-            resolution=float(self.config.grid_resolution),
+        # sanitize_planner_obstacle_points() deliberately no longer depends
+        # on the start pose or radius, so rebuilding and scanning the same
+        # growing point cloud two or three times per robot *per frame* is pure
+        # overhead.  mapped_obstacle_revision changes on every mutation and
+        # makes this cache safe across mapping updates and snapshot restores.
+        cache_key = (
+            int(getattr(self, "mapped_obstacle_revision", 0)),
+            len(getattr(self, "mapped_obstacle_points", ())),
         )
-        return points
+        if getattr(self, "_segment_safety_points_cache_key", None) != cache_key:
+            points, _ = self.sanitize_planner_obstacle_points(
+                list(self.mapped_obstacle_points),
+                start_xy=start_xy,
+                robot_radius=robot_radius,
+                resolution=float(self.config.grid_resolution),
+            )
+            self._segment_safety_points_cache_key = cache_key
+            self._segment_safety_points_cache = points
+        return self._segment_safety_points_cache
 
     def _planning_costmap_inputs_for_robot(
         self,
@@ -2930,10 +2942,9 @@ class SimulationControllerMixin:
         # _finalize_navigation_debug_snapshot() docstring for the same
         # defensive getattr pattern.
         #
-        # Always built now, regardless of navigation_debug_enabled: capture
-        # happens on every tick unconditionally, so history already has
-        # data by the time a user turns Navigation on mid-run (that switch
-        # now only gates the UI's browse/inspect/restore affordances).
+        # Always built regardless of navigation_debug_enabled so a route
+        # decision is available even if the user opens Navigation Reasoning
+        # later. The UI switch only gates browse/inspect/restore affordances.
         debug_capture = PlanDebugCapture()
         result = self.call_compute_planned_waypoints(
             planner_kwargs,
@@ -3367,10 +3378,11 @@ class SimulationControllerMixin:
     def _navigation_debug_belief_frame(self) -> Maybe[BeliefMapDebug]:
         """Return a compact immutable map frame.
 
-        Navigation history records every simulation tick. Copying a full grid on
-        every tick would make the replay prohibitively large, so the expensive
-        grid/explored_by_robot compression is cached and reused across ticks
-        that share the same BeliefMap.revision.
+        Navigation history records sparse events plus rate-limited routine
+        ticks. Copying a full grid for every recorded frame would still make
+        the replay prohibitively large, so the expensive grid/explored_by_robot
+        compression is cached and reused across frames that share the same
+        BeliefMap.revision.
 
         visit_count/last_seen are compressed fresh on every call instead:
         BeliefMap.revision explicitly does NOT bump for visit-count/last-seen-
@@ -3568,16 +3580,14 @@ class SimulationControllerMixin:
         already known on self/agent at call time -- never recomputed here --
         then push it to the bounded event log and (if present) the canvas.
 
-        Runs unconditionally whenever a robot exists -- NOT gated on
-        navigation_debug_enabled. History must already be populated by the
-        time a user turns Navigation on mid-run, so every tick is recorded
-        regardless of that switch; navigation_debug_enabled only gates the
-        UI's browse/inspect/restore affordances (step_navigation_debug_
-        history(), can_restore_navigation_debug_snapshot(), the overlay
-        itself), never whether a tick gets recorded. Still safe to call from
-        lightweight duck-typed engine fakes that never set self.robot at all
-        (self.robot is None guards that, not getattr-guarded navigation_
-        debug_enabled).
+        Runs whenever called and a robot exists -- NOT gated on
+        navigation_debug_enabled. Sparse decisions/events call it immediately;
+        routine TICK call sites are sampled by navigation_debug_tick_due(), so
+        history is already populated when the user opens the panel without
+        serializing a full frame for every robot at GUI frequency.
+        navigation_debug_enabled only gates the UI's browse/inspect/restore
+        affordances. Still safe to call from lightweight duck-typed engine
+        fakes that never set self.robot at all.
         """
         # Single mode historically read self.robot everywhere.  In Multiple,
         # self.robot is only a transient loop cursor (and is reset to the UI's
@@ -3713,6 +3723,7 @@ class SimulationControllerMixin:
             if control_source is not None
             else None
         )
+
         controller = ControllerDebug(
             v=float(robot.v),
             omega=float(last_control[1]) if last_control is not None and last_control.size >= 2 else 0.0,
@@ -3835,15 +3846,11 @@ class SimulationControllerMixin:
             metrics=metrics_debug,
         )
 
-        # The ring buffer records every tick (a full in-memory history for
-        # the </> step buttons to scrub through) -- bounded (see
-        # NavigationDebugEventLog's max_size) and cleared whenever a
-        # simulation starts/resets (the 3 reset_simulation_state() call
-        # sites), so it never persists across a restart and never grows
-        # without bound. The canvas also gets every snapshot below so the
-        # live overlay/HUD stays current while running; pausing just stops
-        # these calls, which is what leaves the last snapshot intact for
-        # inspection.
+        # The ring buffer records every frame delivered here: all sparse
+        # events plus rate-limited routine ticks. It is bounded (see
+        # NavigationDebugEventLog.max_size) and cleared whenever a simulation
+        # starts/resets, so it never persists across a restart or grows without
+        # bound. Pausing leaves the last sampled snapshot intact for inspection.
         canvas = getattr(self, "canvas", None)
         # Keep a live frame per robot.  The scalar alias/canvas represents the
         # robot selected by the user; recording another robot must not make the
@@ -3889,6 +3896,26 @@ class SimulationControllerMixin:
         if publish_to_canvas and canvas is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
             canvas.set_navigation_debug_snapshot(snapshot)
 
+    def navigation_debug_tick_due(self, robot_index: int | None = None) -> bool:
+        """Rate-limit heavy routine reasoning frames, never sparse events.
+
+        Plan results, safety replans, holds, and collisions still call
+        ``_finalize_navigation_debug_snapshot`` immediately.  Only ordinary
+        TICK frames use this gate.  The timestamp is per robot so Multiple
+        mode keeps a balanced replay instead of whichever robot ran first.
+        """
+        key = -1 if robot_index is None else int(robot_index)
+        now = float(getattr(self, "simulation_time", 0.0))
+        last_by_robot = getattr(self, "_nav_debug_last_tick_time_by_robot", None)
+        if last_by_robot is None:
+            self._nav_debug_last_tick_time_by_robot = {}
+            last_by_robot = self._nav_debug_last_tick_time_by_robot
+        last = last_by_robot.get(key)
+        if last is not None and now >= last and now - last < NAVIGATION_DEBUG_TICK_PERIOD_SEC:
+            return False
+        last_by_robot[key] = now
+        return True
+
     def navigation_debug_history_length(self) -> int:
         log = getattr(self, "navigation_debug_log", None)
         if log is None:
@@ -3913,6 +3940,7 @@ class SimulationControllerMixin:
         self._nav_debug_current_plan_capture_by_robot = {}
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
+        self._nav_debug_last_tick_time_by_robot = {}
 
         stop_scrub = getattr(self, "stop_navigation_history_scrub", None)
         if callable(stop_scrub):
@@ -6287,6 +6315,7 @@ class SimulationControllerMixin:
         self._nav_debug_last_event_by_robot = {}
         self._nav_debug_pending_plan_capture_by_robot = {}
         self._nav_debug_current_plan_capture_by_robot = {}
+        self._nav_debug_last_tick_time_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -6512,6 +6541,7 @@ class SimulationControllerMixin:
         self._nav_debug_last_event_by_robot = {}
         self._nav_debug_pending_plan_capture_by_robot = {}
         self._nav_debug_current_plan_capture_by_robot = {}
+        self._nav_debug_last_tick_time_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -7216,7 +7246,7 @@ class SimulationControllerMixin:
             if visual_changed:
                 self._discovered_hazard_render_dirty = True
 
-    def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
+    def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> bool:
         """
         Store the current occlusion-aware sensor footprint as explored area.
 
@@ -7225,7 +7255,7 @@ class SimulationControllerMixin:
         robot moves or rotates enough to add visible information.
         """
         if self.robot is None:
-            return
+            return False
 
         x = float(self.robot.x)
         y = float(self.robot.y)
@@ -7244,7 +7274,7 @@ class SimulationControllerMixin:
             min_turn = 0.18 if "Camera" in self.config.vision_model else math.inf
 
             if moved < min_move and rotated < min_turn:
-                return
+                return False
 
         polygon = sensor_visible_polygon_world(
             origin=(x, y),
@@ -7256,7 +7286,7 @@ class SimulationControllerMixin:
         )
 
         if len(polygon) < 3:
-            return
+            return False
 
         # Update the geometric explored map used by frontier planners. This is
         # independent from the optimized visual pixmap cache.
@@ -7275,6 +7305,7 @@ class SimulationControllerMixin:
         else:
             self.multi_last_explored_poses[int(robot_index)] = (x, y, theta)
             self.canvas.append_explored_area_polygon(polygon, robot_index=int(robot_index))
+        return True
 
     def update_sensed_obstacles(self, force_status: bool = True) -> list[tuple[float, float]]:
         """Update the partial obstacle map with visible boundary samples.
@@ -7322,15 +7353,17 @@ class SimulationControllerMixin:
         _obstacle_extract_perf_start = time.perf_counter()
         for obstacle in candidate_obstacles:
             for point in self.sample_obstacle_boundary_points(tuple(obstacle), spacing):
-                if not self.point_visible_from_robot(point, candidate_obstacles):
-                    continue
-
                 # Keep the sampled boundary location, only rounded to a stable
                 # key. Do not collapse it to the belief cell center; doing so
                 # destroys the visible line and weakens route safety checks.
                 mapped_point = self.quantize_map_point(point, quantization)
                 key = (round(float(mapped_point[0]), 3), round(float(mapped_point[1]), 3))
                 if key in self.mapped_obstacle_point_keys:
+                    continue
+                # Visibility is the expensive part (an occlusion ray against
+                # the nearby obstacle set).  Already-mapped samples cannot add
+                # information, so reject them before doing that work.
+                if not self.point_visible_from_robot(point, candidate_obstacles):
                     continue
 
                 self.mapped_obstacle_point_keys.add(key)
@@ -7735,9 +7768,14 @@ class SimulationControllerMixin:
 
             for robot_index, robot in enumerate(self.robots):
                 self.robot = robot
-                self.record_explored_area(force=True, robot_index=robot_index)
-                newly = self.update_sensed_obstacles(force_status=False)
-                newly_discovered_all.extend(newly)
+                # Static robots have no new FoV in a static map.  The forced
+                # rescan used to rasterize their polygon and ray-test every
+                # obstacle boundary at 10 Hz while they were waiting, which
+                # scales particularly badly at six robots.  Startup already
+                # performs one forced observation for every robot.
+                if self.record_explored_area(force=False, robot_index=robot_index):
+                    newly = self.update_sensed_obstacles(force_status=False)
+                    newly_discovered_all.extend(newly)
 
             self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
 
@@ -7995,20 +8033,22 @@ class SimulationControllerMixin:
             route_reason = ""
             if 0 <= index < len(getattr(self, "multi_route_state_reasons", [])):
                 route_reason = str(self.multi_route_state_reasons[index] or "")
-            self._finalize_navigation_debug_snapshot(
-                agent=agent,
-                robot=robot,
-                robot_index=index,
-                decision_kind="ESCAPE_LOCAL" if used_rotation_escape else "FOLLOW_PATH",
-                decision_reason=route_reason or "multi-robot route active",
-                event_kind=(
-                    NavigationDebugEventKind.PREDICTED_COLLISION
-                    if used_rotation_escape
-                    else NavigationDebugEventKind.TICK
-                ),
-                capture=nav_debug_capture,
-                control=control,
+            tick_event_kind = (
+                NavigationDebugEventKind.PREDICTED_COLLISION
+                if used_rotation_escape
+                else NavigationDebugEventKind.TICK
             )
+            if tick_event_kind is not NavigationDebugEventKind.TICK or self.navigation_debug_tick_due(index):
+                self._finalize_navigation_debug_snapshot(
+                    agent=agent,
+                    robot=robot,
+                    robot_index=index,
+                    decision_kind="ESCAPE_LOCAL" if used_rotation_escape else "FOLLOW_PATH",
+                    decision_reason=route_reason or "multi-robot route active",
+                    event_kind=tick_event_kind,
+                    capture=nav_debug_capture,
+                    control=control,
+                )
 
             robot.update(control, dt)
             new_controls.append(control)
@@ -8401,12 +8441,9 @@ class SimulationControllerMixin:
             # ── New OOP flow ──────────────────────────────────────────────
             # build_observation pre-computes active_segment_blocked.
             #
-            # nav_debug_capture is always built now (see _finalize_
-            # navigation_debug_snapshot()'s docstring): every tick is
-            # recorded unconditionally, so history is already populated by
-            # the time a user turns Navigation on mid-run -- navigation_
-            # debug_enabled only gates the UI's browse/inspect/restore
-            # affordances, not whether a tick gets captured.
+            # Build capture independently of the panel switch so sparse events
+            # are never missed. Routine frames are rate-limited immediately
+            # before finalization below.
             nav_debug_capture = NavigationDebugCapture()
             _runtime_state_build_perf_start = time.perf_counter()
             obs = self.build_observation(self.robot, agent, None, capture=nav_debug_capture)
@@ -8445,12 +8482,16 @@ class SimulationControllerMixin:
                 # getattr-guarded -- see the equivalent call site in
                 # apply_route_result() for why.
                 _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
-                if callable(_nav_debug_finalize):
+                debug_event_kind = self._navigation_debug_event_kind_for_decision(decision, predicted_report)
+                if callable(_nav_debug_finalize) and (
+                    debug_event_kind is not NavigationDebugEventKind.TICK
+                    or self.navigation_debug_tick_due(None)
+                ):
                     _nav_debug_finalize(
                         agent=agent,
                         decision_kind=str(decision.kind),
                         decision_reason=str(decision.reason),
-                        event_kind=self._navigation_debug_event_kind_for_decision(decision, predicted_report),
+                        event_kind=debug_event_kind,
                         capture=nav_debug_capture,
                     )
 

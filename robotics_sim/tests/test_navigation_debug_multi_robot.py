@@ -195,3 +195,18 @@ def test_sparse_relevant_event_is_cached_per_robot_not_shared_across_team():
     assert fake._nav_debug_last_event_by_robot[1].snapshot.robot_id == "R2"
     assert canvas.events[-1].snapshot.robot_id == "R2"
     assert canvas.events[-1].event_kind is NavigationDebugEventKind.PREDICTED_COLLISION
+
+
+def test_routine_navigation_frames_are_rate_limited_per_robot() -> None:
+    fake, _, _ = _engine()
+    fake._nav_debug_last_tick_time_by_robot = {}
+    fake.navigation_debug_tick_due = SimulationControllerMixin.navigation_debug_tick_due.__get__(fake)
+
+    assert fake.navigation_debug_tick_due(0) is True
+    assert fake.navigation_debug_tick_due(1) is True
+    assert fake.navigation_debug_tick_due(0) is False
+    assert fake.navigation_debug_tick_due(1) is False
+
+    fake.simulation_time += 0.11
+    assert fake.navigation_debug_tick_due(0) is True
+    assert fake.navigation_debug_tick_due(1) is True

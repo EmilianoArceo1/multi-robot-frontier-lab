@@ -66,7 +66,7 @@
       "cqlite_overlap_radius": 1.0, "cqlite_communication_range": 50.0,
       "cqlite_nominal_speed": 0.5, "cqlite_rho": 2.0, "cqlite_sigma": 0.01,
       "cqlite_information_weight": 0.0, "cqlite_voronoi_fallback": true,
-      "cqlite_use_path_service": true, "cqlite_path_planner": "A*"
+      "cqlite_use_path_service": false, "cqlite_path_planner": "A*", "cqlite_path_service_candidate_limit": 4
     }
   },
   "sensor": {"type": "LiDAR", "range": 15.0},
@@ -78,5 +78,5 @@
       {"x": -8.4, "y": 4.7, "theta": 0.0, "v": 0.0, "vision": 15.0, "body_radius": 0.105, "safety_radius": 0.22, "max_speed": 0.5, "max_acceleration": 1.0, "max_angular_speed": 0.7853981633974483, "goal_tolerance": 0.2, "acceleration_gain": 0.75}
     ]
   },
-  "simulation": {"agent_mode": "Multiple Robot Mode", "map_visualization": "Current", "robot_icon": "Wheeled Robot", "show_goal_preview": false, "show_path": true, "show_vision": true, "show_explored_area": true, "show_obstacles": true, "show_robot_orders": true, "mapping_point_spacing": 0.025}
+  "simulation": {"agent_mode": "Multiple Robot Mode", "map_visualization": "Current", "robot_icon": "Wheeled Robot", "show_goal_preview": false, "show_path": true, "show_vision": true, "show_explored_area": true, "show_obstacles": true, "show_robot_orders": true, "mapping_point_spacing": 0.1}
 }

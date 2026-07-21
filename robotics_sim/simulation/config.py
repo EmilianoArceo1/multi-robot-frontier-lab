@@ -229,6 +229,10 @@ TARGET_FRAME_MS = 16
 SENSOR_UPDATE_PERIOD_SEC = 0.10
 MIN_SENSOR_UPDATE_DISTANCE = 0.05
 MIN_SENSOR_UPDATE_ROTATION = 0.10
+# Navigation Reasoning stores compressed sensor/belief frames.  Ten samples
+# per simulated second are enough for a readable replay and prevent Multiple
+# mode from serializing one complete debug frame per robot at the GUI rate.
+NAVIGATION_DEBUG_TICK_PERIOD_SEC = 0.10
 
 # Ray counts intentionally differ by purpose. The current sensor footprint is
 # visual, so it can use more rays. The explored-area cache and physics-loop

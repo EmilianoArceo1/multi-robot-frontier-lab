@@ -1079,3 +1079,59 @@ def test_unconsumed_frontier_information_service_does_not_change_benchmark_resul
     assert record.deterministic_fingerprint == (
         "15bdb9ded076c922aac314972a9f97b05e404e9ec0fca6e0217b76a3408e04f3"
     )
+
+
+# ---------------------------------------------------------------------------
+# 53-54. Headless integration: the new Frontier cluster Hungarian coordinator
+#    (Commit 3) can drive this same static benchmark by only changing
+#    scenario.algorithm -- run_experiment.py/records.py/static_services.py
+#    are untouched, and the existing Independent baseline scenario/fingerprint
+#    stay frozen (see test_unconsumed_frontier_information_service_does_not_
+#    change_benchmark_result above).
+# ---------------------------------------------------------------------------
+
+
+def _hungarian_scenario_dict() -> dict:
+    data = _base_scenario_dict()
+    data["algorithm"] = "Frontier cluster Hungarian coordinator"
+    return data
+
+
+def test_hungarian_coordinator_runs_headless_by_only_changing_algorithm():
+    scenario = scenario_from_dict(_hungarian_scenario_dict())
+
+    record = run_static_allocation_benchmark(scenario)
+
+    assert record.success is True
+    assert len(record.assignments) + len(record.holds) == record.robot_count == 3
+    assert len(record.deterministic_fingerprint) == 64
+
+    # f3 is the shipped scenario's only valid=False component -- it must
+    # never be assigned.
+    assigned_cluster_ids = {item.cluster_id for item in record.assignments}
+    assert "f3" not in assigned_cluster_ids
+
+    targets = [item.target for item in record.assignments]
+    assert len(targets) == len(set(targets))
+
+
+def test_hungarian_coordinator_is_deterministic_across_two_runs():
+    scenario = scenario_from_dict(_hungarian_scenario_dict())
+
+    record_1 = run_static_allocation_benchmark(scenario)
+    record_2 = run_static_allocation_benchmark(scenario)
+
+    assert record_to_json_dict(record_1) == record_to_json_dict(record_2)
+    assert record_1.deterministic_fingerprint == record_2.deterministic_fingerprint
+
+
+def test_independent_baseline_fingerprint_is_unaffected_by_the_new_coordinator():
+    """Regression guard: adding the Hungarian coordinator must never change
+    the frozen Independent baseline scenario/fingerprint."""
+    scenario = load_scenario(str(RAPID_ALLOCATION_CONFIG))
+
+    record = run_static_allocation_benchmark(scenario)
+
+    assert record.deterministic_fingerprint == (
+        "15bdb9ded076c922aac314972a9f97b05e404e9ec0fca6e0217b76a3408e04f3"
+    )

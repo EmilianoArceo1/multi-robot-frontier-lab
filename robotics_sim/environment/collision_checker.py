@@ -24,6 +24,7 @@ import numpy as np
 
 Point2D = tuple[float, float]
 RectObstacle = tuple[float, float, float, float]
+DiskObstacle = tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -34,13 +35,12 @@ class CollisionReport:
     The boolean `collision` is the main decision signal. The other fields exist
     for status messages, debugging, and future visualization.
 
-    `distance` is only populated on a collision hit for the point-cloud checks
-    (check_segment_points/check_position_points/check_predicted_motion_points),
-    since that is the only case where those checks already compute a scalar
-    distance before comparing it to robot_radius. On a clear result there is
-    no single distance value to report -- the loop simply finds nothing within
-    radius of any sampled point, so this stays None rather than being invented
-    (e.g. as a nearest-point search the real check never performs).
+    `distance` is populated on collision hits for the point-cloud and dynamic-
+    disk checks, where the primitive already computes a scalar distance before
+    comparing it to the required clearance. On a clear result there is no
+    single distance value to report -- the loop simply finds no blocking
+    primitive, so this stays None rather than triggering a separate nearest-
+    obstacle search.
     """
 
     collision: bool
@@ -420,6 +420,50 @@ class CollisionChecker:
                     point=report.point,
                     distance=report.distance,
                 )
+
+        return CollisionReport(collision=False)
+
+    def check_predicted_motion_disks(
+        self,
+        snapshot: RobotSnapshot,
+        control,
+        dt: float,
+        steps: int,
+        obstacles: Iterable[DiskObstacle],
+        robot_radius: float,
+    ) -> CollisionReport:
+        """Check predicted motion against exact dynamic obstacle disks.
+
+        Multi-robot runtime used to approximate every teammate with 17 point
+        samples, then compare every predicted pose against that cloud. Exact
+        disk geometry is both safer (no gaps between samples) and much cheaper:
+        five teammates require five squared-distance checks per pose instead
+        of 85 point-distance checks.
+        """
+        disks = tuple(
+            (float(cx), float(cy), max(0.0, float(radius)))
+            for cx, cy, radius in obstacles
+        )
+        if not disks:
+            return CollisionReport(collision=False)
+
+        predicted_points = self.predict_unicycle_points(snapshot, control, dt, steps)
+        ego_radius = max(0.0, float(robot_radius))
+        for point in predicted_points:
+            px, py = point
+            for cx, cy, radius in disks:
+                required = ego_radius + radius
+                dx = px - cx
+                dy = py - cy
+                distance_sq = dx * dx + dy * dy
+                if distance_sq <= required * required:
+                    return CollisionReport(
+                        collision=True,
+                        reason="predicted motion enters a dynamic obstacle safety disk",
+                        obstacle=None,
+                        point=(cx, cy),
+                        distance=math.sqrt(max(distance_sq, 0.0)),
+                    )
 
         return CollisionReport(collision=False)
 

@@ -9,6 +9,7 @@ from robotics_sim.core.robot_agent import RobotAgent
 from robotics_sim.diagnostics.capture import NavigationDebugCapture, PlanDebugCapture
 from robotics_sim.diagnostics.event_log import NavigationDebugEventLog
 from robotics_sim.diagnostics.navigation_snapshot import NavigationDebugEventKind
+from robotics_sim.simulation import engine as engine_module
 from robotics_sim.simulation.engine import SimulationControllerMixin
 
 
@@ -82,6 +83,8 @@ def _engine():
         _nav_debug_live_snapshots_by_robot={},
         _nav_debug_last_event_by_robot={},
         _nav_debug_history_index=None,
+        last_visible_sensor_polygon=None,
+        multi_visible_sensor_polygons={},
         canvas=canvas,
     )
     fake.body_radius_for_robot = lambda robot: 0.15
@@ -97,6 +100,7 @@ def _engine():
     fake._navigation_debug_metrics_frame = lambda: SimulationControllerMixin._navigation_debug_metrics_frame(fake)
     for name in (
         "_finalize_navigation_debug_snapshot",
+        "_navigation_debug_sensor_polygon",
         "navigation_debug_history_length",
         "select_navigation_debug_robot",
     ):
@@ -210,3 +214,16 @@ def test_routine_navigation_frames_are_rate_limited_per_robot() -> None:
     fake.simulation_time += 0.11
     assert fake.navigation_debug_tick_due(0) is True
     assert fake.navigation_debug_tick_due(1) is True
+
+
+def test_navigation_debug_reuses_last_authoritative_sensor_sweep(monkeypatch) -> None:
+    fake, _, _ = _engine()
+    cached = ((5.0, 2.0), (6.0, 2.0), (5.0, 3.0))
+    fake.multi_visible_sensor_polygons[1] = cached
+
+    def _unexpected_recast(**kwargs):
+        raise AssertionError("a debug frame must not repeat sensor ray casting")
+
+    monkeypatch.setattr(engine_module, "sensor_visible_polygon_world", _unexpected_recast)
+
+    assert fake._navigation_debug_sensor_polygon(fake.robots[1], 1) == cached

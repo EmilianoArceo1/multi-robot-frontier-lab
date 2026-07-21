@@ -40,10 +40,12 @@ with nothing to reject it, and the very next tick's raw-list active-segment/
 predicted-motion checks immediately flag it -- exactly the observed
 PLAN_ACCEPTED -> PREDICTED_COLLISION -> SAFETY_REPLAN loop.
 
-Fix: every one of these call sites now uses the SAME obstacle_points_for_
-segment_safety_check() helper the planner and build_observation()'s
-active_segment_blocked already relied on -- no new abstraction, no radius
-duplicated, no config/threshold changed.
+Route validation and active-segment validation use the SAME obstacle_points_
+for_segment_safety_check() helper the planner and build_observation() already
+relied on. Runtime motion prediction subsequently moved to stronger exact
+geometry: ground-truth rectangles for static obstacles and combined-radius
+disks for teammates. That avoids repeating the mapped point-cloud pass without
+changing route validation or weakening the simulator's integrity guard.
 
 These tests exercise the REAL production CollisionChecker/predicted_motion_
 report()/obstacle_points_for_segment_safety_check() via a lightweight
@@ -295,29 +297,25 @@ def test_episode_rejects_route_before_motion_when_point_is_inside_envelope():
 
 # ---------------------------------------------------------------------------
 # 6. REAL multi-robot wiring: simulation_step_multi() itself (not a
-#    hand-rolled reconstruction of its obstacle-list arithmetic) must feed
-#    the sanitized occupancy set to both its active-segment check and its
-#    predicted_motion_report() call, and must still append dynamic
-#    (other-robot) points unsanitized, exactly as engine.py's own comments
-#    at both call sites claim.
+#    hand-rolled reconstruction) keeps the mapped point cloud only for the
+#    active-segment check. Short-horizon prediction uses exact static
+#    rectangles plus exact teammate disks, avoiding two redundant sampled-
+#    geometry passes on every robot and every tick.
 #
 #    obstacle_points_for_segment_safety_check() itself is monkeypatched to
 #    return a known sentinel collection -- this isolates "does simulation_
 #    step_multi() call the sanitizer and use its result" from "does the
-#    sanitizer itself work", which is already covered by tests 1-3 above and
-#    by test_first_segment_validation_consistency.py. CollisionChecker.
-#    check_segment_points()/check_predicted_motion_points() are monkeypatched
-#    only to CAPTURE their obstacle_points argument (still real collision-
-#    safe no-op reports) -- the method under test, simulation_step_multi(),
-#    runs for real and unmodified.
+#    sanitizer itself work", which is already covered by tests 1-3 above.
+#    The exact disk checker is monkeypatched only to capture its argument;
+#    the production simulation_step_multi() runs unmodified.
 # ---------------------------------------------------------------------------
 
 
 _SANITIZED_SENTINEL = [(42.0, 42.0)]
-_DYNAMIC_SENTINEL = [(7.77, 7.77)]
+_DYNAMIC_DISK_SENTINEL = [(7.77, 7.77, 0.41)]
 
 
-def test_simulation_step_multi_wires_sanitized_occupancy_into_both_checks(monkeypatch):
+def test_simulation_step_multi_uses_exact_runtime_geometry_without_duplicate_point_pass(monkeypatch):
     near_center = (0.03, -0.02)  # 0.01-0.05m from the robot's own center
     robot_radius = 0.35
     robot = Robot(
@@ -364,6 +362,8 @@ def test_simulation_step_multi_wires_sanitized_occupancy_into_both_checks(monkey
     fake.apply_hazard_safety_filter = lambda robot, control: control
     fake.is_exploration_mode = lambda: False
     fake.log_robot_motion = lambda *args, **kwargs: None
+    fake.reset_multi_safety_replan_streak = lambda index: None
+    fake.navigation_debug_tick_due = lambda index: False
 
     sanitize_calls: list[tuple[tuple[float, float], float]] = []
 
@@ -373,13 +373,18 @@ def test_simulation_step_multi_wires_sanitized_occupancy_into_both_checks(monkey
 
     fake.obstacle_points_for_segment_safety_check = _fake_obstacle_points_for_segment_safety_check
 
-    dynamic_calls: list[int] = []
+    dynamic_disk_calls: list[int] = []
 
-    def _fake_dynamic_robot_obstacle_points_for_robot(index):
-        dynamic_calls.append(index)
-        return list(_DYNAMIC_SENTINEL)
+    def _fake_dynamic_robot_obstacles_for_target_selection(index):
+        dynamic_disk_calls.append(index)
+        return list(_DYNAMIC_DISK_SENTINEL)
 
-    fake.dynamic_robot_obstacle_points_for_robot = _fake_dynamic_robot_obstacle_points_for_robot
+    fake.dynamic_robot_obstacles_for_target_selection = (
+        _fake_dynamic_robot_obstacles_for_target_selection
+    )
+    fake.dynamic_robot_obstacle_points_for_robot = lambda index: pytest.fail(
+        "runtime prediction must not construct sampled teammate point clouds"
+    )
 
     segment_points_calls: list[list[tuple[float, float]]] = []
 
@@ -389,47 +394,38 @@ def test_simulation_step_multi_wires_sanitized_occupancy_into_both_checks(monkey
 
     monkeypatch.setattr(fake.collision_checker, "check_segment_points", _capturing_check_segment_points)
 
-    predicted_points_calls: list[list[tuple[float, float]]] = []
+    disk_calls: list[list[tuple[float, float, float]]] = []
 
-    def _capturing_check_predicted_motion_points(*, snapshot, control, dt, steps, obstacle_points, robot_radius):
-        predicted_points_calls.append(list(obstacle_points))
+    def _capturing_check_predicted_motion_disks(*, snapshot, control, dt, steps, obstacles, robot_radius):
+        disk_calls.append(list(obstacles))
         return CollisionReport(collision=False)
 
     monkeypatch.setattr(
-        fake.collision_checker, "check_predicted_motion_points", _capturing_check_predicted_motion_points
+        fake.collision_checker,
+        "check_predicted_motion_disks",
+        _capturing_check_predicted_motion_disks,
+    )
+    monkeypatch.setattr(
+        fake.collision_checker,
+        "check_predicted_motion_points",
+        lambda **kwargs: pytest.fail("runtime prediction must not repeat the mapped point-cloud check"),
     )
 
     # Run the REAL, unmodified method.
     SimulationControllerMixin.simulation_step_multi(fake, 0.05)
 
-    # 1. Both checks were actually reached (not skipped/short-circuited).
+    # Both safety layers were reached (not skipped/short-circuited).
     assert len(segment_points_calls) == 1
-    assert len(predicted_points_calls) == 1
+    assert len(disk_calls) == 1
 
-    # 2. Both received the sanitized sentinel -- proving simulation_step_
-    #    multi() actually calls obstacle_points_for_segment_safety_check()
-    #    and uses ITS return value, not a hand-rolled equivalent.
-    assert _SANITIZED_SENTINEL[0] in segment_points_calls[0]
-    assert _SANITIZED_SENTINEL[0] in predicted_points_calls[0]
+    # Mapped samples are used once for segment validation.
+    assert segment_points_calls[0] == _SANITIZED_SENTINEL
+    assert sanitize_calls == [((0.0, 0.0), robot_radius)]
 
-    # 3. Neither received the raw occupancy point directly -- it only ever
-    #    reaches these checks by going through the (mocked) sanitizer, which
-    #    in production would have excluded it.
+    # Raw occupancy never bypasses normalization.
     assert near_center not in segment_points_calls[0]
-    assert near_center not in predicted_points_calls[0]
 
-    # 4. dynamic_robot_obstacle_points_for_robot() is still appended AFTER,
-    #    unsanitized -- present in both received lists, called once per check.
-    assert _DYNAMIC_SENTINEL[0] in segment_points_calls[0]
-    assert _DYNAMIC_SENTINEL[0] in predicted_points_calls[0]
-    assert dynamic_calls == [0, 0]
-
-    # 5. Each received list is exactly sentinel + dynamic -- nothing else
-    #    silently mixed in.
-    assert segment_points_calls[0] == _SANITIZED_SENTINEL + _DYNAMIC_SENTINEL
-    assert predicted_points_calls[0] == _SANITIZED_SENTINEL + _DYNAMIC_SENTINEL
-
-    # 6. The sanitizer itself was invoked with the robot's real current
-    #    position/radius for this tick (wiring detail, not a re-test of the
-    #    sanitizer's own math).
-    assert sanitize_calls == [((0.0, 0.0), robot_radius), ((0.0, 0.0), robot_radius)]
+    # Teammates retain exact center/radius geometry and are not mixed into
+    # the sampled static collection.
+    assert disk_calls == [_DYNAMIC_DISK_SENTINEL]
+    assert dynamic_disk_calls == [0]

@@ -3564,6 +3564,46 @@ class SimulationControllerMixin:
             )
         )
 
+    def _navigation_debug_sensor_polygon(self, robot, robot_index: int | None):
+        """Reuse the most recent authoritative sensor sweep for debug frames.
+
+        ``record_explored_area`` already computes the occlusion-aware polygon
+        whenever motion can reveal meaningful new geometry. Recomputing the
+        same 121-ray polygon again for every Navigation Reasoning frame made
+        debug capture one of the largest multi-robot hot paths. The sweep can
+        lag the pose by at most the mapping motion threshold; sparse safety and
+        planning events still carry the current robot pose/control exactly.
+        """
+        if robot_index is None:
+            cached = getattr(self, "last_visible_sensor_polygon", None)
+        else:
+            cached = getattr(self, "multi_visible_sensor_polygons", {}).get(int(robot_index))
+        if cached:
+            return cached
+
+        polygon = sensor_visible_polygon_world(
+            origin=(float(robot.x), float(robot.y)),
+            theta=float(robot.theta),
+            vision=float(robot.vision),
+            vision_model=self.config.vision_model,
+            obstacles=list(self.config.obstacles),
+            ray_count=(
+                SENSOR_DRAW_RAYS_CAMERA
+                if "Camera" in self.config.vision_model
+                else SENSOR_DRAW_RAYS_OMNI
+            ),
+        )
+        frozen = tuple((float(x), float(y)) for x, y in polygon)
+        if robot_index is None:
+            self.last_visible_sensor_polygon = frozen
+        else:
+            cache = getattr(self, "multi_visible_sensor_polygons", None)
+            if cache is None:
+                self.multi_visible_sensor_polygons = {}
+                cache = self.multi_visible_sensor_polygons
+            cache[int(robot_index)] = frozen
+        return frozen
+
     def _finalize_navigation_debug_snapshot(
         self,
         *,
@@ -3786,18 +3826,25 @@ class SimulationControllerMixin:
             route=route,
         )
 
-        sensor_polygon = sensor_visible_polygon_world(
-            origin=robot_xy,
-            theta=float(robot.theta),
-            vision=float(robot.vision),
-            vision_model=self.config.vision_model,
-            obstacles=list(self.config.obstacles),
-            ray_count=(
-                SENSOR_DRAW_RAYS_CAMERA
-                if "Camera" in self.config.vision_model
-                else SENSOR_DRAW_RAYS_OMNI
-            ),
-        )
+        polygon_provider = getattr(self, "_navigation_debug_sensor_polygon", None)
+        if callable(polygon_provider):
+            sensor_polygon = polygon_provider(robot, resolved_index)
+        else:
+            # Duck-typed unit-test fakes bind only the finalizer. Keep that
+            # long-standing lightweight contract without requiring every fake
+            # to learn the production cache helper.
+            sensor_polygon = sensor_visible_polygon_world(
+                origin=robot_xy,
+                theta=float(robot.theta),
+                vision=float(robot.vision),
+                vision_model=self.config.vision_model,
+                obstacles=list(self.config.obstacles),
+                ray_count=(
+                    SENSOR_DRAW_RAYS_CAMERA
+                    if "Camera" in self.config.vision_model
+                    else SENSOR_DRAW_RAYS_OMNI
+                ),
+            )
         sensor_polygon_array = np.ascontiguousarray(sensor_polygon, dtype=np.float32)
         sensor = SensorDebug(
             vision_range=float(robot.vision),
@@ -5412,6 +5459,10 @@ class SimulationControllerMixin:
         # geometric fidelity -- never invent smooth paths from cells.
         self.canvas.clear_explored_area_geometry()
         self.explored_area_polygons = []
+        self.last_explored_pose = None
+        self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_explored_area_seed(explored, float(frame.resolution), belief.bounds)
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -6323,6 +6374,8 @@ class SimulationControllerMixin:
         self.total_distance_traveled = 0.0
         self.last_explored_pose = None
         self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
         self._exhausted_idle_obstacle_count = None
@@ -6548,6 +6601,9 @@ class SimulationControllerMixin:
         self.exploration_replan_count = 0
         self.total_distance_traveled = 0.0
         self.last_explored_pose = None
+        self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.last_motion_log_time = -1.0e9
         self.multi_last_motion_log_times = {}
         self.log_console_message(self.simulation_start_summary(multi=False))
@@ -6627,6 +6683,9 @@ class SimulationControllerMixin:
         self.exploration_replan_count = 0
         self.total_distance_traveled = 0.0
         self.last_explored_pose: tuple[float, float, float] | None = None
+        self.multi_last_explored_poses: dict[int, tuple[float, float, float]] = {}
+        self.last_visible_sensor_polygon: tuple[tuple[float, float], ...] | None = None
+        self.multi_visible_sensor_polygons: dict[int, tuple[tuple[float, float], ...]] = {}
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
         self._exhausted_idle_obstacle_count = None
@@ -7301,9 +7360,13 @@ class SimulationControllerMixin:
 
         if robot_index is None:
             self.last_explored_pose = (x, y, theta)
+            self.last_visible_sensor_polygon = tuple((float(px), float(py)) for px, py in polygon)
             self.canvas.append_explored_area_polygon(polygon, robot_index=None)
         else:
             self.multi_last_explored_poses[int(robot_index)] = (x, y, theta)
+            self.multi_visible_sensor_polygons[int(robot_index)] = tuple(
+                (float(px), float(py)) for px, py in polygon
+            )
             self.canvas.append_explored_area_polygon(polygon, robot_index=int(robot_index))
         return True
 
@@ -7587,16 +7650,17 @@ class SimulationControllerMixin:
         dt: float,
         robot_radius: float,
         known_obstacle_points: list[tuple[float, float]] | None = None,
+        dynamic_obstacles: list[tuple[float, float, float]] | None = None,
         use_ground_truth: bool = True,
         capture=None,
     ):
         """Check short-horizon motion before applying a control.
 
-        Known mapped-obstacle points are checked first when the installed
-        CollisionChecker supports point-cloud prediction. Ground-truth rectangles
-        are also checked as a simulator integrity guard: the simulator should
-        stop before a collision, not after the robot has already entered an
-        obstacle safety region.
+        Optional mapped points are checked when a caller has no stronger source.
+        Runtime static obstacles use their exact ground-truth rectangles, while
+        dynamic robots use exact disks. This avoids checking the same static
+        geometry twice (once as hundreds of samples and again as rectangles)
+        without weakening either safety layer.
 
         capture: optional NavigationDebugCapture. When provided, stashes the
         predicted trajectory (predict_unicycle_points() already computes
@@ -7641,6 +7705,24 @@ class SimulationControllerMixin:
             if getattr(report, "collision", False):
                 return report
 
+        if dynamic_obstacles and hasattr(self.collision_checker, "check_predicted_motion_disks"):
+            report = self.collision_checker.check_predicted_motion_disks(
+                snapshot=snapshot,
+                control=control,
+                dt=safe_dt,
+                steps=steps,
+                obstacles=dynamic_obstacles,
+                robot_radius=robot_radius,
+            )
+            if capture is not None:
+                capture.predicted_collision = clearance_terms_from_report(
+                    report,
+                    checker="check_predicted_motion_disks",
+                    required_clearance=robot_radius,
+                )
+            if getattr(report, "collision", False):
+                return report
+
         if use_ground_truth and hasattr(self.collision_checker, "check_predicted_motion"):
             report = self.collision_checker.check_predicted_motion(
                 snapshot=snapshot,
@@ -7667,6 +7749,7 @@ class SimulationControllerMixin:
         dt: float,
         robot_radius: float,
         known_obstacle_points: list[tuple[float, float]],
+        dynamic_obstacles: list[tuple[float, float, float]] | None = None,
         capture=None,
     ) -> np.ndarray | None:
         """Return a safe rotate-in-place command after an unsafe tracking arc.
@@ -7735,6 +7818,7 @@ class SimulationControllerMixin:
                 dt=dt,
                 robot_radius=robot_radius,
                 known_obstacle_points=known_obstacle_points,
+                dynamic_obstacles=dynamic_obstacles,
                 use_ground_truth=True,
                 capture=capture,
             )
@@ -7832,15 +7916,15 @@ class SimulationControllerMixin:
             self.robot = robot
             target = self.active_target_xy()
             if target is not None:
-                dynamic_points = self.dynamic_robot_obstacle_points_for_robot(index)
                 # obstacle_points_for_segment_safety_check() (not the raw
                 # mapped_obstacle_points list) -- see that method's
-                # docstring; single-robot's build_observation() already
-                # uses it for this exact check, multi-robot must agree.
+                # docstring. Teammates are checked immediately below with
+                # exact combined-radius disks, so sampled robot point clouds
+                # would only duplicate that work.
                 active_segment_report = self.collision_checker.check_segment_points(
                     start=robot_position,
                     end=target,
-                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius) + dynamic_points,
+                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
                     robot_radius=robot_radius,
                 )
                 nav_debug_capture.active_segment = clearance_terms_from_report(
@@ -7926,18 +8010,18 @@ class SimulationControllerMixin:
                     float(flattened_control[1]),
                 )
 
-            # obstacle_points_for_segment_safety_check() (not the raw
-            # mapped_obstacle_points list) -- matches the active-segment
-            # check above and single-robot's predicted_motion_report call.
-            prediction_obstacle_points = (
-                self.obstacle_points_for_segment_safety_check(robot_position, robot_radius)
-                + self.dynamic_robot_obstacle_points_for_robot(index)
-            )
+            # Static mapped samples represent the same rectangles available to
+            # the simulator's integrity guard, so checking both collections is
+            # redundant. Predict against exact static rectangles and exact
+            # teammate disks; keep point-cloud checks for callers that truly
+            # have only sampled geometry.
+            prediction_dynamic_obstacles = self.dynamic_robot_obstacles_for_target_selection(index)
             prediction_report = self.predicted_motion_report(
                 control=control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=prediction_obstacle_points,
+                known_obstacle_points=None,
+                dynamic_obstacles=prediction_dynamic_obstacles,
                 use_ground_truth=True,
                 capture=nav_debug_capture,
             )
@@ -7950,7 +8034,8 @@ class SimulationControllerMixin:
                     target=target,
                     dt=dt,
                     robot_radius=robot_radius,
-                    known_obstacle_points=prediction_obstacle_points,
+                    known_obstacle_points=[],
+                    dynamic_obstacles=prediction_dynamic_obstacles,
                     capture=nav_debug_capture,
                 )
                 if rotation_escape is not None:
@@ -8461,7 +8546,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
+                known_obstacle_points=None,
                 use_ground_truth=True,
                 capture=nav_debug_capture,
             )
@@ -8550,7 +8635,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
+                known_obstacle_points=None,
                 use_ground_truth=True,
             )
             if predicted_report is not None and getattr(predicted_report, "collision", False):

@@ -82,3 +82,52 @@ def test_rounded_expansion_preserves_real_corner_and_edge_collisions():
     # A segment that genuinely crosses the rounded safety envelope is blocked.
     assert checker.check_segment((1.3, 1.3), (0.9, 0.9), [obstacle], safety_radius).collision
 
+
+def test_predicted_motion_disks_uses_combined_robot_radii():
+    checker = CollisionChecker()
+    snapshot = RobotSnapshot(
+        x=0.0,
+        y=0.0,
+        theta=0.0,
+        v=1.0,
+        max_speed=1.5,
+        max_acceleration=2.0,
+        max_angular_speed=2.5,
+    )
+
+    report = checker.check_predicted_motion_disks(
+        snapshot,
+        np.array([[0.0], [0.0]]),
+        dt=0.1,
+        steps=5,
+        obstacles=[(0.72, 0.0, 0.22)],
+        robot_radius=0.20,
+    )
+
+    assert report.collision
+    assert report.point == (0.72, 0.0)
+    assert report.distance is not None and report.distance <= 0.42 + 1e-9
+
+
+def test_predicted_motion_disks_leaves_clear_teammate_untouched():
+    checker = CollisionChecker()
+    snapshot = RobotSnapshot(
+        x=0.0,
+        y=0.0,
+        theta=0.0,
+        v=0.5,
+        max_speed=1.5,
+        max_acceleration=2.0,
+        max_angular_speed=2.5,
+    )
+
+    report = checker.check_predicted_motion_disks(
+        snapshot,
+        np.array([[0.0], [0.0]]),
+        dt=0.1,
+        steps=5,
+        obstacles=[(0.0, 1.0, 0.20)],
+        robot_radius=0.20,
+    )
+
+    assert not report.collision

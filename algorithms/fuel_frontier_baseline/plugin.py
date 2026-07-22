@@ -11,6 +11,7 @@ from robotics_interfaces.coordination import (
 )
 from robotics_interfaces.observations import Point2D, RobotCoordinationState
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -44,8 +45,21 @@ class FuelFrontierBaselinePlugin:
             PluginCapability.COORDINATION,
             PluginCapability.TARGET_GENERATION,
             PluginCapability.TASK_ALLOCATION,
+            # Reduces raw candidates/clusters to one representative viewpoint
+            # per frontier cluster (_best_candidate_per_frontier_cluster)
+            # before ranking -- that reduction is genuine task generation,
+            # not just picking one already-final candidate.
+            PluginCapability.TASK_GENERATION,
         ),
         source="FUEL/RACER-inspired 2D adapter; no middleware/C++ dependency",
+        # HYBRID: prefers host frontier_information_service/team_frontier_
+        # provider/frontier_provider input (in that priority order, see
+        # _candidate_pool's candidate_source_order), but falls back to its
+        # own deterministic angle-spread bootstrap candidate when none of
+        # those produce anything (e.g. t=0 empty map) and fuel_enable_
+        # bootstrap is set. debug["per_robot"][...]["candidate_source"]
+        # exports which source was actually used for a given decision.
+        candidate_input_mode=CandidateInputMode.HYBRID,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

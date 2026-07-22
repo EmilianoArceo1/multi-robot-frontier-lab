@@ -8,6 +8,7 @@ from robotics_interfaces.coordination import (
     RobotCoordinationState,
 )
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginContractError,
@@ -20,14 +21,26 @@ from robotics_interfaces.plugins import (
     validate_coordination_plugin,
 )
 from robotics_interfaces.commands import RobotCommand, RobotCommandStatus
+from robotics_interfaces.decision_context import (
+    CoordinationDecisionContext,
+    CoordinationScope,
+    CoordinationTrigger,
+    RobotRouteSnapshot,
+    VisitCountSnapshot,
+    build_robot_route_snapshot,
+)
 
 __all__ = [
     "AssignmentStatus",
+    "CandidateInputMode",
     "CandidateProposal",
     "CoordinationAssignment",
+    "CoordinationDecisionContext",
     "CoordinationPlugin",
     "CoordinationRequest",
     "CoordinationResult",
+    "CoordinationScope",
+    "CoordinationTrigger",
     "PluginCapability",
     "PluginContractError",
     "PluginFactory",
@@ -37,12 +50,20 @@ __all__ = [
     "RobotCommand",
     "RobotCommandStatus",
     "RobotCoordinationState",
+    "RobotRouteSnapshot",
+    "VisitCountSnapshot",
+    "build_robot_route_snapshot",
     "build_runtime_profile",
     "declares_capability",
     "plugin_owns",
     "validate_coordination_plugin",
 ]
 
+from robotics_interfaces.candidate_generation import (
+    CandidateGenerationRequest,
+    CandidateGenerationResult,
+    CandidateGenerator,
+)
 from robotics_interfaces.observations import WorldSnapshot
 from robotics_interfaces.proposals import ExplorationCandidate
 from robotics_interfaces.frontiers import FrontierCluster, ViewpointCandidate

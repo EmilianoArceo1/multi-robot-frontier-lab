@@ -94,3 +94,50 @@ def test_mouse_coordinates_can_be_disabled_from_configuration():
     assert _window.canvas.cursor_coordinates_enabled is False
     _window.cursor_coordinates_toggle.setChecked(True)
     assert _window.canvas.cursor_coordinates_enabled is True
+
+
+def test_route_visualization_toggles_are_independent_and_feed_config():
+    _window.traveled_path_switch.setChecked(True)
+    _window.planned_route_switch.setChecked(False)
+
+    config = _window.read_config()
+
+    assert config.show_traveled_path is True
+    assert config.show_path is False
+
+    _window.traveled_path_switch.setChecked(False)
+    _window.planned_route_switch.setChecked(True)
+
+
+def test_custom_discovery_reveals_obstacle_color_and_opacity_controls():
+    previous_mode = _window.map_visualization_combo.currentText()
+    try:
+        _window.map_visualization_combo.setCurrentText("Current")
+        assert _window.custom_obstacle_color_field.isHidden()
+        assert _window.custom_explored_opacity_field.isHidden()
+
+        _window.map_visualization_combo.setCurrentText("Custom Discovery")
+        assert not _window.custom_obstacle_color_field.isHidden()
+        assert not _window.custom_explored_opacity_field.isHidden()
+    finally:
+        _window.map_visualization_combo.setCurrentText(previous_mode)
+
+
+def test_custom_visual_values_are_collected_from_configuration_controls():
+    previous_color = _window.custom_obstacle_color_button.color_hex()
+    previous_opacity = _window.custom_explored_opacity_input.value()
+    previous_width = _window.mapped_obstacle_line_width_input.value()
+    try:
+        _window.custom_obstacle_color_button.set_color("#123456")
+        _window.custom_explored_opacity_input.setValue(45.0)
+        _window.mapped_obstacle_line_width_input.setValue(2.75)
+
+        config = _window.read_config()
+
+        assert config.custom_obstacle_color == "#123456"
+        assert config.custom_explored_opacity == 0.45
+        assert config.mapped_obstacle_line_width == 2.75
+    finally:
+        _window.custom_obstacle_color_button.set_color(previous_color)
+        _window.custom_explored_opacity_input.setValue(previous_opacity)
+        _window.mapped_obstacle_line_width_input.setValue(previous_width)

@@ -25,6 +25,7 @@ from robotics_interfaces.coordination import (
 )
 from robotics_interfaces.observations import Point2D, RobotCoordinationState, WorldBounds
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -186,8 +187,22 @@ class Nav2DMultiWavefrontPlugin:
             PluginCapability.COORDINATION,
             PluginCapability.TARGET_GENERATION,
             PluginCapability.TASK_ALLOCATION,
+            # This plugin rebuilds its own occupancy grid from
+            # request.world.explored_points/mapped_obstacle_points and finds
+            # frontier cells itself (_build_grid/_is_frontier) -- real
+            # frontier detection, not host-provided candidates.
+            PluginCapability.FRONTIER_DETECTION,
+            # The synchronized wavefront claims cells and selects one target
+            # per robot from its own detected frontier cells -- task
+            # generation over its own detection output, not host reduction.
+            PluginCapability.TASK_GENERATION,
         ),
         source="https://github.com/skasperski/navigation_2d",
+        # This plugin never reads request.services at all (no
+        # frontier_provider/team_frontier_provider/frontier_information_
+        # service) -- it must keep working with services=None. See
+        # test_nav2d_wavefront_assigns_targets_without_any_host_frontier_service.
+        candidate_input_mode=CandidateInputMode.PLUGIN_INTERNAL,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

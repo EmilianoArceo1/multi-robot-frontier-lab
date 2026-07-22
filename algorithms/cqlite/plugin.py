@@ -25,6 +25,7 @@ from robotics_interfaces.coordination import (
 )
 from robotics_interfaces.observations import Point2D, RobotCoordinationState
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -90,6 +91,15 @@ class CQLitePlugin:
             PluginCapability.TASK_ALLOCATION,
             PluginCapability.TARGET_GENERATION,
         ),
+        # TARGET_GENERATION is the deprecated capability, kept for backward
+        # compatibility. CQLite ranks candidates from
+        # frontier_information_service/team_frontier_provider/frontier_
+        # provider (in that priority order) -- it does not detect frontiers
+        # itself, hence HOST_CANDIDATES. Its Q-tables/neighbor communication
+        # are genuine learned state; the neighbor exchange itself is
+        # in-process emulation, not real networking -- see
+        # debug["communication"]["simulated"] in assign()'s result.
+        candidate_input_mode=CandidateInputMode.HOST_CANDIDATES,
     )
 
     def __init__(self) -> None:
@@ -455,12 +465,17 @@ class CQLitePlugin:
                 "neighbors_by_robot": {str(key): list(value) for key, value in neighbors.items()},
             },
             "communication": {
+                "simulated": True,
                 "messages_this_decision": call_messages,
                 "payload_bytes_this_decision": call_bytes,
                 "messages_cumulative": self._message_count,
                 "payload_bytes_cumulative": self._communication_bytes,
                 "map_merge_requests_cumulative": self._map_merge_requests,
-                "payload_model": "compact fields only; excludes middleware/transport overhead",
+                "payload_model": (
+                    "compact fields only; excludes middleware/transport overhead; "
+                    "no real network I/O occurs -- neighbor exchange is emulated "
+                    "in-process from the shared request.robot_states/world"
+                ),
             },
             "target_lifecycle": {
                 "confirmed_completed_robot_ids": sorted(completed_by_robot),

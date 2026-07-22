@@ -1179,6 +1179,12 @@ class SimulationControllerMixin:
             coordination_parameters=dict(
                 getattr(self.config, "coordination_parameters", {}) or {}
             ),
+            coordination_replan_interval_s=float(
+                getattr(self.config, "coordination_replan_interval_s", 0.0)
+            ),
+            coordination_strict_contracts=bool(
+                getattr(self.config, "coordination_strict_contracts", False)
+            ),
             exploration_replan_cooldown=max(0.0, float(self.exploration_cooldown_input.value())),
             ipp_distance_penalty=max(0.0, float(self.ipp_lambda_input.value())),
             vision_model=self.vision_combo.currentText(),
@@ -1187,10 +1193,20 @@ class SimulationControllerMixin:
             map_visualization=self.map_visualization_combo.currentText(),
             custom_unexplored_color=self.custom_unexplored_color_button.color_hex(),
             custom_explored_color=self.custom_explored_color_button.color_hex(),
+            custom_obstacle_color=self.custom_obstacle_color_button.color_hex(),
+            custom_explored_opacity=max(
+                0.0,
+                min(1.0, float(self.custom_explored_opacity_input.value()) / 100.0),
+            ),
+            mapped_obstacle_line_width=max(
+                0.25,
+                min(6.0, float(self.mapped_obstacle_line_width_input.value())),
+            ),
             robot_icon=self.robot_icon_combo.currentText(),
             obstacles=list(self.config.obstacles),
             show_goal_preview=self.preview_switch.isChecked(),
-            show_path=True,
+            show_path=self.planned_route_switch.isChecked(),
+            show_traveled_path=self.traveled_path_switch.isChecked(),
             show_vision=True,
             show_explored_area=self.explored_area_switch.isChecked(),
             show_obstacles=self.obstacles_switch.isChecked(),
@@ -1309,6 +1325,8 @@ class SimulationControllerMixin:
         self.preview_switch.setChecked(config.show_goal_preview)
         self.obstacles_switch.setChecked(config.show_obstacles)
         self.explored_area_switch.setChecked(config.show_explored_area)
+        self.planned_route_switch.setChecked(config.show_path)
+        self.traveled_path_switch.setChecked(config.show_traveled_path)
         self.planner_combo.setCurrentText(config.planner_type)
         self.path_simplifier_combo.setCurrentText(config.path_simplifier)
         self.exploration_planner_combo.setCurrentText(config.exploration_planner)
@@ -1321,6 +1339,9 @@ class SimulationControllerMixin:
         self.map_visualization_combo.setCurrentText(config.map_visualization)
         self.custom_unexplored_color_button.set_color(config.custom_unexplored_color)
         self.custom_explored_color_button.set_color(config.custom_explored_color)
+        self.custom_obstacle_color_button.set_color(config.custom_obstacle_color)
+        self.custom_explored_opacity_input.setValue(config.custom_explored_opacity * 100.0)
+        self.mapped_obstacle_line_width_input.setValue(config.mapped_obstacle_line_width)
         self.robot_icon_combo.setCurrentText(config.robot_icon)
         self.top_bar.mode_selector.setCurrentText(config.agent_mode)
 

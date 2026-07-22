@@ -34,6 +34,7 @@ from robotics_interfaces.coordination import (
 from robotics_interfaces.frontiers import FrontierCluster
 from robotics_interfaces.observations import Point2D, RobotCoordinationState
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -287,7 +288,18 @@ class FrontierClusterHungarianPlugin:
         capabilities=(
             PluginCapability.COORDINATION,
             PluginCapability.TASK_ALLOCATION,
+            # The grid-density reduction stage turns many host-detected
+            # FrontierClusters into a smaller set of tasks before allocation
+            # -- genuine task generation, not frontier detection (it never
+            # touches raw occupancy/explored points itself).
+            PluginCapability.TASK_GENERATION,
         ),
+        # The host detects connected frontier components
+        # (FrontierInformationService.get_frontier_clusters(), called exactly
+        # once per assign() -- see debug["frontier_information_service_calls"]);
+        # this plugin only reduces and allocates. It never falls back to
+        # frontier_provider/team_frontier_provider/its own detection.
+        candidate_input_mode=CandidateInputMode.HOST_FRONTIER_CLUSTERS,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

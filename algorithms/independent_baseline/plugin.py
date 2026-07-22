@@ -10,6 +10,7 @@ from robotics_interfaces.coordination import (
 )
 from robotics_interfaces.observations import Point2D, RobotCoordinationState
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -44,6 +45,13 @@ class IndependentBaselinePlugin:
             PluginCapability.TARGET_GENERATION,
             PluginCapability.TASK_ALLOCATION,
         ),
+        # TARGET_GENERATION above is the deprecated capability, kept for
+        # backward compatibility (PluginRuntimeProfile.owns_target_generation,
+        # existing tests). This plugin does not detect frontiers or reduce
+        # candidates into new tasks -- it only ranks candidates already
+        # provided by team_frontier_provider/frontier_provider/explicit
+        # proposals, hence HOST_CANDIDATES rather than PLUGIN_INTERNAL.
+        candidate_input_mode=CandidateInputMode.HOST_CANDIDATES,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

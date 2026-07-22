@@ -66,6 +66,42 @@ FRONTIER_OR_ENDPOINT_MARKER_RADIUS = 7
 DEFAULT_RENDER_THROTTLE_FPS = 30.0
 
 
+def ipp_uncertainty_rgba(values, mask) -> np.ndarray:
+    """Map a variance raster to a perceptually ordered, transparent RGBA image."""
+    grid = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(mask, dtype=np.bool_)
+    if grid.ndim != 2 or valid.shape != grid.shape or not np.any(valid):
+        raise ValueError("IPP variance and mask must be matching non-empty 2-D arrays.")
+    low = float(np.min(grid[valid]))
+    high = float(np.max(grid[valid]))
+    if high - low <= 1e-12:
+        normalized = np.full(grid.shape, 0.5, dtype=np.float64)
+    else:
+        normalized = np.clip((grid - low) / (high - low), 0.0, 1.0)
+
+    # Viridis-like anchors: low uncertainty is dark violet/blue, high
+    # uncertainty is yellow.  The ordered lightness remains readable on both
+    # application themes and cannot be mistaken for the red/orange hazard map.
+    anchors = np.array(
+        [
+            [68, 1, 84],
+            [59, 82, 139],
+            [33, 145, 140],
+            [94, 201, 98],
+            [253, 231, 37],
+        ],
+        dtype=np.float64,
+    )
+    scaled = normalized * (len(anchors) - 1)
+    lower = np.minimum(scaled.astype(np.int32), len(anchors) - 2)
+    fraction = (scaled - lower)[..., None]
+    rgb = anchors[lower] * (1.0 - fraction) + anchors[lower + 1] * fraction
+    rgba = np.zeros((*grid.shape, 4), dtype=np.uint8)
+    rgba[..., :3] = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+    rgba[..., 3] = np.where(valid, 142, 0).astype(np.uint8)
+    return rgba
+
+
 def _fit_world_span_to_plot_aspect(
     span_x: float,
     span_y: float,
@@ -283,6 +319,7 @@ class SimulationCanvas(QWidget):
         self.setObjectName("canvasCard")
         self.setMinimumSize(610, 500)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
 
         self._theme_mode = ThemeMode.LIGHT
 
@@ -293,6 +330,12 @@ class SimulationCanvas(QWidget):
         self.multi_path_points: list[list[tuple[float, float]]] = []
         self.multi_last_controls: list[np.ndarray] = []
         self.planned_path_points: list[tuple[float, float]] = []
+        # Optional, validated paper-experiment layer.  It is separate from the
+        # hazard and occupancy maps because it represents a scalar field and GP
+        # posterior uncertainty, not collision geometry.
+        self._ipp_experiment_bundle = None
+        self._ipp_variance_pixmap_cache: QPixmap | None = None
+        self._ipp_variance_pixmap_cache_key: tuple | None = None
         # Read-only snapshot of the independent continuous hazard field
         # (GROUND TRUTH -- kept for legacy/potential editor use only; see
         # draw_fires(), no longer called from the live paint loop).
@@ -330,6 +373,15 @@ class SimulationCanvas(QWidget):
         self.show_hazard_map = False
         self.show_fire_markers = False
         self.exploration_target_xy: tuple[float, float] | None = None
+        self.frontier_reasoning_overlay_enabled = False
+        self.frontier_reasoning_simulation_paused = False
+        self.frontier_reasoning_decision: dict | None = None
+        self.frontier_reasoning_inspection: dict | None = None
+        self.frontier_reasoning_cluster_view_enabled = False
+        self.frontier_reasoning_clusters: tuple[dict, ...] = ()
+        self.cursor_coordinates_enabled = True
+        self.cursor_coordinate_position: tuple[float, float] | None = None
+        self.cursor_coordinate_world: tuple[float, float] | None = None
         self.multi_exploration_targets: list[tuple[float, float] | None] = []
         self.multi_invalidated_exploration_targets: list[list[tuple[float, float]]] = []
         self.explored_area_polygons: list[list[tuple[float, float]]] = []
@@ -452,6 +504,8 @@ class SimulationCanvas(QWidget):
         # (not running, or no belief map yet) only resolution grid lines
         # are drawn.
         self.grid_overlay_enabled = False
+        self.grid_cell_values_enabled = False
+        self.frontier_decisions_enabled = False
         self._grid_overlay_resolution = 0.50
         self._grid_overlay_snapshot: dict | None = None
         self._grid_overlay_snapshot_version = 0
@@ -945,6 +999,13 @@ class SimulationCanvas(QWidget):
         if previous_camera != current_camera:
             self.invalidate_view_transform_caches()
 
+        self.update()
+
+    def set_ipp_experiment_bundle(self, bundle) -> None:
+        """Install a validated RSS26 visualization bundle, or clear it."""
+        self._ipp_experiment_bundle = bundle
+        self._ipp_variance_pixmap_cache = None
+        self._ipp_variance_pixmap_cache_key = None
         self.update()
 
     def set_robot(self, robot):
@@ -1841,6 +1902,14 @@ class SimulationCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
+        if self.cursor_coordinates_enabled and self.plot_rect().contains(int(pos.x()), int(pos.y())):
+            world_x, world_y = self.screen_to_world(pos.x(), pos.y())
+            self.cursor_coordinate_position = (float(pos.x()), float(pos.y()))
+            self.cursor_coordinate_world = (float(world_x), float(world_y))
+        else:
+            self.cursor_coordinate_position = None
+            self.cursor_coordinate_world = None
+        self.update()
         if self.editor_mode and self.editor_pan_active and self.editor_last_pan_pos is not None:
             pos = event.position()
             dx = pos.x() - self.editor_last_pan_pos[0]
@@ -1893,6 +1962,12 @@ class SimulationCanvas(QWidget):
         x = clamp(x + dx, WORLD_X_MIN, WORLD_X_MAX)
         y = clamp(y + dy, WORLD_Y_MIN, WORLD_Y_MAX)
         self.robotDragged.emit(int(self.dragging_robot_index), float(x), float(y))
+
+    def leaveEvent(self, event):
+        self.cursor_coordinate_position = None
+        self.cursor_coordinate_world = None
+        self.update()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self.editor_mode and self.editor_pan_active:
@@ -2670,6 +2745,10 @@ class SimulationCanvas(QWidget):
         self.draw_grid_overlay(painter, rect)
         self._render_layer_ms["grid_overlay"] = (time.perf_counter() - _grid_overlay_start) * 1000.0
 
+        # Scientific raster for the RSS26 reproduction.  It sits above the
+        # generic map/grid and below every piece of physical geometry.
+        self.draw_ipp_uncertainty_heatmap(painter)
+
         # Always-visible physical world layers.
         # These are not "robot orders"; they are what the simulation world
         # actually contains or what the robot has already sensed.
@@ -2709,6 +2788,7 @@ class SimulationCanvas(QWidget):
         # source filter, no shared cache (see draw_fire_markers()'s own
         # docstring).
         self.draw_fire_markers(painter)
+        self.draw_ipp_reference_overlay(painter)
         self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 
         # Robot-related layers, broken down into named sub-buckets for the
@@ -2762,12 +2842,20 @@ class SimulationCanvas(QWidget):
             self.draw_navigation_debug_overlay(painter)
         self._render_layer_ms["navigation_debug"] = (time.perf_counter() - _nav_debug_start) * 1000.0
 
+        self.draw_frontier_clusters(painter)
+        # Candidate inspection is intentionally the final map-space overlay:
+        # Navigation Debug paints dense grid/frontier annotations and would
+        # otherwise cover the focus ring selected with the panel's < > buttons.
+        self.draw_frontier_candidate_inspection(painter)
+
         _grid_preview_start = time.perf_counter()
         # Drawn last so the temporary red preview is clearly visible over
         # every other layer while the user is comparing grid resolutions.
         self.draw_grid_resolution_preview(painter, rect)
         _grid_preview_ms = (time.perf_counter() - _grid_preview_start) * 1000.0
         self._render_layer_ms["grid_preview"] = _grid_preview_ms
+
+        self.draw_cursor_coordinates(painter)
 
         painter.restore()
 
@@ -2989,10 +3077,57 @@ class SimulationCanvas(QWidget):
 
     def set_grid_overlay_enabled(self, enabled: bool) -> None:
         self.grid_overlay_enabled = bool(enabled)
+        self._grid_overlay_cache_key = None
+        self.update()
+
+    def set_frontier_reasoning_overlay_enabled(self, enabled: bool) -> None:
+        self.frontier_reasoning_overlay_enabled = bool(enabled)
+        self.update()
+
+    def set_frontier_reasoning_simulation_paused(self, paused: bool) -> None:
+        self.frontier_reasoning_simulation_paused = bool(paused)
+        self.update()
+
+    def set_frontier_reasoning_decision(self, decision: dict | None) -> None:
+        self.frontier_reasoning_decision = None if decision is None else dict(decision)
+        if decision is None:
+            self.frontier_reasoning_inspection = None
+        self.update()
+
+    def set_frontier_reasoning_inspection(self, candidate: dict | None) -> None:
+        """Highlight a ranked candidate without changing the planner's target."""
+        self.frontier_reasoning_inspection = None if candidate is None else dict(candidate)
+        self.update()
+
+    def set_frontier_reasoning_cluster_view_enabled(self, enabled: bool) -> None:
+        self.frontier_reasoning_cluster_view_enabled = bool(enabled)
+        # Frontier labels/fills are part of the cached grid overlay.
+        self._grid_overlay_cache_key = None
+        self.update()
+
+    def set_frontier_reasoning_clusters(self, clusters) -> None:
+        self.frontier_reasoning_clusters = tuple(dict(cluster) for cluster in (clusters or ()))
+        self.update()
+
+    def set_cursor_coordinates_enabled(self, enabled: bool) -> None:
+        self.cursor_coordinates_enabled = bool(enabled)
+        if not self.cursor_coordinates_enabled:
+            self.cursor_coordinate_position = None
+            self.cursor_coordinate_world = None
         self.update()
 
     def is_grid_overlay_enabled(self) -> bool:
         return bool(self.grid_overlay_enabled)
+
+    def set_grid_cell_values_enabled(self, enabled: bool) -> None:
+        self.grid_cell_values_enabled = bool(enabled)
+        self._grid_overlay_cache_key = None
+        self.update()
+
+    def set_frontier_decisions_enabled(self, enabled: bool) -> None:
+        self.frontier_decisions_enabled = bool(enabled)
+        self._grid_overlay_cache_key = None
+        self.update()
 
     # ------------------------------------------------------------------
     # Hazard Map / Fire Markers toggles. Independent of each other and of
@@ -3279,7 +3414,12 @@ class SimulationCanvas(QWidget):
         """
         historical_environment = self._decoded_navigation_debug_environment()
         history_active = historical_environment is not None
-        if not self.grid_overlay_enabled and not history_active:
+        overlay_requested = bool(
+            self.grid_overlay_enabled
+            or self.grid_cell_values_enabled
+            or self.frontier_decisions_enabled
+        )
+        if not overlay_requested and not history_active:
             self._grid_overlay_last_cache_status = "off"
             self._grid_overlay_last_visible_cells = 0
             self._grid_overlay_degraded = False
@@ -3332,6 +3472,9 @@ class SimulationCanvas(QWidget):
             getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION),
             getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
             getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
+            bool(self.grid_overlay_enabled),
+            bool(self.grid_cell_values_enabled),
+            bool(self.frontier_decisions_enabled),
         )
 
         if self._grid_overlay_cache is not None and self._grid_overlay_cache_key == cache_key:
@@ -3368,12 +3511,15 @@ class SimulationCanvas(QWidget):
         cache_painter.setClipRect(rect)
 
         _cells_start = time.perf_counter()
-        if snapshot is not None and cell_bounds is not None:
+        if self.grid_overlay_enabled and snapshot is not None and cell_bounds is not None:
             self._draw_grid_overlay_cells(cache_painter, snapshot, cell_bounds)
         self._grid_overlay_cells_ms = (time.perf_counter() - _cells_start) * 1000.0
 
         _lines_start = time.perf_counter()
-        self._draw_grid_overlay_lines(cache_painter, rect, resolution)
+        if self.grid_overlay_enabled:
+            self._draw_grid_overlay_lines(cache_painter, rect, resolution)
+        if snapshot is not None and cell_bounds is not None:
+            self._draw_grid_debug_labels(cache_painter, snapshot, cell_bounds)
         self._grid_overlay_lines_ms = (time.perf_counter() - _lines_start) * 1000.0
 
         cache_painter.restore()
@@ -3459,6 +3605,80 @@ class SimulationCanvas(QWidget):
                         abs(syB - syA),
                     )
                 )
+
+    def _draw_grid_debug_labels(
+        self,
+        painter: QPainter,
+        snapshot: dict,
+        cell_bounds: tuple[int, int, int, int],
+    ) -> None:
+        """Draw occupancy values and frontier semantics as separate layers.
+
+        Occupancy owns only -1/0/1. A frontier is a FREE cell adjacent to
+        UNKNOWN, so it is highlighted with an ``F`` without replacing the
+        underlying occupancy value. Labels are hidden when cells are too
+        small to read; frontier tint remains visible while zoomed out.
+        """
+        grid = snapshot.get("grid")
+        bounds = snapshot.get("bounds")
+        resolution = float(snapshot.get("resolution") or 0.0)
+        if grid is None or bounds is None or resolution <= 0.0:
+            return
+
+        col_start, col_end, row_start, row_end = cell_bounds
+        x_min, _x_max, y_min, _y_max = bounds
+        frontier_cells = {
+            (int(row), int(col))
+            for row, col in snapshot.get("frontier_cells", ())
+            if row_start <= int(row) <= row_end and col_start <= int(col) <= col_end
+        }
+        bfs_steps = snapshot.get("bfs_steps")
+
+        sx0, sy0 = self.world_to_screen(0.0, 0.0)
+        sx1, sy1 = self.world_to_screen(resolution, resolution)
+        cell_px = min(abs(sx1 - sx0), abs(sy1 - sy0))
+        painter.save()
+        font = QFont(painter.font())
+        # Keep semantic labels visible at every zoom level where per-cell
+        # drawing itself is active.  Scaling down is preferable to abruptly
+        # hiding -1/0/1 or F; the visible-cell degradation cap above still
+        # protects performance for extremely dense, zoomed-out grids.
+        font.setPixelSize(max(4, min(14, int(round(cell_px * 0.48)))))
+        font.setBold(True)
+        painter.setFont(font)
+
+        for row in range(row_start, row_end + 1):
+            for col in range(col_start, col_end + 1):
+                cx0 = x_min + col * resolution
+                cy0 = y_min + row * resolution
+                sx_a, sy_a = self.world_to_screen(cx0, cy0)
+                sx_b, sy_b = self.world_to_screen(cx0 + resolution, cy0 + resolution)
+                cell_rect = QRectF(
+                    min(sx_a, sx_b), min(sy_a, sy_b),
+                    abs(sx_b - sx_a), abs(sy_b - sy_a),
+                )
+
+                is_frontier = (row, col) in frontier_cells
+                show_frontier_cells = self.frontier_decisions_enabled and not self.frontier_reasoning_cluster_view_enabled
+                if show_frontier_cells and is_frontier:
+                    painter.fillRect(cell_rect.adjusted(1, 1, -1, -1), QColor(255, 190, 40, 92))
+                    painter.setPen(QPen(QColor(180, 105, 0, 220), 2))
+                    painter.drawRect(cell_rect.adjusted(1, 1, -1, -1))
+
+                if show_frontier_cells and is_frontier:
+                    painter.setPen(QColor(110, 55, 0, 245))
+                    step = int(bfs_steps[row, col]) if bfs_steps is not None else -1
+                    painter.drawText(cell_rect, Qt.AlignCenter, f"F:{step}" if step >= 0 else "F")
+                elif self.frontier_decisions_enabled and bfs_steps is not None and int(bfs_steps[row, col]) >= 0:
+                    painter.setPen(QColor(80, 65, 25, 220))
+                    painter.drawText(cell_rect, Qt.AlignCenter, str(int(bfs_steps[row, col])))
+                elif self.grid_cell_values_enabled:
+                    state = int(grid[row, col])
+                    color = QColor(180, 30, 30, 235) if state == 1 else QColor(25, 65, 95, 225)
+                    painter.setPen(color)
+                    painter.drawText(cell_rect, Qt.AlignCenter, str(state))
+
+        painter.restore()
 
     def current_robot_pose(self) -> tuple[float, float, float, float]:
         if self.robot is not None:
@@ -4334,6 +4554,115 @@ class SimulationCanvas(QWidget):
         painter.drawPixmap(0, 0, self._mapped_points_cache)
         painter.restore()
 
+    def draw_ipp_uncertainty_heatmap(self, painter: QPainter) -> None:
+        """Draw posterior GP variance from a validated paper bundle."""
+        bundle = self._ipp_experiment_bundle
+        if bundle is None:
+            return
+        variance = np.asarray(bundle.posterior_variance, dtype=np.float64)
+        mask = np.asarray(bundle.mask, dtype=np.bool_)
+        key = (
+            str(getattr(bundle, "manifest_path", "")),
+            variance.shape,
+            float(np.min(variance[mask])),
+            float(np.max(variance[mask])),
+            str(getattr(bundle, "raster_origin", "lower")),
+        )
+        if self._ipp_variance_pixmap_cache is None or self._ipp_variance_pixmap_cache_key != key:
+            rgba = ipp_uncertainty_rgba(variance, mask)
+            # Dataset row zero follows raster_origin; QImage row zero is top.
+            if str(getattr(bundle, "raster_origin", "lower")) == "lower":
+                rgba = np.flipud(rgba)
+            rgba = np.ascontiguousarray(rgba)
+            height, width = rgba.shape[:2]
+            image = QImage(
+                rgba.data,
+                width,
+                height,
+                int(rgba.strides[0]),
+                QImage.Format_RGBA8888,
+            ).copy()
+            self._ipp_variance_pixmap_cache = QPixmap.fromImage(image)
+            self._ipp_variance_pixmap_cache_key = key
+
+        if self._ipp_variance_pixmap_cache is None:
+            return
+        x_min, x_max, y_min, y_max = map(float, bundle.data_world_bounds)
+        left, top = self.world_to_screen(x_min, y_max)
+        right, bottom = self.world_to_screen(x_max, y_min)
+        target = QRectF(
+            min(left, right),
+            min(top, bottom),
+            abs(right - left),
+            abs(bottom - top),
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(target, self._ipp_variance_pixmap_cache, QRectF(self._ipp_variance_pixmap_cache.rect()))
+        painter.restore()
+
+    def draw_ipp_reference_overlay(self, painter: QPainter) -> None:
+        """Draw the paper's pilot path, planned tour, sensing sites and FoVs."""
+        bundle = self._ipp_experiment_bundle
+        if bundle is None:
+            return
+
+        def draw_polyline(points, pen: QPen) -> None:
+            points = np.asarray(points, dtype=float)
+            if len(points) < 2:
+                return
+            path = QPainterPath()
+            sx, sy = self.world_to_screen(float(points[0, 0]), float(points[0, 1]))
+            path.moveTo(sx, sy)
+            for point in points[1:]:
+                sx, sy = self.world_to_screen(float(point[0]), float(point[1]))
+                path.lineTo(sx, sy)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(path)
+
+        painter.save()
+
+        # FoV polygons are intentionally translucent violet.  Unlike the old
+        # rendering bug, each patch is a bounded sensing footprint at a chosen
+        # site, not a filled polygon connecting a robot to its frontier.
+        painter.setPen(QPen(QColor(126, 87, 194, 145), 1.0))
+        painter.setBrush(QBrush(QColor(126, 87, 194, 28)))
+        for polygon in np.asarray(bundle.fovs, dtype=float):
+            if len(polygon) < 3:
+                continue
+            path = QPainterPath()
+            sx, sy = self.world_to_screen(float(polygon[0, 0]), float(polygon[0, 1]))
+            path.moveTo(sx, sy)
+            for point in polygon[1:]:
+                sx, sy = self.world_to_screen(float(point[0]), float(point[1]))
+                path.lineTo(sx, sy)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        pilot_pen = QPen(QColor(0, 137, 123, 220), 2.0)
+        pilot_pen.setStyle(Qt.DashLine)
+        draw_polyline(bundle.pilot_path, pilot_pen)
+        draw_polyline(bundle.solution_path, QPen(QColor(211, 47, 47, 235), 2.6))
+
+        painter.setPen(QPen(QColor(117, 0, 30, 230), 1.0))
+        painter.setBrush(QBrush(QColor(255, 235, 59, 245)))
+        for point in np.asarray(bundle.sensing_points, dtype=float):
+            sx, sy = self.world_to_screen(float(point[0]), float(point[1]))
+            painter.drawEllipse(QPointF(sx, sy), 3.2, 3.2)
+
+        metrics = getattr(bundle, "metrics", {})
+        method = str(metrics.get("method", "uncertainty-guaranteed IPP"))
+        maximum = float(np.max(np.asarray(bundle.posterior_variance)[np.asarray(bundle.mask)]))
+        label = f"RSS 2026 · {method} · max posterior variance {maximum:.3g}"
+        rect = self.plot_rect()
+        label_rect = QRectF(rect.left() + 10, rect.top() + 9, max(240.0, rect.width() - 20), 25)
+        painter.setPen(QPen(QColor(255, 255, 255, 225), 5.0))
+        painter.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+        painter.setPen(QPen(QColor(25, 35, 45, 245), 1.0))
+        painter.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+        painter.restore()
+
     def _build_hazard_pixmap(self, snapshot: dict) -> QPixmap | None:
         grid = np.asarray(snapshot.get("grid"), dtype=np.float32)
         if grid.ndim != 2 or grid.size == 0:
@@ -4840,6 +5169,27 @@ class SimulationCanvas(QWidget):
             path.lineTo(sx, sy)
         return path
 
+    def _multi_robot_body_radius_px(self, robot_index: int) -> float:
+        """Return the same screen-space body radius used by robot drawing."""
+        body_radius = float(self.config.body_radius)
+        if 0 <= int(robot_index) < len(self.robots):
+            body_radius = float(
+                getattr(self.robots[int(robot_index)], "_sim_body_radius", body_radius)
+            )
+        return max(5.0, body_radius * self.pixels_per_meter())
+
+    def _multi_frontier_marker_radius_px(self, robot_index: int) -> float:
+        """A compact assignment marker that never outweighs its robot.
+
+        Frontiers are points of interest, not physical world footprints.  Keep
+        them legible in screen space, but derive their size from the same
+        body-radius scale as the owning robot and cap them at the established
+        endpoint-marker size.  This is rendering-only; planner coordinates and
+        tolerances are intentionally untouched.
+        """
+        body_px = self._multi_robot_body_radius_px(robot_index)
+        return min(float(FRONTIER_OR_ENDPOINT_MARKER_RADIUS), max(5.0, body_px * 0.8))
+
     def _draw_waypoint_marker(
         self,
         painter: QPainter,
@@ -4849,16 +5199,27 @@ class SimulationCanvas(QWidget):
         endpoint: bool,
         endpoint_is_goal: bool,
         color: QColor,
+        endpoint_radius: float | None = None,
+        endpoint_fill: QColor | None = None,
+        endpoint_label: str | None = None,
     ) -> None:
         sx, sy = self.world_to_screen(*point)
         if endpoint:
-            radius = FRONTIER_OR_ENDPOINT_MARKER_RADIUS
-            fill = QColor(GREEN) if endpoint_is_goal else QColor(146, 62, 160)
-            label = "G" if endpoint_is_goal else "F"
+            radius = (
+                float(FRONTIER_OR_ENDPOINT_MARKER_RADIUS)
+                if endpoint_radius is None
+                else max(1.0, float(endpoint_radius))
+            )
+            fill = (
+                QColor(GREEN)
+                if endpoint_is_goal
+                else QColor(endpoint_fill) if endpoint_fill is not None else QColor(146, 62, 160)
+            )
+            label = "G" if endpoint_is_goal else (endpoint_label or "F")
             painter.setPen(QPen(QColor("white"), 2.0))
             painter.setBrush(QBrush(fill))
             painter.drawEllipse(QRectF(sx - radius, sy - radius, 2 * radius, 2 * radius))
-            painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            painter.setFont(QFont("Segoe UI", 7 if len(label) > 1 else 8, QFont.Bold))
             painter.setPen(QPen(QColor("white")))
             painter.drawText(QRectF(sx - radius, sy - radius, 2 * radius, 2 * radius), Qt.AlignCenter, label)
             return
@@ -5002,6 +5363,13 @@ class SimulationCanvas(QWidget):
             route_color = QColor(color)
             route_color.setAlpha(215)
             painter.setPen(QPen(route_color, 2.2, Qt.DashLine, Qt.RoundCap, Qt.RoundJoin))
+            # QPainterPath treats an open polyline as implicitly closed when
+            # a brush is active.  _draw_waypoint_marker() intentionally uses
+            # a purple brush for frontier endpoints, so without resetting the
+            # brush here that state leaked into the *next* robot's route and
+            # filled the area enclosed by its bends (often a large purple
+            # wedge between the robot and F marker).  Routes are strokes only.
+            painter.setBrush(Qt.NoBrush)
             painter.drawPath(self._rebuild_route_path(remaining))
 
             goal_xy = self.current_goal_xy()
@@ -5018,6 +5386,13 @@ class SimulationCanvas(QWidget):
                     endpoint=endpoint,
                     endpoint_is_goal=endpoint_is_goal,
                     color=color,
+                    endpoint_radius=(
+                        None
+                        if endpoint_is_goal
+                        else self._multi_frontier_marker_radius_px(robot_index)
+                    ),
+                    endpoint_fill=None if endpoint_is_goal else color,
+                    endpoint_label=None if endpoint_is_goal else f"F{robot_index + 1}",
                 )
         painter.restore()
 
@@ -5260,6 +5635,141 @@ class SimulationCanvas(QWidget):
 
         painter.restore()
 
+    def draw_frontier_reasoning_overlay(self, painter: QPainter) -> None:
+        """Draw the selected frontier's live geometric inputs beside the decision."""
+        if (
+            not self.frontier_reasoning_overlay_enabled
+            or not self.frontier_reasoning_simulation_paused
+            or not self.frontier_reasoning_decision
+        ):
+            return
+        data = self.frontier_reasoning_decision
+        robot = data.get("robot")
+        frontier = data.get("frontier")
+        if robot is None or frontier is None:
+            return
+        rx, ry = float(robot[0]), float(robot[1])
+        fx, fy = float(frontier[0]), float(frontier[1])
+        rsx, rsy = self.world_to_screen(rx, ry)
+        fsx, fsy = self.world_to_screen(fx, fy)
+        distance = float(data.get("distance", math.hypot(fx - rx, fy - ry)))
+        terms = list(data.get("terms", ()))[:4]
+
+        painter.save()
+        accent = QColor(245, 166, 35, 235)
+        painter.setPen(QPen(accent, 2.0, Qt.DashLine))
+        painter.drawLine(QPointF(rsx, rsy), QPointF(fsx, fsy))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+
+        def label(x: float, y: float, text: str) -> None:
+            metrics = painter.fontMetrics()
+            rect = metrics.boundingRect(text).adjusted(-6, -4, 6, 4)
+            box = QRectF(x, y, rect.width(), rect.height())
+            painter.fillRect(box, QColor(20, 27, 38, 220))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(box, Qt.AlignCenter, text)
+
+        label(rsx + 12, rsy - 30, f"R ({rx:.2f}, {ry:.2f})")
+        label(fsx + 12, fsy - 30, f"F ({fx:.2f}, {fy:.2f})")
+        mid_x, mid_y = (rsx + fsx) / 2.0, (rsy + fsy) / 2.0
+        label(mid_x + 8, mid_y - 22, f"d(R,F) = {distance:.2f} m")
+        if terms:
+            label(fsx + 12, fsy + 8, "  |  ".join(str(term) for term in terms))
+        painter.restore()
+
+    def draw_frontier_clusters(self, painter: QPainter) -> None:
+        """Color the actual connected frontier components exported by the planner."""
+        if (
+            not self.frontier_reasoning_overlay_enabled
+            or not self.frontier_reasoning_simulation_paused
+            or not self.frontier_reasoning_cluster_view_enabled
+            or not self.frontier_reasoning_clusters
+        ):
+            return
+        palette = (
+            QColor(0, 174, 239), QColor(238, 75, 138), QColor(84, 190, 121),
+            QColor(156, 102, 204), QColor(255, 145, 45), QColor(32, 191, 184),
+            QColor(225, 196, 35), QColor(95, 122, 230),
+        )
+        painter.save()
+        for index, cluster in enumerate(self.frontier_reasoning_clusters):
+            color = QColor(palette[index % len(palette)])
+            fill = QColor(color)
+            fill.setAlpha(48)
+            edge = QColor(color)
+            edge.setAlpha(125)
+            painter.setBrush(QBrush(fill))
+            painter.setPen(QPen(edge, 1.0))
+            resolution = max(0.01, float(cluster.get("resolution", 0.25) or 0.25))
+            half = resolution * 0.5
+            for x, y in cluster.get("points", ()):
+                sx0, sy0 = self.world_to_screen(float(x) - half, float(y) - half)
+                sx1, sy1 = self.world_to_screen(float(x) + half, float(y) + half)
+                rect = QRectF(min(sx0, sx1), min(sy0, sy1), abs(sx1 - sx0), abs(sy1 - sy0))
+                painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+        painter.restore()
+
+    def draw_frontier_candidate_inspection(self, painter: QPainter) -> None:
+        """Draw a compact focus ring for the candidate browsed in the panel."""
+        if (
+            not self.frontier_reasoning_overlay_enabled
+            or not self.frontier_reasoning_simulation_paused
+            or not self.frontier_reasoning_inspection
+        ):
+            return
+        frontier = self.frontier_reasoning_inspection.get("frontier")
+        if frontier is None:
+            return
+        sx, sy = self.world_to_screen(float(frontier[0]), float(frontier[1]))
+        index = int(self.frontier_reasoning_inspection.get("index", 0))
+        count = int(self.frontier_reasoning_inspection.get("count", 0))
+        painter.save()
+        glow = QColor(255, 196, 46, 70)
+        accent = QColor(255, 174, 0, 245)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(glow))
+        painter.drawEllipse(QRectF(sx - 22, sy - 22, 44, 44))
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(accent, 4.0))
+        painter.drawEllipse(QRectF(sx - 14, sy - 14, 28, 28))
+        painter.setBrush(QBrush(QColor(20, 27, 38, 225)))
+        painter.setPen(QPen(QColor("white"), 1.5))
+        badge = QRectF(sx + 11, sy - 25, 42, 20)
+        painter.drawRoundedRect(badge, 5, 5)
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        painter.drawText(badge, Qt.AlignCenter, f"{index}/{count}")
+        painter.restore()
+
+    def draw_cursor_coordinates(self, painter: QPainter) -> None:
+        """Draw the world coordinate beside the mouse while it is over the map."""
+        if (
+            not self.cursor_coordinates_enabled
+            or self.cursor_coordinate_position is None
+            or self.cursor_coordinate_world is None
+        ):
+            return
+        mouse_x, mouse_y = self.cursor_coordinate_position
+        world_x, world_y = self.cursor_coordinate_world
+        text = f"({world_x:.2f}, {world_y:.2f})"
+        plot = self.plot_rect()
+        painter.save()
+        painter.setFont(QFont("Consolas", 9, QFont.Bold))
+        metrics = painter.fontMetrics()
+        text_rect = metrics.boundingRect(text).adjusted(-7, -4, 7, 4)
+        box_x = mouse_x + 14.0
+        box_y = mouse_y + 14.0
+        if box_x + text_rect.width() > plot.right():
+            box_x = mouse_x - text_rect.width() - 14.0
+        if box_y + text_rect.height() > plot.bottom():
+            box_y = mouse_y - text_rect.height() - 14.0
+        box = QRectF(box_x, box_y, text_rect.width(), text_rect.height())
+        painter.setPen(QPen(QColor(255, 255, 255, 210), 1.0))
+        painter.setBrush(QBrush(QColor(20, 27, 38, 225)))
+        painter.drawRoundedRect(box, 5, 5)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(box, Qt.AlignCenter, text)
+        painter.restore()
+
     def draw_goal_and_robot(self, painter: QPainter):
         history_position, _history_total = self._nav_debug_history_position
         if self.navigation_debug_enabled and history_position is not None and self._nav_debug_snapshot is not None:
@@ -5322,11 +5832,16 @@ class SimulationCanvas(QWidget):
                     continue
                 tx_s, ty_s = self.world_to_screen(tx, ty)
                 color = robot_color(target_index)
+                radius = self._multi_frontier_marker_radius_px(target_index)
                 painter.setPen(QPen(QColor("white"), 2.0))
                 painter.setBrush(QBrush(color))
-                painter.drawEllipse(QRectF(tx_s - 11, ty_s - 11, 22, 22))
+                painter.drawEllipse(QRectF(tx_s - radius, ty_s - radius, 2 * radius, 2 * radius))
                 painter.setPen(QPen(QColor("white")))
-                painter.drawText(QRectF(tx_s - 11, ty_s - 11, 22, 22), Qt.AlignCenter, f"F{target_index + 1}")
+                painter.drawText(
+                    QRectF(tx_s - radius, ty_s - radius, 2 * radius, 2 * radius),
+                    Qt.AlignCenter,
+                    f"F{target_index + 1}",
+                )
             painter.restore()
         elif self.exploration_target_xy is not None:
             tx, ty = self.exploration_target_xy
@@ -5390,12 +5905,11 @@ class SimulationCanvas(QWidget):
         # multi-robot equivalent exists yet.
         if self.robots and "Multiple" in self.config.agent_mode:
             painter.save()
-            px_per_meter = self.pixels_per_meter()
 
             for index, robot in enumerate(self.robots):
                 sx, sy = self.world_to_screen(float(robot.x), float(robot.y))
                 color = robot_color(index)
-                body_px = max(5.0, float(getattr(robot, "_sim_body_radius", self.config.body_radius)) * px_per_meter)
+                body_px = self._multi_robot_body_radius_px(index)
 
                 self.draw_robot_icon(
                     painter,

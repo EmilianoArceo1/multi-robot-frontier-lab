@@ -249,6 +249,44 @@ def _inside_bounds(point: tuple[float, float], bounds: tuple[float, float, float
     return x_min <= point[0] <= x_max and y_min <= point[1] <= y_max
 
 
+def _bounded_cells_in_radius(
+    target: tuple[float, float],
+    *,
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    radius: float,
+):
+    """Yield grid cells inside both ``bounds`` and a world-space disk.
+
+    The former information-gain loop first visited the entire sensor square
+    and only then rejected cells outside the map. A 15 m LiDAR on a 0.25 m
+    grid therefore examined 14,641 offsets for every frontier even when the
+    whole map contained far fewer cells. Clamp the integer ranges up front and
+    use squared distances so the result is identical without millions of
+    temporary tuples, ``hypot`` calls, and bounds checks.
+    """
+    resolution = max(float(resolution), 1e-6)
+    radius = max(float(radius), 0.0)
+    search_radius = max(radius, resolution)
+    tx, ty = float(target[0]), float(target[1])
+    x_min, x_max, y_min, y_max = (float(value) for value in bounds)
+
+    min_ix = max(math.ceil(x_min / resolution), math.ceil((tx - search_radius) / resolution))
+    max_ix = min(math.floor(x_max / resolution), math.floor((tx + search_radius) / resolution))
+    min_iy = max(math.ceil(y_min / resolution), math.ceil((ty - search_radius) / resolution))
+    max_iy = min(math.floor(y_max / resolution), math.floor((ty + search_radius) / resolution))
+    radius_sq = radius * radius
+    epsilon = max(1e-12, radius_sq * 1e-12)
+
+    for ix in range(min_ix, max_ix + 1):
+        dx = float(ix) * resolution - tx
+        dx_sq = dx * dx
+        for iy in range(min_iy, max_iy + 1):
+            dy = float(iy) * resolution - ty
+            if dx_sq + dy * dy <= radius_sq + epsilon:
+                yield (ix, iy)
+
+
 def _normalize_target(target) -> tuple[float, float] | None:
     if target is None:
         return None
@@ -560,21 +598,18 @@ def _estimate_information_gain(
     resolution: float,
     sensor_range: float,
 ) -> float:
-    resolution = max(float(resolution), 1e-6)
-    radius_cells = max(1, int(math.ceil(max(float(sensor_range), resolution) / resolution)))
-    target_cell = _cell_key(target, resolution)
-    gain = 0
-    for dx in range(-radius_cells, radius_cells + 1):
-        for dy in range(-radius_cells, radius_cells + 1):
-            cell = (target_cell[0] + dx, target_cell[1] + dy)
-            if cell in explored or cell in occupied:
-                continue
-            world = _cell_center(cell, resolution)
-            if not _inside_bounds(world, bounds):
-                continue
-            if _distance(target, world) <= sensor_range:
-                gain += 1
-    return float(gain)
+    return float(
+        sum(
+            1
+            for cell in _bounded_cells_in_radius(
+                target,
+                bounds=bounds,
+                resolution=resolution,
+                radius=sensor_range,
+            )
+            if cell not in explored and cell not in occupied
+        )
+    )
 
 
 def _footprint_cells(
@@ -584,17 +619,14 @@ def _footprint_cells(
     sensor_range: float,
     bounds: tuple[float, float, float, float],
 ) -> set[tuple[int, int]]:
-    resolution = max(float(resolution), 1e-6)
-    radius_cells = max(1, int(math.ceil(max(float(sensor_range), resolution) / resolution)))
-    center = _cell_key(target, resolution)
-    cells: set[tuple[int, int]] = set()
-    for dx in range(-radius_cells, radius_cells + 1):
-        for dy in range(-radius_cells, radius_cells + 1):
-            cell = (center[0] + dx, center[1] + dy)
-            world = _cell_center(cell, resolution)
-            if _inside_bounds(world, bounds) and _distance(target, world) <= sensor_range:
-                cells.add(cell)
-    return cells
+    return set(
+        _bounded_cells_in_radius(
+            target,
+            bounds=bounds,
+            resolution=resolution,
+            radius=sensor_range,
+        )
+    )
 
 
 def _sample_route_to_target(
@@ -829,17 +861,20 @@ def assign_frontier_viewpoints(
             if other_map_ratio > 0.3:
                 debug_tracker[index]["fov_overlap_penalty"] += 1
 
-            # A candidate whose direct corridor from the robot's current
-            # position crosses a teammate's safety disk is penalized, not
-            # vetoed -- same reasoning as reservation_penalty above: it should
-            # still be selectable as a last resort instead of forcing HOLD.
+            # Penalize the complete direct corridor, not just candidates whose
+            # endpoint happens to be close to a teammate.  The old endpoint
+            # pre-filter missed R1 -> R2 -> frontier crossings whenever the
+            # frontier itself was far beyond R2.
             corridor_margin = max(dynamic_obstacle_margin, resolution * 0.75)
             corridor_penalty = 0.0
             for cx, cy, radius in teammate_disks:
-                center = (float(cx), float(cy))
-                if _distance(target, center) > float(radius) + float(state.safety_radius) + corridor_margin:
-                    continue
-                if _distance_point_to_segment(center, state.xy, target) <= float(radius) + float(state.safety_radius) + corridor_margin:
+                if _segment_crosses_any_disk(
+                    start=state.xy,
+                    end=target,
+                    disks=[(cx, cy, radius)],
+                    margin=float(state.safety_radius) + corridor_margin,
+                    ignore_near_start=teammate_block_radius,
+                ):
                     corridor_penalty = 8.0
                     debug_tracker[index]["rejected_by_corridor_overlap"] += 1
                     debug_tracker[index]["too_close_to_robot"] += 1

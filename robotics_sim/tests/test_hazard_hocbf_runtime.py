@@ -320,10 +320,8 @@ def test_single_robot_wiring_runs_filter_before_safety_veto():
         assert nominal_call < filter_call < veto_call < update_call
 
 
-def test_engine_apply_hazard_safety_filter_actually_intervenes():
-    """End-to-end through the bound engine method itself (not just
-    HazardSafetyRuntime directly): a real Robot heading straight at an
-    observed hazard gets a control different from its coasting nominal."""
+def test_engine_hazard_safety_hook_is_passthrough_for_aerial_robots():
+    """Observed fire is information, so it never changes aerial control."""
     service = _service()
     service.add_fire(_FIRE_POSITION)
     service.observe_visible_polygon(_OBSERVING_POLYGON, robot_index=0)
@@ -352,8 +350,7 @@ def test_engine_apply_hazard_safety_filter_actually_intervenes():
     nominal = np.array([[0.0], [0.0]])
     filtered = fake.apply_hazard_safety_filter(robot, nominal)
 
-    assert filtered.shape == (2, 1)
-    assert not np.array_equal(filtered, nominal)
+    assert filtered is nominal
 
 
 # ---------------------------------------------------------------------------

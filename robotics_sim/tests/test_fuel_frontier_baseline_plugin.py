@@ -384,3 +384,77 @@ def test_fuel_frontier_baseline_preserves_existing_target_when_not_reassigning()
     assert result.targets[0] == (8.0, 8.0)
     assert result.targets[1] == (3.0, 1.0)
     assert result.reasons[0] == "kept existing target"
+
+
+def test_fuel_cell_count_gain_does_not_overpower_large_extra_travel():
+    """One extra UNKNOWN cell used to offset five metres at lambda=0.2.
+
+    Runtime information gain is a cell count (roughly up to 80 cells for the
+    default sensor/grid), so raw gain and metre cost are not commensurate.
+    Ten additional cells must not justify travelling six extra metres when a
+    strong nearby frontier is available.
+    """
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={
+            0: (
+                ExplorationCandidate(
+                    target=(2.0, 0.0),
+                    information_gain=60.0,
+                    metadata={"cluster_id": "near"},
+                ),
+                ExplorationCandidate(
+                    target=(8.0, 0.0),
+                    information_gain=70.0,
+                    metadata={"cluster_id": "far"},
+                ),
+            ),
+        },
+        parameters={
+            "grid_resolution": 0.5,
+            "goal_tolerance": 0.25,
+            "ipp_distance_penalty": 0.2,
+        },
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets == ((2.0, 0.0),)
+    assert result.commands[0].metadata["fuel_score"] > 0.0
+
+
+def test_fuel_selects_viewpoint_with_robot_aware_cost_inside_cluster():
+    """All viewpoints must reach `_fuel_score` before one per cluster wins."""
+    plugin = load_coordination_plugin(FUEL_FRONTIER_BASELINE_COORDINATOR)
+    service = FakeFrontierInformationService(
+        clusters=(
+            FakeFrontierCluster(
+                cluster_id="long-frontier",
+                centroid=(5.0, 0.0),
+                viewpoints=(
+                    FakeViewpoint(xy=(2.0, 0.0), information_gain=60.0),
+                    FakeViewpoint(xy=(8.0, 0.0), information_gain=70.0),
+                ),
+            ),
+        )
+    )
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        world=_world(),
+        services=SimpleNamespace(frontier_information_service=service),
+        parameters={
+            "grid_resolution": 0.5,
+            "goal_tolerance": 0.25,
+            "ipp_distance_penalty": 0.2,
+        },
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets == ((2.0, 0.0),)
+    assert result.debug["per_robot"][0]["raw_candidates"] == 2
+    assert result.debug["per_robot"][0]["clustered_candidates"] == 1
+    assert result.commands[0].metadata["cluster_id"] == "long-frontier"

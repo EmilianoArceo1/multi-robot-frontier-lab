@@ -22,6 +22,9 @@ import numbers
 import os
 import time
 import zlib
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -56,7 +59,6 @@ from robotics_sim.diagnostics.snapshot_export import (
     export_navigation_snapshots_xlsx,
     select_navigation_snapshot_events,
 )
-from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
 from robotics_sim.simulation.hazard_safety_runtime import HazardSafetyRuntime
@@ -169,11 +171,60 @@ def occupancy_grid_snapshot_from_belief(belief_map) -> dict | None:
     if belief_map is None:
         return None
 
+    grid = belief_map.grid.copy()
+    free = grid == 0
+    unknown = grid == -1
+    adjacent_unknown = np.zeros_like(unknown, dtype=np.bool_)
+    adjacent_unknown[1:, :] |= unknown[:-1, :]
+    adjacent_unknown[:-1, :] |= unknown[1:, :]
+    adjacent_unknown[:, 1:] |= unknown[:, :-1]
+    adjacent_unknown[:, :-1] |= unknown[:, 1:]
+    frontier_rows, frontier_cols = np.where(free & adjacent_unknown)
+
     return {
         "resolution": float(belief_map.resolution),
         "bounds": tuple(belief_map.bounds),
-        "grid": belief_map.grid.copy(),
+        "grid": grid,
+        "frontier_cells": tuple(
+            (int(row), int(col)) for row, col in zip(frontier_rows, frontier_cols)
+        ),
     }
+
+
+def frontier_bfs_steps(grid: np.ndarray, start_cell: tuple[int, int] | None) -> np.ndarray:
+    """Four-connected BFS levels through known FREE cells only."""
+    steps = np.full(grid.shape, -1, dtype=np.int32)
+    if start_cell is None:
+        return steps
+    start_row, start_col = map(int, start_cell)
+    if not (0 <= start_row < grid.shape[0] and 0 <= start_col < grid.shape[1]):
+        return steps
+    if int(grid[start_row, start_col]) != 0:
+        free_rows, free_cols = np.where(grid == 0)
+        if free_rows.size == 0:
+            return steps
+        index = min(
+            range(int(free_rows.size)),
+            key=lambda i: (
+                abs(int(free_rows[i]) - start_row) + abs(int(free_cols[i]) - start_col),
+                int(free_rows[i]), int(free_cols[i]),
+            ),
+        )
+        start_row, start_col = int(free_rows[index]), int(free_cols[index])
+
+    queue = deque([(start_row, start_col)])
+    steps[start_row, start_col] = 0
+    while queue:
+        row, col = queue.popleft()
+        next_step = int(steps[row, col]) + 1
+        for nr, nc in ((row + 1, col), (row - 1, col), (row, col + 1), (row, col - 1)):
+            if not (0 <= nr < grid.shape[0] and 0 <= nc < grid.shape[1]):
+                continue
+            if steps[nr, nc] >= 0 or int(grid[nr, nc]) != 0:
+                continue
+            steps[nr, nc] = next_step
+            queue.append((nr, nc))
+    return steps
 
 
 class PlannerWorkerSignals(QObject):
@@ -546,6 +597,22 @@ def effective_planning_clearance(robot_radius: float, safety_radius: float) -> f
     return max(float(robot_radius), float(safety_radius))
 
 
+@dataclass(frozen=True, eq=False)
+class CandidateReachabilityResult:
+    reachable: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return bool(self.reachable)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, (bool, np.bool_)):
+            return self.reachable == bool(other)
+        if isinstance(other, CandidateReachabilityResult):
+            return (self.reachable, self.reason) == (other.reachable, other.reason)
+        return NotImplemented
+
+
 def candidate_reachable_on_planning_grid(
     planning_grid,
     planner_type: str,
@@ -556,7 +623,8 @@ def candidate_reachable_on_planning_grid(
     resolution: float,
     robot_radius: float,
     goal_tolerance: float,
-) -> bool:
+    return_details: bool = False,
+) -> bool | CandidateReachabilityResult:
     """True when compute_planned_waypoints() can find a route from start_xy
     to candidate_xy on the given, already-built planning_grid, AND that
     route's final waypoint actually reaches candidate_xy within
@@ -583,9 +651,13 @@ def candidate_reachable_on_planning_grid(
     plain OccupancyGrid, without instantiating the Qt-based simulation
     engine.
     """
+    def result(reachable: bool, reason: str):
+        detail = CandidateReachabilityResult(bool(reachable), str(reason))
+        return detail if return_details else bool(detail)
+
     if compute_planned_waypoints is None or planning_grid is None:
-        return True
-    success, _reason, waypoints = compute_planned_waypoints(
+        return result(True, "reachability check unavailable; assumed reachable")
+    success, plan_reason, waypoints = compute_planned_waypoints(
         planner_type=planner_type,
         start_xy=start_xy,
         goal_xy=candidate_xy,
@@ -596,9 +668,21 @@ def candidate_reachable_on_planning_grid(
         unknown_is_traversable=True,
         obstacle_points=[],
     )
-    if not success or not waypoints:
-        return False
-    return NavigationSupervisor.validate_route_endpoint(waypoints, candidate_xy, goal_tolerance)
+    if not success:
+        return result(False, f"path planner failed: {plan_reason}")
+    if not waypoints:
+        return result(False, "path planner returned no executable waypoints")
+    endpoint_valid = NavigationSupervisor.validate_route_endpoint(
+        waypoints, candidate_xy, goal_tolerance
+    )
+    if not endpoint_valid:
+        endpoint = waypoints[-1]
+        miss = math.hypot(float(endpoint[0]) - candidate_xy[0], float(endpoint[1]) - candidate_xy[1])
+        return result(
+            False,
+            f"route endpoint misses candidate by {miss:.3f} m (tolerance={goal_tolerance:.3f} m)",
+        )
+    return result(True, "reachable: valid path and endpoint")
 
 
 # ============================================================
@@ -620,6 +704,18 @@ class SimulationControllerMixin:
     # How many candidate targets to try (1 initial attempt + retries) before
     # a corridor-blocked robot is allowed to fall back to HOLD/WAITING.
     MAX_ROUTE_RECOVERY_ATTEMPTS = 3
+
+    # Repair an unsafe route to its existing information target first.  If the
+    # same robot remains at the same pose and the same static prediction vetoes
+    # that target repeatedly, stop reinstalling the route and request another
+    # frontier.  Throttled frames do not count toward this limit.
+    MAX_SAME_TARGET_STATIC_SAFETY_REPAIRS = 2
+
+    # A coordinator result is still validated by the engine.  If that
+    # post-validation rejects F_i, ask the coordinator for another candidate
+    # immediately instead of returning HOLD and waiting for another robot to
+    # finish its whole route before the map happens to change.
+    MAX_TARGET_RESELECTION_ATTEMPTS = 4
 
     # NAVIGATION MODE / ROBOT AGENT HELPERS
     # ========================================================
@@ -849,39 +945,13 @@ class SimulationControllerMixin:
         return runtime
 
     def apply_hazard_safety_filter(self, robot, control: np.ndarray) -> np.ndarray:
-        """Filter one robot's proposed control through the Observed Hazard
-        OGM-HOCBF safety filter.
+        """Return nominal control unchanged.
 
-        Pure wiring: gathers the team's observed HazardBelief snapshot, the
-        robot's own state/limits/safety radius, and delegates to
-        HazardSafetyRuntime -- no SDF construction, no gradients/Hessians,
-        no HOCBF equations, and no QP solving live here (see
-        hazard_safety_runtime.py / hazard_hocbf_filter.py /
-        hazard_distance_field.py).
-
-        Must be called AFTER the nominal control is decided (nominal_
-        control_safe() for single-robot, select_runtime_control_source() for
-        multi-robot, so a CONTROL-owning plugin cannot skip it) and BEFORE
-        predicted_motion_report() -- see the call sites in simulation_step()
-        and simulation_step_multi() for the exact ordering.
+        Fire is traversable information for aerial robots, not physical
+        occupancy.  The compatibility hook remains at existing call sites,
+        but HazardBelief must never modify motion.
         """
-        if not bool(getattr(self.config, "hazard_cbf_enabled", True)):
-            return control
-
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is None or robot is None:
-            return control
-
-        runtime = self.ensure_hazard_safety_runtime()
-        result = runtime.filter_control(
-            belief_frame=hazard_service.belief.snapshot(),
-            geometry=hazard_service.belief.geometry,
-            state=robot.state,
-            limits=robot.limits,
-            nominal_control=control,
-            safety_radius=self.safety_radius_for_robot(robot),
-        )
-        return result.control
+        return control
 
     def push_hazard_snapshot(self) -> None:
         """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
@@ -944,7 +1014,20 @@ class SimulationControllerMixin:
         routing, or exploration, and does not create or rebuild the belief
         map -- returns None if none exists yet.
         """
-        return occupancy_grid_snapshot_from_belief(getattr(self, "belief_map", None))
+        belief = getattr(self, "belief_map", None)
+        snapshot = occupancy_grid_snapshot_from_belief(belief)
+        if snapshot is None:
+            return None
+
+        selected_index = int(getattr(self, "selected_robot_index", 0))
+        robots = list(getattr(self, "robots", []) or [])
+        robot = robots[selected_index] if 0 <= selected_index < len(robots) else getattr(self, "robot", None)
+        start_cell = None
+        if robot is not None:
+            start_cell = belief.world_to_cell((float(robot.x), float(robot.y)), clamp=True)
+        snapshot["bfs_steps"] = frontier_bfs_steps(snapshot["grid"], start_cell)
+        snapshot["bfs_robot_index"] = selected_index
+        return snapshot
 
     def push_grid_overlay_snapshot_if_due(self) -> None:
         """Push a fresh occupancy snapshot into the canvas's grid overlay,
@@ -964,7 +1047,12 @@ class SimulationControllerMixin:
         simulation tick for no visible benefit.
         """
         canvas = getattr(self, "canvas", None)
-        if canvas is None or not getattr(canvas, "grid_overlay_enabled", False):
+        overlay_requested = bool(
+            getattr(canvas, "grid_overlay_enabled", False)
+            or getattr(canvas, "grid_cell_values_enabled", False)
+            or getattr(canvas, "frontier_decisions_enabled", False)
+        ) if canvas is not None else False
+        if not overlay_requested:
             return
 
         is_degraded = getattr(canvas, "is_grid_overlay_degraded", None)
@@ -1088,6 +1176,9 @@ class SimulationControllerMixin:
             path_simplifier=self.path_simplifier_combo.currentText(),
             exploration_planner=self.exploration_planner_combo.currentText(),
             coordinator_type=self.coordinator_combo.currentText() if hasattr(self, "coordinator_combo") else self.config.coordinator_type,
+            coordination_parameters=dict(
+                getattr(self.config, "coordination_parameters", {}) or {}
+            ),
             exploration_replan_cooldown=max(0.0, float(self.exploration_cooldown_input.value())),
             ipp_distance_penalty=max(0.0, float(self.ipp_lambda_input.value())),
             vision_model=self.vision_combo.currentText(),
@@ -1108,7 +1199,67 @@ class SimulationControllerMixin:
             selected_robot_index=int(getattr(self, "selected_robot_index", 0)),
             same_robot_configuration=self.same_config_switch.isChecked() if hasattr(self, "same_config_switch") else self.config.same_robot_configuration,
             robots=list(getattr(self, "multi_robot_configs", self.config.robots)),
+            experiment=dict(getattr(self.config, "experiment", {}) or {}),
+            source_path=str(getattr(self.config, "source_path", "") or ""),
         )
+
+    @staticmethod
+    def ipp_manifest_path_for_config(config: SimulationConfig) -> Path | None:
+        """Resolve a portable RSS26 bundle reference from a loaded ``.sim``.
+
+        Experiment assets are deliberately opt-in and confined beneath the
+        scenario directory.  Ordinary scenarios therefore keep exactly their
+        existing behavior, and an untrusted preset cannot use ``..`` to make
+        the bundle loader inspect arbitrary files elsewhere on the machine.
+        """
+        experiment = getattr(config, "experiment", {})
+        if not isinstance(experiment, dict):
+            return None
+        if experiment.get("kind") != "uncertainty_guaranteed_ipp_rss26":
+            return None
+        bundle_value = experiment.get("bundle")
+        source_path = str(getattr(config, "source_path", "") or "")
+        if not isinstance(bundle_value, str) or not bundle_value.strip() or not source_path:
+            return None
+        relative = Path(bundle_value)
+        if relative.is_absolute():
+            raise ValueError("RSS26 experiment bundle must be relative to the .sim file.")
+        base = Path(source_path).resolve().parent
+        candidate = (base / relative).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError as exc:
+            raise ValueError("RSS26 experiment bundle escapes the scenario directory.") from exc
+        return candidate
+
+    def refresh_ipp_experiment_bundle(self, config: SimulationConfig) -> None:
+        """Load/clear the paper-experiment overlay associated with ``config``."""
+        bundle = None
+        manifest_path = None
+        error = None
+        try:
+            manifest_path = self.ipp_manifest_path_for_config(config)
+            if manifest_path is not None:
+                from robotics_sim.experiments import load_ipp_bundle
+
+                bundle = load_ipp_bundle(manifest_path)
+        except (OSError, ValueError) as exc:
+            error = str(exc)
+
+        self.ipp_experiment_bundle = bundle
+        self._ipp_experiment_manifest_path = str(manifest_path or "")
+        setter = getattr(self.canvas, "set_ipp_experiment_bundle", None)
+        if callable(setter):
+            setter(bundle)
+
+        if error:
+            message = f"[RSS26 IPP] Bundle unavailable: {error}"
+            logger = getattr(self, "log_console_message", None)
+            if callable(logger):
+                logger(message)
+            status = getattr(self.canvas, "set_status", None)
+            if callable(status):
+                status(message)
 
     def enforce_radius_consistency(self, *_):
         """
@@ -1182,11 +1333,13 @@ class SimulationControllerMixin:
 
         self.config = config
         self.spatial_index.rebuild(self.config.obstacles)
+        self.refresh_ipp_experiment_bundle(self.config)
         self.update_relevant_parameter_visibility()
         self.set_configuration_locked(self.running or self.robot is not None)
         self.canvas.set_preview_config(self.config)
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
+        self.canvas.set_frontier_reasoning_decision(None)
 
     def save_simulation_config(self) -> None:
         self.config = self.read_config()
@@ -1479,6 +1632,17 @@ class SimulationControllerMixin:
             score=selected_score,
             candidate_count=len(result.candidates),
         )
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None:
+            frontier_panel.update_decision(
+                planner=str(planner_name),
+                result=result,
+                robot_label="R1",
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                robot_xy=(float(self.robot.x), float(self.robot.y)) if self.robot is not None else None,
+                configured_planner=str(getattr(self.config, "exploration_planner", planner_name)),
+                attempt_role="configured planner",
+            )
 
         if not result.success or result.target is None:
             self.current_exploration_target = None
@@ -1562,77 +1726,57 @@ class SimulationControllerMixin:
         robot_radius: float,
         resolution: float,
     ) -> tuple[list[tuple[float, float]], int]:
-        """Remove obstacle samples that falsely occupy the robot's own start cell.
+        """Normalize planner obstacle samples without deleting geometry.
 
-        The planner inflates obstacle points by the robot safety radius. If a
-        quantized mapped-obstacle point falls on the current robot cell, A* can
-        reject the route before it even starts. We clear only a small disk around
-        the robot's current center for the planner input. This does not remove
-        ground-truth obstacle checks or teammate dynamic obstacles outside the
-        start cell.
+        The former implementation removed every sample within roughly 1.25
+        grid cells of ``start_xy``.  At the default 0.5 m resolution that made
+        a 0.625 m hole in observed geometry, larger than the 0.35 m safety
+        envelope.  A* could then accept a path which the continuous collision
+        predictor rejected immediately, especially near obstacle corners.
+
+        Distance to the robot is not enough to distinguish a mapping artefact
+        from a real obstacle.  Preserve every finite sample so planning and
+        collision safety use the same geometry.  The keyword arguments remain
+        in the signature for compatibility with existing callers.
         """
-        sx, sy = float(start_xy[0]), float(start_xy[1])
-        # Enough to clear the start cell and immediate quantization error, but
-        # not enough to open corridors through real obstacles.
-        clear_radius = max(float(resolution) * 1.25, min(float(robot_radius) * 0.75, float(resolution) * 2.5))
-        clear_radius = max(clear_radius, 1e-6)
+        del start_xy, robot_radius, resolution
         kept: list[tuple[float, float]] = []
-        removed = 0
         for point in obstacle_points:
             px, py = float(point[0]), float(point[1])
-            if math.hypot(px - sx, py - sy) <= clear_radius:
-                removed += 1
-                continue
-            kept.append((px, py))
-        return kept, removed
+            if math.isfinite(px) and math.isfinite(py):
+                kept.append((px, py))
+        return kept, 0
 
     def obstacle_points_for_segment_safety_check(
         self,
         start_xy: tuple[float, float],
         robot_radius: float,
     ) -> list[tuple[float, float]]:
-        """Return self.mapped_obstacle_points with the SAME near-start
-        sanitization sanitize_planner_obstacle_points() already applies
-        before the planner ever sees them, for use by every post-hoc
-        segment/motion safety check (route_first_segment_blocked(),
-        active_segment_blocked in build_observation(), predicted_collision
-        in predicted_motion_report()).
+        """Return the normalized geometry used by all segment safety checks.
 
-        Root cause this closes: the planner (A*/reachability) has always
-        sanitized mapped_obstacle_points before building its planning grid
-        -- clearing a small disk around the robot's own current position,
-        because a boundary sample the robot's own sensor just placed a few
-        centimeters from its center is expected, not a real obstacle, and
-        would otherwise make A* reject the route before it starts (see
-        sanitize_planner_obstacle_points()'s own docstring). The four
-        safety/validation checks above were never given the same
-        sanitization -- they used the raw mapped_obstacle_points list
-        directly, so CollisionChecker.check_segment_points()'s "distance
-        from any obstacle point to the segment" rule always found that same
-        near-start sample sitting well inside robot_radius of start_xy
-        (since t=0 of any segment starting AT the robot is exactly where
-        that sample was recorded), and rejected the route's first segment
-        as "blocked" regardless of which direction it actually pointed.
-        This is exactly the reproducible Office.sim sequence: reachability
-        approves a candidate, A* finds a path on the sanitized grid, the
-        simplifier agrees, and then route validation -- and predicted
-        collision, using the same unsanitized list -- immediately rejects
-        it. Using the SAME sanitized list here makes every checker agree
-        with what the planner already assumed about the robot's own
-        immediate surroundings. clear_radius stays exactly what
-        sanitize_planner_obstacle_points() already computes (~1.25x grid
-        resolution) -- this does not touch robot_radius/safety_radius, does
-        not relax any check away from the robot's current position, and
-        does not change the disk beyond the one already used to plan the
-        route.
+        Planning and continuous safety deliberately receive the same complete
+        near-start geometry.  In particular, this helper must never introduce
+        a planner-only free disk around the robot.
         """
-        points, _ = self.sanitize_planner_obstacle_points(
-            list(self.mapped_obstacle_points),
-            start_xy=start_xy,
-            robot_radius=robot_radius,
-            resolution=float(self.config.grid_resolution),
+        # sanitize_planner_obstacle_points() deliberately no longer depends
+        # on the start pose or radius, so rebuilding and scanning the same
+        # growing point cloud two or three times per robot *per frame* is pure
+        # overhead.  mapped_obstacle_revision changes on every mutation and
+        # makes this cache safe across mapping updates and snapshot restores.
+        cache_key = (
+            int(getattr(self, "mapped_obstacle_revision", 0)),
+            len(getattr(self, "mapped_obstacle_points", ())),
         )
-        return points
+        if getattr(self, "_segment_safety_points_cache_key", None) != cache_key:
+            points, _ = self.sanitize_planner_obstacle_points(
+                list(self.mapped_obstacle_points),
+                start_xy=start_xy,
+                robot_radius=robot_radius,
+                resolution=float(self.config.grid_resolution),
+            )
+            self._segment_safety_points_cache_key = cache_key
+            self._segment_safety_points_cache = points
+        return self._segment_safety_points_cache
 
     def _planning_costmap_inputs_for_robot(
         self,
@@ -1643,28 +1787,18 @@ class SimulationControllerMixin:
     ):
         """Build the PlanningCostmapSnapshot for ONE robot via
         PlanningCostmapBuilder (robotics_sim/planning/planning_costmap_
-        builder.py), applying this robot's own per-robot
-        sanitize_planner_obstacle_points() to the static observed geometry
-        AND to dynamic_obstacle_points -- SEPARATELY, matching the
-        builder's own static/dynamic separation. Sanitizing them apart
-        (rather than concatenating first, then sanitizing once) is
-        equivalent in result -- sanitize_planner_obstacle_points() is a
-        per-point distance filter, independent of what else shares the
-        list -- but it is what lets the sanitized static view become its
-        own ephemeral ObservedObstacleSnapshot below, never merged with
-        dynamic points into one contract.
+        builder.py), normalizing static observed geometry and dynamic points
+        separately to preserve the builder's static/dynamic source contract.
 
         Never mutates self.mapped_obstacle_points or the shared
         observed_obstacle_snapshot(): the sanitized static snapshot built
         here is a fresh object, local to this one call, carrying the same
         bounds/resolution/revision/source as the unsanitized snapshot
-        (sanitization removes near-start rendering artifacts, it is not a
-        new observation, so the revision does not change).
+        (normalization is not a new observation, so the revision does not
+        change).
 
-        Hazard enters exclusively via hazard_service.belief.snapshot() +
-        hazard_service.belief.geometry -- never mapped_obstacle_points or
-        dynamic_obstacle_points. Ground truth (config.obstacles) never
-        enters at all.
+        Hazard is deliberately absent: fire is traversable information, not
+        physical occupancy. Ground truth (config.obstacles) never enters.
         """
         belief = self.ensure_belief_map()
         exploration = belief.snapshot()
@@ -1689,19 +1823,10 @@ class SimulationControllerMixin:
             source=observed_static.source,
         )
 
-        hazard_belief = None
-        hazard_geometry = None
-        hazard_block_threshold = None
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            hazard_belief = hazard_service.belief.snapshot()
-            hazard_geometry = hazard_service.belief.geometry
-            hazard_block_threshold = float(hazard_service.block_threshold)
-
         policy = PlanningCostmapPolicy(
             unknown_is_traversable=True,
             obstacle_padding=radius,
-            hazard_block_threshold=hazard_block_threshold,
+            hazard_block_threshold=None,
         )
 
         return PlanningCostmapBuilder().build(
@@ -1709,8 +1834,8 @@ class SimulationControllerMixin:
             observed_obstacles=sanitized_static_snapshot,
             policy=policy,
             dynamic_obstacle_points=tuple(sanitized_dynamic_points),
-            hazard_belief=hazard_belief,
-            hazard_geometry=hazard_geometry,
+            hazard_belief=None,
+            hazard_geometry=None,
         )
 
     def _planning_grid_from_costmap_snapshot(self, snapshot) -> OccupancyGrid:
@@ -1759,7 +1884,7 @@ class SimulationControllerMixin:
         A. NEW runtime path -- obstacle_points is None (the caller did not
            pass it at all): routes through PlanningCostmapBuilder via
            _planning_costmap_inputs_for_robot()/_planning_grid_from_
-           costmap_snapshot(). This is what all four production callers
+           costmap_snapshot(). This is what all production callers
            use today: build_planner_kwargs(), build_planner_kwargs_for_
            goal(), build_planner_kwargs_for_multi_robot() (dynamic_
            obstacle_points = other runtime robots), and make_exploration_
@@ -1807,18 +1932,64 @@ class SimulationControllerMixin:
         if obstacle_points:
             planning_grid.add_obstacle_points(obstacle_points, padding=max(0.0, radius))
 
-        # Project the team's DISCOVERED hazard belief into this derived
-        # binary planning grid -- never the omniscient ground-truth
-        # HazardField. BeliefMap.grid is never modified either way.
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            apply_hazard_belief_to_planning_grid(
-                planning_grid,
-                hazard_service.belief,
-                block_threshold=hazard_service.block_threshold,
-                inflate_radius=max(0.0, radius),
-            )
         return planning_grid
+
+    def build_refined_static_planning_grid_for_robot(
+        self,
+        robot,
+        *,
+        robot_radius: float,
+        refinement_factor: float = 2.0,
+    ) -> OccupancyGrid:
+        """Build an on-demand finer grid from observed continuous geometry.
+
+        Obstacle samples are inflated conservatively by the cell footprint.
+        That error shrinks with resolution, but at the configured resolution
+        it can close a passage that is wider than the robot's continuous
+        safety diameter.  This grid is only used after both the dynamic and
+        normal static grids report no path, so ordinary planning keeps its
+        lower cost.  Runtime segment/predicted-motion checks still use the
+        original continuous obstacle geometry.
+        """
+        belief = self.ensure_belief_map()
+        factor = max(1.0, float(refinement_factor))
+        base_resolution = max(1e-6, float(self.config.grid_resolution))
+        refined_resolution = max(0.05, base_resolution / factor)
+        radius = max(0.0, float(robot_radius))
+        cache_key = (
+            id(belief),
+            int(getattr(self, "mapped_obstacle_revision", 0)),
+            len(getattr(self, "mapped_obstacle_points", ())),
+            round(radius, 9),
+            round(refined_resolution, 9),
+            tuple(float(value) for value in belief.bounds),
+        )
+        if getattr(self, "_refined_static_grid_cache_key", None) == cache_key:
+            cached = getattr(self, "_refined_static_grid_cache", None)
+            if cached is not None:
+                return cached.copy()
+
+        bounds = tuple(float(value) for value in belief.bounds)
+        grid = OccupancyGrid.from_bounds(
+            x_min=bounds[0],
+            x_max=bounds[1],
+            y_min=bounds[2],
+            y_max=bounds[3],
+            resolution=refined_resolution,
+            initial_value=UNKNOWN,
+            unknown_is_traversable=True,
+        )
+        static_points, _ = self.sanitize_planner_obstacle_points(
+            list(self.mapped_obstacle_points),
+            start_xy=(float(robot.x), float(robot.y)),
+            robot_radius=radius,
+            resolution=refined_resolution,
+        )
+        if static_points:
+            grid.add_obstacle_points(static_points, padding=radius)
+        self._refined_static_grid_cache_key = cache_key
+        self._refined_static_grid_cache = grid.copy()
+        return grid
 
     def planner_accepts_path_simplifier(self) -> bool:
         """Return True when the installed planner registry supports path_simplifier."""
@@ -2052,7 +2223,13 @@ class SimulationControllerMixin:
             if other_index == int(robot_index) or other_target is None:
                 continue
             distance = math.hypot(float(target[0]) - float(other_target[0]), float(target[1]) - float(other_target[1]))
-            if distance <= radius:
+            # Exactly-on-the-boundary targets satisfy the advertised minimum
+            # separation.  The old <= check rejected a FUEL allocation logged
+            # as "1.00 m < 1.00 m", then left the robot parked until a
+            # teammate consumed its frontier.  Keep a small numerical margin
+            # so grid-derived coordinates do not flip classification due to
+            # floating-point noise.
+            if distance < radius - 1e-6:
                 return (
                     False,
                     f"target too close to F{other_index + 1} "
@@ -2093,11 +2270,19 @@ class SimulationControllerMixin:
         robot_index: int,
         target: tuple[float, float],
     ) -> tuple[bool, str]:
-        """Full validation for an already assigned or newly proposed F_i."""
+        """Hard endpoint validation for an assigned or proposed F_i.
+
+        Teammate *positions* and reserved frontier endpoints are hard safety /
+        duplication constraints.  A teammate's complete future route is not:
+        without timestamps, treating that polyline as occupied forever makes
+        ordinary crossing corridors mutually exclusive and parks one robot
+        until the other reaches its frontier.  Route overlap remains an
+        allocation penalty inside the coordinators; live robot disks, active-
+        segment checks and predicted-motion checks enforce actual safety.
+        """
         checks = (
             self.target_is_clear_of_reserved_frontiers,
             self.target_is_clear_of_dynamic_robots,
-            self.target_is_clear_of_other_active_routes,
         )
         for check in checks:
             ok, reason = check(robot_index, target)
@@ -2409,7 +2594,12 @@ class SimulationControllerMixin:
         if not robots_to_assign:
             return
 
-        coordinator = MultiRobotCoordinator(self.config.coordinator_type)
+        coordinator = getattr(self, "_multi_robot_coordinator", None)
+        if coordinator is None or str(getattr(coordinator, "strategy", "")) != str(
+            self.config.coordinator_type
+        ):
+            coordinator = MultiRobotCoordinator(self.config.coordinator_type)
+            self._multi_robot_coordinator = coordinator
 
         # Per-robot explored footprints are required by the coordinated frontier
         # planner to penalize duplicated sensing.  Passing only the shared map is
@@ -2437,7 +2627,35 @@ class SimulationControllerMixin:
             route_points_by_robot=self.multi_active_route_points_by_robot(),
             explored_points_by_robot=explored_points_by_robot,
             goal_tolerance=float(self.config.goal_tolerance),
+            coordination_parameters=dict(
+                getattr(self.config, "coordination_parameters", {}) or {}
+            ),
+            time_s=float(getattr(self, "simulation_time", 0.0)),
         )
+        self.last_coordination_debug = dict(result.debug)
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None:
+            runtime_profile = self.coordinator_runtime_profile()
+            frontier_panel.update_coordination(
+                planner=str(self.config.exploration_planner),
+                coordinator=str(self.config.coordinator_type),
+                result=result,
+                robot_index=int(getattr(self, "selected_robot_index", requesting_robot_index)),
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                runtime_profile=runtime_profile,
+                robot_positions=tuple(
+                    (float(robot.x), float(robot.y)) for robot in self.robots
+                ),
+            )
+        coordinator_panel = getattr(self, "coordinator_reasoning_panel", None)
+        if coordinator_panel is not None and hasattr(coordinator_panel, "update_coordination"):
+            coordinator_panel.update_coordination(
+                planner=str(self.config.exploration_planner),
+                coordinator=str(self.config.coordinator_type),
+                result=result,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                runtime_profile=self.coordinator_runtime_profile(),
+            )
 
         if not hasattr(self, "multi_robot_commands_by_id"):
             self.multi_robot_commands_by_id = {}
@@ -2519,46 +2737,61 @@ class SimulationControllerMixin:
             # one. Clear only this robot's F_i; do not disturb the other robots.
             self.invalidate_current_multi_frontier(robot_index, validity_reason)
 
-        self.synchronize_multi_frontier_targets(
-            requesting_robot_index=robot_index,
-            force_new_target=force_new_target,
-        )
-
-        target = None
-        if 0 <= robot_index < len(self.multi_exploration_targets):
-            target = self.multi_exploration_targets[robot_index]
-
-        if target is None:
-            recovery_target = self.temporary_separation_target_for_robot(robot_index)
-            if recovery_target is not None:
-                ok, reason = self.multi_exploration_target_is_valid(robot_index, recovery_target)
-                if ok:
-                    self.multi_exploration_targets[robot_index] = recovery_target
-                    self.publish_multi_exploration_targets()
-                    return recovery_target, (
-                        f"R{robot_index + 1}: temporary separation target while waiting for frontier"
-                    )
-
-            # Do not fall back to G while an exploration planner is selected.
-            # The robot should hold its current position until a unique frontier exists.
-            return (float(start_xy[0]), float(start_xy[1])), (
-                f"R{robot_index + 1}: no valid frontier assigned by "
-                f"{self.config.coordinator_type}; holding position"
+        last_invalid_reason = ""
+        for attempt in range(self.MAX_TARGET_RESELECTION_ATTEMPTS):
+            self.synchronize_multi_frontier_targets(
+                requesting_robot_index=robot_index,
+                # force_new_target was already applied above.  Re-applying it
+                # here would clear a valid alternative returned by the prior
+                # iteration before it can be inspected.
+                force_new_target=False,
             )
 
-        target = (float(target[0]), float(target[1]))
-        target_valid, target_valid_reason = self.multi_exploration_target_is_valid(robot_index, target)
-        if not target_valid:
-            self.multi_exploration_targets[robot_index] = None
-            self.publish_multi_exploration_targets()
-            return (float(start_xy[0]), float(start_xy[1])), (
-                f"R{robot_index + 1}: assigned frontier invalid after validation; "
-                f"{target_valid_reason}"
+            target = None
+            if 0 <= robot_index < len(self.multi_exploration_targets):
+                target = self.multi_exploration_targets[robot_index]
+            if target is None:
+                break
+
+            target = (float(target[0]), float(target[1]))
+            target_valid, target_valid_reason = self.multi_exploration_target_is_valid(
+                robot_index, target
+            )
+            if target_valid:
+                return target, (
+                    f"R{robot_index + 1}: frontier assigned by "
+                    f"{self.config.coordinator_type}"
+                )
+
+            # This is the missing transition shown by both supplied traces:
+            # the post-validator used to set F_i=None directly, losing the
+            # rejected target.  The next cooldown tick therefore asked the
+            # plugin for exactly the same F_i again.  Remember it and retry a
+            # bounded number of alternatives immediately.
+            last_invalid_reason = str(target_valid_reason)
+            self.invalidate_current_multi_frontier(robot_index, last_invalid_reason)
+            self.log_console_message(
+                f"R{robot_index + 1}: coordinator target rejected after validation "
+                f"({attempt + 1}/{self.MAX_TARGET_RESELECTION_ATTEMPTS}); "
+                f"trying alternative; {last_invalid_reason}"
             )
 
-        return target, (
-            f"R{robot_index + 1}: frontier assigned by "
-            f"{self.config.coordinator_type}"
+        recovery_target = self.temporary_separation_target_for_robot(robot_index)
+        if recovery_target is not None:
+            ok, _reason = self.multi_exploration_target_is_valid(robot_index, recovery_target)
+            if ok:
+                self.multi_exploration_targets[robot_index] = recovery_target
+                self.publish_multi_exploration_targets()
+                return recovery_target, (
+                    f"R{robot_index + 1}: temporary separation target while waiting for frontier"
+                )
+
+        # Do not fall back to G while an exploration planner is selected.
+        # The robot should hold its current position until a unique frontier exists.
+        detail = f"; last rejected target: {last_invalid_reason}" if last_invalid_reason else ""
+        return (float(start_xy[0]), float(start_xy[1])), (
+            f"R{robot_index + 1}: no valid frontier assigned by "
+            f"{self.config.coordinator_type}; holding position{detail}"
         )
 
     def build_planner_kwargs_for_multi_robot(
@@ -2656,6 +2889,13 @@ class SimulationControllerMixin:
         PATH_PLANNING) the external planner runs exactly as before.
         """
 
+        robot_index = int(robot_index)
+        current_captures = getattr(self, "_nav_debug_current_plan_capture_by_robot", None)
+        if current_captures is None:
+            self._nav_debug_current_plan_capture_by_robot = {}
+            current_captures = self._nav_debug_current_plan_capture_by_robot
+        current_captures.pop(robot_index, None)
+
         def _legacy_route() -> tuple[bool, str, list[tuple[float, float]]]:
             planner_kwargs, goal_reason = self.build_planner_kwargs_for_multi_robot(
                 robot_index,
@@ -2672,15 +2912,79 @@ class SimulationControllerMixin:
             if compute_planned_waypoints is None:
                 return False, "planner package is not available", []
 
+            debug_capture = PlanDebugCapture()
             success, reason, waypoints = self.call_compute_planned_waypoints(
                 planner_kwargs,
                 path_simplifier=self.config.path_simplifier,
+                debug_capture=debug_capture,
             )
+            current_captures[robot_index] = debug_capture
+
+            # Teammates are transient obstacles, but their sampled safety
+            # rings live in the global planning grid for the duration of an
+            # A* call.  In a narrow doorway those rings can disconnect the
+            # whole grid and make every robot wait for another robot that is
+            # waiting in turn.  If (and only if) that dynamic grid has no path,
+            # retry the same goal against static topology.  The resulting path
+            # is not blindly activated: immediate-corridor validation below
+            # and the per-frame exact disk checks still veto motion until the
+            # occupied doorway is actually clear.
+            dynamic_points = self.dynamic_robot_obstacle_points_for_robot(robot_index)
+            if not success and dynamic_points:
+                static_kwargs = dict(planner_kwargs)
+                robot = self.robots[robot_index]
+                static_kwargs["planning_grid"] = self.build_planning_grid_for_robot(
+                    robot,
+                    robot_radius=float(planner_kwargs["robot_radius"]),
+                    dynamic_obstacle_points=(),
+                )
+                static_capture = PlanDebugCapture()
+                static_success, static_reason, static_waypoints = self.call_compute_planned_waypoints(
+                    static_kwargs,
+                    path_simplifier=self.config.path_simplifier,
+                    debug_capture=static_capture,
+                )
+                if static_success and static_waypoints:
+                    current_captures[robot_index] = static_capture
+                    return (
+                        True,
+                        f"{goal_reason}; dynamic occupancy disconnected planning grid ({reason}); "
+                        f"static-topology fallback: {static_reason}",
+                        static_waypoints,
+                    )
+                refined_kwargs = dict(static_kwargs)
+                refined_grid = self.build_refined_static_planning_grid_for_robot(
+                    robot,
+                    robot_radius=float(planner_kwargs["robot_radius"]),
+                )
+                refined_kwargs["planning_grid"] = refined_grid
+                refined_kwargs["resolution"] = float(refined_grid.resolution)
+                refined_capture = PlanDebugCapture()
+                refined_success, refined_reason, refined_waypoints = self.call_compute_planned_waypoints(
+                    refined_kwargs,
+                    path_simplifier=self.config.path_simplifier,
+                    debug_capture=refined_capture,
+                )
+                if refined_success and refined_waypoints:
+                    current_captures[robot_index] = refined_capture
+                    return (
+                        True,
+                        f"{goal_reason}; dynamic occupancy disconnected planning grid ({reason}); "
+                        f"static grid also disconnected ({static_reason}); "
+                        f"refined static-topology fallback ({refined_grid.resolution:.3f} m): "
+                        f"{refined_reason}",
+                        refined_waypoints,
+                    )
+                reason = (
+                    f"{reason}; static-topology fallback: {static_reason}; "
+                    f"refined static-topology fallback ({refined_grid.resolution:.3f} m): "
+                    f"{refined_reason}"
+                )
 
             return success, f"{goal_reason}; {reason}", waypoints
 
         profile = self.coordinator_runtime_profile()
-        command = getattr(self, "multi_robot_commands_by_id", {}).get(int(robot_index))
+        command = getattr(self, "multi_robot_commands_by_id", {}).get(robot_index)
         success, reason, waypoints = select_runtime_path_source(profile, command, _legacy_route)
         if profile.owns_path_planning and "fallback" in reason:
             self.log_console_message(f"R{int(robot_index) + 1}: {reason}")
@@ -2768,10 +3072,14 @@ class SimulationControllerMixin:
         if not cleaned:
             return []
 
+        # A research experiment may provide an already-optimized sensing tour.
+        # Its intermediate vertices are measurement locations, not disposable
+        # grid artifacts, so the normal line-of-sight shortcut must not erase
+        # them merely because the final endpoint is visible.
+        if bool(getattr(self, "_preserve_next_route_waypoints", False)):
+            return cleaned
+
         points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            points_for_clearance.extend(hazard_service.observed_blocked_world_points())
 
         # Runtime invariant: if the final target is directly safe from the
         # robot's CURRENT pose, never execute an older/grid-artifact detour.
@@ -2837,10 +3145,9 @@ class SimulationControllerMixin:
         # _finalize_navigation_debug_snapshot() docstring for the same
         # defensive getattr pattern.
         #
-        # Always built now, regardless of navigation_debug_enabled: capture
-        # happens on every tick unconditionally, so history already has
-        # data by the time a user turns Navigation on mid-run (that switch
-        # now only gates the UI's browse/inspect/restore affordances).
+        # Always built regardless of navigation_debug_enabled so a route
+        # decision is available even if the user opens Navigation Reasoning
+        # later. The UI switch only gates browse/inspect/restore affordances.
         debug_capture = PlanDebugCapture()
         result = self.call_compute_planned_waypoints(
             planner_kwargs,
@@ -2867,18 +3174,14 @@ class SimulationControllerMixin:
 
         This is intentionally checked against mapped_obstacle_points, not the
         ground-truth rectangles. The robot should be allowed to plan through
-        unknown space; if a hidden obstacle is discovered later, the safety
-        layer will trigger replanning. Hazard is held to the same rule: only
-        observed_blocked_world_points() (discovered), never the omniscient
-        ground-truth HazardField.
+        unknown space; if a hidden physical obstacle is discovered later, the
+        safety layer will trigger replanning. Fire is excluded because it is
+        traversable information for an aerial robot.
         """
         if self.collision_checker is None:
             return True
 
         obstacle_points = list(self.mapped_obstacle_points)
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            obstacle_points.extend(hazard_service.observed_blocked_world_points())
 
         report = self.collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
@@ -2928,6 +3231,13 @@ class SimulationControllerMixin:
 
         if not cleaned:
             return []
+
+        # A research experiment may provide an already-optimized sensing tour.
+        # Its intermediate vertices are measurement locations, not disposable
+        # grid artifacts, so the normal line-of-sight shortcut must not erase
+        # them merely because the final endpoint is visible.
+        if bool(getattr(self, "_preserve_next_route_waypoints", False)):
+            return cleaned
 
         # The executable route must never preserve a huge detour when the
         # intended final target is directly safe from the CURRENT pose. This
@@ -2985,6 +3295,26 @@ class SimulationControllerMixin:
         # reaches the success branch that would otherwise clear it).
         pending_plan_capture = getattr(self, "_nav_debug_last_plan_capture", None)
         self._nav_debug_last_plan_capture = None
+
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if path_panel is not None and hasattr(path_panel, "update_route"):
+            start_xy = (float(self.robot.x), float(self.robot.y))
+            intended_goal = (
+                tuple(self.current_exploration_target)
+                if self.is_exploration_mode() and self.current_exploration_target is not None
+                else self.final_goal_xy()
+            )
+            path_panel.update_route(
+                planner=str(self.config.planner_type),
+                simplifier=str(self.config.path_simplifier),
+                success=bool(success),
+                reason=str(reason),
+                capture=pending_plan_capture,
+                waypoints=tuple(waypoints or ()),
+                start_xy=start_xy,
+                goal_xy=intended_goal,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+            )
 
         self.route_result_count += 1
 
@@ -3267,10 +3597,11 @@ class SimulationControllerMixin:
     def _navigation_debug_belief_frame(self) -> Maybe[BeliefMapDebug]:
         """Return a compact immutable map frame.
 
-        Navigation history records every simulation tick. Copying a full grid on
-        every tick would make the replay prohibitively large, so the expensive
-        grid/explored_by_robot compression is cached and reused across ticks
-        that share the same BeliefMap.revision.
+        Navigation history records sparse events plus rate-limited routine
+        ticks. Copying a full grid for every recorded frame would still make
+        the replay prohibitively large, so the expensive grid/explored_by_robot
+        compression is cached and reused across frames that share the same
+        BeliefMap.revision.
 
         visit_count/last_seen are compressed fresh on every call instead:
         BeliefMap.revision explicitly does NOT bump for visit-count/last-seen-
@@ -3452,6 +3783,46 @@ class SimulationControllerMixin:
             )
         )
 
+    def _navigation_debug_sensor_polygon(self, robot, robot_index: int | None):
+        """Reuse the most recent authoritative sensor sweep for debug frames.
+
+        ``record_explored_area`` already computes the occlusion-aware polygon
+        whenever motion can reveal meaningful new geometry. Recomputing the
+        same 121-ray polygon again for every Navigation Reasoning frame made
+        debug capture one of the largest multi-robot hot paths. The sweep can
+        lag the pose by at most the mapping motion threshold; sparse safety and
+        planning events still carry the current robot pose/control exactly.
+        """
+        if robot_index is None:
+            cached = getattr(self, "last_visible_sensor_polygon", None)
+        else:
+            cached = getattr(self, "multi_visible_sensor_polygons", {}).get(int(robot_index))
+        if cached:
+            return cached
+
+        polygon = sensor_visible_polygon_world(
+            origin=(float(robot.x), float(robot.y)),
+            theta=float(robot.theta),
+            vision=float(robot.vision),
+            vision_model=self.config.vision_model,
+            obstacles=list(self.config.obstacles),
+            ray_count=(
+                SENSOR_DRAW_RAYS_CAMERA
+                if "Camera" in self.config.vision_model
+                else SENSOR_DRAW_RAYS_OMNI
+            ),
+        )
+        frozen = tuple((float(x), float(y)) for x, y in polygon)
+        if robot_index is None:
+            self.last_visible_sensor_polygon = frozen
+        else:
+            cache = getattr(self, "multi_visible_sensor_polygons", None)
+            if cache is None:
+                self.multi_visible_sensor_polygons = {}
+                cache = self.multi_visible_sensor_polygons
+            cache[int(robot_index)] = frozen
+        return frozen
+
     def _finalize_navigation_debug_snapshot(
         self,
         *,
@@ -3460,27 +3831,40 @@ class SimulationControllerMixin:
         decision_reason: str,
         event_kind: NavigationDebugEventKind,
         capture: NavigationDebugCapture | None = None,
+        robot_index: int | None = None,
+        robot=None,
+        control: np.ndarray | None = None,
     ) -> None:
         """Freeze `capture` into a NavigationDebugSnapshot using values
         already known on self/agent at call time -- never recomputed here --
         then push it to the bounded event log and (if present) the canvas.
 
-        Runs unconditionally whenever a robot exists -- NOT gated on
-        navigation_debug_enabled. History must already be populated by the
-        time a user turns Navigation on mid-run, so every tick is recorded
-        regardless of that switch; navigation_debug_enabled only gates the
-        UI's browse/inspect/restore affordances (step_navigation_debug_
-        history(), can_restore_navigation_debug_snapshot(), the overlay
-        itself), never whether a tick gets recorded. Still safe to call from
-        lightweight duck-typed engine fakes that never set self.robot at all
-        (self.robot is None guards that, not getattr-guarded navigation_
-        debug_enabled).
+        Runs whenever called and a robot exists -- NOT gated on
+        navigation_debug_enabled. Sparse decisions/events call it immediately;
+        routine TICK call sites are sampled by navigation_debug_tick_due(), so
+        history is already populated when the user opens the panel without
+        serializing a full frame for every robot at GUI frequency.
+        navigation_debug_enabled only gates the UI's browse/inspect/restore
+        affordances. Still safe to call from lightweight duck-typed engine
+        fakes that never set self.robot at all.
         """
-        if self.robot is None:
+        # Single mode historically read self.robot everywhere.  In Multiple,
+        # self.robot is only a transient loop cursor (and is reset to the UI's
+        # selected robot after the loop), so using it here made every snapshot
+        # claim to be R1 or whichever robot happened to be current.  Resolve
+        # the producer explicitly and keep the old call shape fully compatible.
+        resolved_index = int(robot_index) if robot_index is not None else None
+        runtime_robots = list(getattr(self, "robots", None) or [])
+        if robot is None and resolved_index is not None and 0 <= resolved_index < len(runtime_robots):
+            robot = runtime_robots[resolved_index]
+        if robot is None:
+            robot = getattr(self, "robot", None)
+        if robot is None:
             return
+        if resolved_index is None and runtime_robots:
+            resolved_index = next((i for i, candidate in enumerate(runtime_robots) if candidate is robot), 0)
 
         capture = capture or NavigationDebugCapture()
-        robot = self.robot
         robot_xy = (float(robot.x), float(robot.y))
         robot_radius = self.body_radius_for_robot(robot)
         safety_radius = self.safety_radius_for_robot(robot)
@@ -3497,7 +3881,19 @@ class SimulationControllerMixin:
         # same accessor build_observation()/simulation_step() already use
         # for the real active_segment_blocked check, so this now agrees
         # with what the controller is actually tracking this tick.
-        active_target_xy = self.active_target_xy()
+        active_target_xy = None
+        if hasattr(robot, "active_waypoint"):
+            maybe_target = robot.active_waypoint()
+            if maybe_target is not None:
+                target_array = np.asarray(maybe_target, dtype=float).reshape(-1)
+                if target_array.size >= 2:
+                    active_target_xy = (float(target_array[0]), float(target_array[1]))
+        if active_target_xy is None:
+            maybe_goal = getattr(robot, "goal", None)
+            if maybe_goal is not None:
+                goal_array = np.asarray(maybe_goal, dtype=float).reshape(-1)
+                if goal_array.size >= 2:
+                    active_target_xy = (float(goal_array[0]), float(goal_array[1]))
 
         waypoints_mgr = getattr(robot, "waypoints", None)
         if waypoints_mgr is None or not hasattr(waypoints_mgr, "waypoints"):
@@ -3519,7 +3915,11 @@ class SimulationControllerMixin:
         # planner/simplifier/raw/simplified-path keep describing the route
         # currently being executed instead of reading "unavailable" on
         # every tick except the exact one a route was accepted on.
-        plan = capture.plan or getattr(self, "_nav_debug_last_accepted_plan", None)
+        plan = capture.plan
+        if plan is None and resolved_index is not None:
+            plan = getattr(self, "_nav_debug_last_accepted_plan_by_robot", {}).get(resolved_index)
+        if plan is None:
+            plan = getattr(self, "_nav_debug_last_accepted_plan", None)
         path = PathDebug(
             raw_path=Maybe.of(plan.raw_world_path) if plan and plan.raw_world_path is not None else Maybe.missing(),
             simplified_path=(
@@ -3570,9 +3970,19 @@ class SimulationControllerMixin:
             ),
         )
 
-        last_control = np.asarray(getattr(self, "last_control", None), dtype=float).reshape(-1) if getattr(
-            self, "last_control", None
-        ) is not None else None
+        control_source = control
+        if control_source is None and resolved_index is not None:
+            controls = list(getattr(self, "multi_last_controls", None) or [])
+            if 0 <= resolved_index < len(controls):
+                control_source = controls[resolved_index]
+        if control_source is None:
+            control_source = getattr(self, "last_control", None)
+        last_control = (
+            np.asarray(control_source, dtype=float).reshape(-1)
+            if control_source is not None
+            else None
+        )
+
         controller = ControllerDebug(
             v=float(robot.v),
             omega=float(last_control[1]) if last_control is not None and last_control.size >= 2 else 0.0,
@@ -3584,11 +3994,39 @@ class SimulationControllerMixin:
             applied_control=Maybe.of(capture.applied_control) if capture.applied_control is not None else Maybe.missing(),
         )
 
+        selected_frontier = getattr(agent, "exploration_target_xy", None) if agent is not None else None
+        configured_frontier_planner = str(getattr(agent, "planner_mode", "")) if agent is not None else ""
+        effective_frontier_planner = str(
+            getattr(agent, "last_frontier_planner", "") or configured_frontier_planner
+        ) if agent is not None else ""
         frontier = FrontierDebug(
-            candidate_count=Maybe.missing(),
-            selected_target=Maybe.missing(),
+            candidate_count=(
+                Maybe.of(int(getattr(agent, "last_frontier_candidate_count", 0)))
+                if agent is not None
+                else Maybe.missing()
+            ),
+            selected_target=(
+                Maybe.of((float(selected_frontier[0]), float(selected_frontier[1])))
+                if selected_frontier is not None
+                else Maybe.missing()
+            ),
             selected_score=Maybe.missing(),
-            reason=Maybe.missing(),
+            reason=(
+                Maybe.of(str(getattr(agent, "last_frontier_selection_reason", "") or decision_reason))
+                if agent is not None
+                else Maybe.missing()
+            ),
+            configured_planner=(Maybe.of(configured_frontier_planner) if configured_frontier_planner else Maybe.missing()),
+            effective_planner=(Maybe.of(effective_frontier_planner) if effective_frontier_planner else Maybe.missing()),
+            attempt_role=(
+                Maybe.of(
+                    "configured planner"
+                    if effective_frontier_planner == configured_frontier_planner
+                    else "map-wide fallback"
+                )
+                if configured_frontier_planner and effective_frontier_planner
+                else Maybe.missing()
+            ),
         )
 
         # tracking_mode/rotate_threshold: read directly off the robot's
@@ -3622,18 +4060,25 @@ class SimulationControllerMixin:
             route=route,
         )
 
-        sensor_polygon = sensor_visible_polygon_world(
-            origin=robot_xy,
-            theta=float(robot.theta),
-            vision=float(robot.vision),
-            vision_model=self.config.vision_model,
-            obstacles=list(self.config.obstacles),
-            ray_count=(
-                SENSOR_DRAW_RAYS_CAMERA
-                if "Camera" in self.config.vision_model
-                else SENSOR_DRAW_RAYS_OMNI
-            ),
-        )
+        polygon_provider = getattr(self, "_navigation_debug_sensor_polygon", None)
+        if callable(polygon_provider):
+            sensor_polygon = polygon_provider(robot, resolved_index)
+        else:
+            # Duck-typed unit-test fakes bind only the finalizer. Keep that
+            # long-standing lightweight contract without requiring every fake
+            # to learn the production cache helper.
+            sensor_polygon = sensor_visible_polygon_world(
+                origin=robot_xy,
+                theta=float(robot.theta),
+                vision=float(robot.vision),
+                vision_model=self.config.vision_model,
+                obstacles=list(self.config.obstacles),
+                ray_count=(
+                    SENSOR_DRAW_RAYS_CAMERA
+                    if "Camera" in self.config.vision_model
+                    else SENSOR_DRAW_RAYS_OMNI
+                ),
+            )
         sensor_polygon_array = np.ascontiguousarray(sensor_polygon, dtype=np.float32)
         sensor = SensorDebug(
             vision_range=float(robot.vision),
@@ -3648,12 +4093,18 @@ class SimulationControllerMixin:
         agent_state_debug = self._navigation_debug_agent_state_frame(agent)
         metrics_debug = self._navigation_debug_metrics_frame()
 
+        navigation_state = str(getattr(agent, "status", "idle"))
+        if resolved_index is not None:
+            route_states = list(getattr(self, "multi_route_states", None) or [])
+            if 0 <= resolved_index < len(route_states):
+                navigation_state = str(route_states[resolved_index])
+
         self._nav_debug_seq = getattr(self, "_nav_debug_seq", 0) + 1
         snapshot = NavigationDebugSnapshot(
             snapshot_id=self._nav_debug_seq,
             simulation_time=float(getattr(self, "simulation_time", 0.0)),
-            robot_id="R1",
-            navigation_state=str(getattr(agent, "status", "idle")),
+            robot_id=f"R{resolved_index + 1}" if resolved_index is not None else "R1",
+            navigation_state=navigation_state,
             decision_kind=str(decision_kind),
             decision_reason=str(decision_reason),
             robot_pose=Pose(x=robot_xy[0], y=robot_xy[1], theta=float(robot.theta), v=float(robot.v)),
@@ -3676,17 +4127,32 @@ class SimulationControllerMixin:
             metrics=metrics_debug,
         )
 
-        # The ring buffer records every tick (a full in-memory history for
-        # the </> step buttons to scrub through) -- bounded (see
-        # NavigationDebugEventLog's max_size) and cleared whenever a
-        # simulation starts/resets (the 3 reset_simulation_state() call
-        # sites), so it never persists across a restart and never grows
-        # without bound. The canvas also gets every snapshot below so the
-        # live overlay/HUD stays current while running; pausing just stops
-        # these calls, which is what leaves the last snapshot intact for
-        # inspection.
+        # The ring buffer records every frame delivered here: all sparse
+        # events plus rate-limited routine ticks. It is bounded (see
+        # NavigationDebugEventLog.max_size) and cleared whenever a simulation
+        # starts/resets, so it never persists across a restart or grows without
+        # bound. Pausing leaves the last sampled snapshot intact for inspection.
         canvas = getattr(self, "canvas", None)
-        self._nav_debug_live_snapshot = snapshot
+        # Keep a live frame per robot.  The scalar alias/canvas represents the
+        # robot selected by the user; recording another robot must not make the
+        # overlay jump to it just because its loop iteration ran later.
+        is_multi_snapshot = resolved_index is not None and bool(runtime_robots)
+        if is_multi_snapshot:
+            live_by_robot = getattr(self, "_nav_debug_live_snapshots_by_robot", None)
+            if live_by_robot is None:
+                self._nav_debug_live_snapshots_by_robot = {}
+                live_by_robot = self._nav_debug_live_snapshots_by_robot
+            live_by_robot[resolved_index] = snapshot
+            selected_index = max(
+                0,
+                min(int(getattr(self, "selected_robot_index", 0)), len(runtime_robots) - 1),
+            )
+            publish_to_canvas = resolved_index == selected_index
+        else:
+            publish_to_canvas = True
+
+        if publish_to_canvas:
+            self._nav_debug_live_snapshot = snapshot
 
         log = getattr(self, "navigation_debug_log", None)
         if log is not None:
@@ -3698,15 +4164,48 @@ class SimulationControllerMixin:
             # meaningful signal (PLAN_ACCEPTED/ROUTE_REJECTED/SAFETY_REPLAN/
             # ...) even while routine ticks keep recording into the full
             # history above.
-            if canvas is not None and hasattr(canvas, "set_navigation_debug_last_event"):
-                canvas.set_navigation_debug_last_event(NavigationDebugEvent(event_kind, snapshot))
+            debug_event = NavigationDebugEvent(event_kind, snapshot)
+            if is_multi_snapshot:
+                events_by_robot = getattr(self, "_nav_debug_last_event_by_robot", None)
+                if events_by_robot is None:
+                    self._nav_debug_last_event_by_robot = {}
+                    events_by_robot = self._nav_debug_last_event_by_robot
+                events_by_robot[resolved_index] = debug_event
+            if publish_to_canvas and canvas is not None and hasattr(canvas, "set_navigation_debug_last_event"):
+                canvas.set_navigation_debug_last_event(debug_event)
 
-        if canvas is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
+        if publish_to_canvas and canvas is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
             canvas.set_navigation_debug_snapshot(snapshot)
+
+    def navigation_debug_tick_due(self, robot_index: int | None = None) -> bool:
+        """Rate-limit heavy routine reasoning frames, never sparse events.
+
+        Plan results, safety replans, holds, and collisions still call
+        ``_finalize_navigation_debug_snapshot`` immediately.  Only ordinary
+        TICK frames use this gate.  The timestamp is per robot so Multiple
+        mode keeps a balanced replay instead of whichever robot ran first.
+        """
+        key = -1 if robot_index is None else int(robot_index)
+        now = float(getattr(self, "simulation_time", 0.0))
+        last_by_robot = getattr(self, "_nav_debug_last_tick_time_by_robot", None)
+        if last_by_robot is None:
+            self._nav_debug_last_tick_time_by_robot = {}
+            last_by_robot = self._nav_debug_last_tick_time_by_robot
+        last = last_by_robot.get(key)
+        if last is not None and now >= last and now - last < NAVIGATION_DEBUG_TICK_PERIOD_SEC:
+            return False
+        last_by_robot[key] = now
+        return True
 
     def navigation_debug_history_length(self) -> int:
         log = getattr(self, "navigation_debug_log", None)
-        return len(log) if log is not None else 0
+        if log is None:
+            return 0
+        robots = list(getattr(self, "robots", None) or [])
+        if not robots:
+            return len(log)
+        selected_id = f"R{max(0, min(int(getattr(self, 'selected_robot_index', 0)), len(robots) - 1)) + 1}"
+        return sum(1 for event in log.events() if event.snapshot.robot_id == selected_id)
 
     def reset_navigation_debug_run_state(self) -> None:
         """Clear the in-memory replay and put the panel back on the robot/live state."""
@@ -3714,10 +4213,15 @@ class SimulationControllerMixin:
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
         self._nav_debug_last_accepted_plan = None
+        self._nav_debug_last_accepted_plan_by_robot = {}
         self._nav_debug_live_snapshot = None
+        self._nav_debug_live_snapshots_by_robot = {}
+        self._nav_debug_last_event_by_robot = {}
         self._nav_debug_pending_plan_capture_by_robot = {}
+        self._nav_debug_current_plan_capture_by_robot = {}
         self._nav_debug_belief_frame_key = None
         self._nav_debug_belief_frame_cache = None
+        self._nav_debug_last_tick_time_by_robot = {}
 
         stop_scrub = getattr(self, "stop_navigation_history_scrub", None)
         if callable(stop_scrub):
@@ -3744,9 +4248,17 @@ class SimulationControllerMixin:
         log = getattr(self, "navigation_debug_log", None)
         if log is None:
             return
-        event = log.event_at(index)
-        if event is None:
+        events = log.events()
+        robots = list(getattr(self, "robots", None) or [])
+        if robots:
+            selected = max(
+                0, min(int(getattr(self, "selected_robot_index", 0)), len(robots) - 1)
+            )
+            robot_id = f"R{selected + 1}"
+            events = tuple(event for event in events if event.snapshot.robot_id == robot_id)
+        if not (0 <= int(index) < len(events)):
             return
+        event = events[int(index)]
 
         self._nav_debug_history_index = index
         canvas = getattr(self, "canvas", None)
@@ -3757,7 +4269,7 @@ class SimulationControllerMixin:
         if hasattr(canvas, "set_navigation_debug_last_event"):
             canvas.set_navigation_debug_last_event(event)
         if hasattr(canvas, "set_navigation_debug_history_position"):
-            canvas.set_navigation_debug_history_position(index + 1, len(log))
+            canvas.set_navigation_debug_history_position(index + 1, len(events))
 
     def step_navigation_debug_history(self, delta: int) -> None:
         """Navigate LIVE -> frozen snapshots while paused, then browse strictly
@@ -3799,15 +4311,53 @@ class SimulationControllerMixin:
         canvas = getattr(self, "canvas", None)
         if canvas is None:
             return
-        live_snapshot = getattr(self, "_nav_debug_live_snapshot", None)
+        selected_index = int(getattr(self, "selected_robot_index", 0))
+        live_snapshot = getattr(self, "_nav_debug_live_snapshots_by_robot", {}).get(
+            selected_index,
+            getattr(self, "_nav_debug_live_snapshot", None),
+        )
         if live_snapshot is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
             canvas.set_navigation_debug_snapshot(live_snapshot)
         log = getattr(self, "navigation_debug_log", None)
-        latest = log.latest() if log is not None else None
+        latest = getattr(self, "_nav_debug_last_event_by_robot", {}).get(selected_index)
+        if latest is None:
+            latest = log.latest() if log is not None else None
         if hasattr(canvas, "set_navigation_debug_last_event"):
             canvas.set_navigation_debug_last_event(latest)
         if hasattr(canvas, "set_navigation_debug_history_position"):
             canvas.set_navigation_debug_history_position(None, self.navigation_debug_history_length())
+        updater = getattr(self, "update_navigation_debug_step_buttons", None)
+        if callable(updater):
+            updater()
+
+    def select_navigation_debug_robot(self, robot_index: int) -> None:
+        """Point the live reasoning panel/overlay at one runtime robot.
+
+        Multi-robot snapshots are recorded for the whole team, but the canvas
+        is intentionally a one-robot diagnostic view.  Selection therefore
+        swaps in the already-frozen live frame for R_i; it never recomputes a
+        route, safety result, sensor polygon, or controller value.
+        """
+        robots = list(getattr(self, "robots", None) or [])
+        if not robots:
+            return
+        index = max(0, min(int(robot_index), len(robots) - 1))
+        snapshot = getattr(self, "_nav_debug_live_snapshots_by_robot", {}).get(index)
+        self._nav_debug_history_index = None
+        if snapshot is not None:
+            self._nav_debug_live_snapshot = snapshot
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            if snapshot is not None and hasattr(canvas, "set_navigation_debug_snapshot"):
+                canvas.set_navigation_debug_snapshot(snapshot)
+            if hasattr(canvas, "set_navigation_debug_last_event"):
+                canvas.set_navigation_debug_last_event(
+                    getattr(self, "_nav_debug_last_event_by_robot", {}).get(index)
+                )
+            if hasattr(canvas, "set_navigation_debug_history_position"):
+                canvas.set_navigation_debug_history_position(
+                    None, self.navigation_debug_history_length()
+                )
         updater = getattr(self, "update_navigation_debug_step_buttons", None)
         if callable(updater):
             updater()
@@ -4753,6 +5303,30 @@ class SimulationControllerMixin:
                 for index, count in enumerate(per_robot_overlap):
                     metrics.append((f"R{index + 1} overlap cells", str(count)))
 
+        coordination_debug = getattr(self, "last_coordination_debug", {})
+        if isinstance(coordination_debug, dict) and coordination_debug.get("plugin") == "CQLite distributed Q-learning":
+            communication = coordination_debug.get("communication", {})
+            network = coordination_debug.get("network", {})
+            q_updates = coordination_debug.get("q_updates", {})
+            if isinstance(communication, dict):
+                metrics.extend(
+                    [
+                        ("CQLite decisions", str(coordination_debug.get("decision_index", 0))),
+                        ("CQLite compact messages", str(communication.get("messages_cumulative", 0))),
+                        ("CQLite compact payload", f"{float(communication.get('payload_bytes_cumulative', 0)) / 1000.0:.3f} kB"),
+                        ("CQLite map-merge requests", str(communication.get("map_merge_requests_cumulative", 0))),
+                    ]
+                )
+            if isinstance(network, dict):
+                metrics.append(("CQLite communication edges", str(network.get("undirected_edge_count", 0))))
+            if isinstance(q_updates, dict):
+                metrics.append(
+                    (
+                        "CQLite Q updates",
+                        str(sum(int(value) for value in q_updates.values())),
+                    )
+                )
+
         metrics.extend([
             ("Sensor updates", str(self.sensor_update_count)),
             ("Mapping updates", str(self.mapping_update_count)),
@@ -5119,6 +5693,10 @@ class SimulationControllerMixin:
         # geometric fidelity -- never invent smooth paths from cells.
         self.canvas.clear_explored_area_geometry()
         self.explored_area_polygons = []
+        self.last_explored_pose = None
+        self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.canvas.set_explored_area_polygons(self.explored_area_polygons)
         self.canvas.set_explored_area_seed(explored, float(frame.resolution), belief.bounds)
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -5230,6 +5808,17 @@ class SimulationControllerMixin:
 
         # 10. Return the view to LIVE.
         self._nav_debug_history_index = None
+
+        # Frontier Reasoning is separate from Navigation Reasoning history.
+        # Explicitly replace any discarded-future decision still displayed.
+        self._last_frontier_panel_signature = None
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None and hasattr(frontier_panel, "restore_from_snapshot"):
+            frontier_panel.restore_from_snapshot(
+                snapshot=snapshot,
+                configured_planner=str(getattr(self.config, "exploration_planner", "")),
+                robot_label="R1",
+            )
 
         self.canvas.set_robot(self.robot)
         self.canvas.set_path(self.path_points)
@@ -5400,6 +5989,22 @@ class SimulationControllerMixin:
         elif len(self.multi_last_safety_replan_signatures) > count:
             self.multi_last_safety_replan_signatures = self.multi_last_safety_replan_signatures[:count]
 
+        if not hasattr(self, "multi_safety_replan_streaks"):
+            self.multi_safety_replan_streaks = []
+        if len(self.multi_safety_replan_streaks) < count:
+            self.multi_safety_replan_streaks.extend([0] * (count - len(self.multi_safety_replan_streaks)))
+        elif len(self.multi_safety_replan_streaks) > count:
+            self.multi_safety_replan_streaks = self.multi_safety_replan_streaks[:count]
+
+        if not hasattr(self, "multi_last_safety_replan_positions"):
+            self.multi_last_safety_replan_positions = []
+        if len(self.multi_last_safety_replan_positions) < count:
+            self.multi_last_safety_replan_positions.extend(
+                [None] * (count - len(self.multi_last_safety_replan_positions))
+            )
+        elif len(self.multi_last_safety_replan_positions) > count:
+            self.multi_last_safety_replan_positions = self.multi_last_safety_replan_positions[:count]
+
         if not hasattr(self, "multi_last_exploration_replan_sim_times"):
             self.multi_last_exploration_replan_sim_times = []
         if len(self.multi_last_exploration_replan_sim_times) < count:
@@ -5478,9 +6083,51 @@ class SimulationControllerMixin:
         if same_signature and elapsed < cooldown:
             return False
 
+        current_position = None
+        robots = list(getattr(self, "robots", []) or [])
+        if 0 <= robot_index < len(robots):
+            current_position = (float(robots[robot_index].x), float(robots[robot_index].y))
+        last_position = self.multi_last_safety_replan_positions[robot_index]
+        progress_tolerance = max(0.10, 0.20 * float(getattr(self.config, "grid_resolution", 0.5)))
+        same_stuck_pose = (
+            current_position is not None
+            and last_position is not None
+            and math.hypot(
+                current_position[0] - float(last_position[0]),
+                current_position[1] - float(last_position[1]),
+            ) < progress_tolerance
+        )
+        if same_signature and same_stuck_pose:
+            self.multi_safety_replan_streaks[robot_index] += 1
+        else:
+            self.multi_safety_replan_streaks[robot_index] = 1
+
         self.multi_last_safety_replan_sim_times[robot_index] = float(self.simulation_time)
         self.multi_last_safety_replan_signatures[robot_index] = signature
+        self.multi_last_safety_replan_positions[robot_index] = current_position
         return True
+
+    def repeated_multi_safety_replan_requires_new_target(self, robot_index: int) -> bool:
+        """Return whether same-target static repairs are exhausted for a robot."""
+        self.ensure_multi_replan_guard_slots()
+        robot_index = int(robot_index)
+        if not (0 <= robot_index < len(self.multi_safety_replan_streaks)):
+            return False
+        return (
+            int(self.multi_safety_replan_streaks[robot_index])
+            > int(self.MAX_SAME_TARGET_STATIC_SAFETY_REPAIRS)
+        )
+
+    def reset_multi_safety_replan_streak(self, robot_index: int) -> None:
+        """Forget a stuck streak after the robot obtains a safe motion tick."""
+        self.ensure_multi_replan_guard_slots()
+        robot_index = int(robot_index)
+        if not (0 <= robot_index < len(self.multi_safety_replan_streaks)):
+            return
+        self.multi_safety_replan_streaks[robot_index] = 0
+        self.multi_last_safety_replan_sim_times[robot_index] = -1.0e9
+        self.multi_last_safety_replan_signatures[robot_index] = None
+        self.multi_last_safety_replan_positions[robot_index] = None
 
     def multi_exploration_target_replan_allowed(self, robot_index: int) -> bool:
         """Per-robot cooldown for target-reached frontier replans."""
@@ -5539,6 +6186,7 @@ class SimulationControllerMixin:
             return False
 
         robot_index = int(robot_index)
+        getattr(self, "_nav_debug_current_plan_capture_by_robot", {}).pop(robot_index, None)
         robot = self.robots[robot_index]
         hold_xy = (float(robot.x), float(robot.y))
 
@@ -5630,6 +6278,32 @@ class SimulationControllerMixin:
         reason: str,
     ) -> bool:
         """Shared tail: commit a validated route as ACTIVE and restore self.robot."""
+        plan_capture = getattr(self, "_nav_debug_current_plan_capture_by_robot", {}).pop(
+            int(robot_index), None
+        )
+        if plan_capture is not None:
+            accepted_by_robot = getattr(self, "_nav_debug_last_accepted_plan_by_robot", None)
+            if accepted_by_robot is None:
+                self._nav_debug_last_accepted_plan_by_robot = {}
+                accepted_by_robot = self._nav_debug_last_accepted_plan_by_robot
+            accepted_by_robot[int(robot_index)] = plan_capture
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if (
+            path_panel is not None
+            and hasattr(path_panel, "update_route")
+        ):
+            path_panel.update_route(
+                planner=str(self.config.planner_type),
+                simplifier=str(self.config.path_simplifier),
+                success=True,
+                reason=str(route_reason),
+                capture=plan_capture,
+                waypoints=tuple(waypoints),
+                start_xy=(float(robot.x), float(robot.y)),
+                goal_xy=tuple(waypoints[-1]) if waypoints else None,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                robot_index=int(robot_index),
+            )
         self.set_robot_goal_or_waypoints(robot, waypoints)
         self.set_multi_route_state(robot_index, self.ROUTE_STATE_ACTIVE, route_reason)
 
@@ -5675,6 +6349,36 @@ class SimulationControllerMixin:
         )
 
         if (not success or not waypoints) and self.is_exploration_mode():
+            failed_target = (
+                self.multi_exploration_targets[robot_index]
+                if 0 <= robot_index < len(self.multi_exploration_targets) else None
+            )
+            failed_capture = getattr(self, "_nav_debug_current_plan_capture_by_robot", {}).get(robot_index)
+            path_panel = getattr(self, "path_reasoning_panel", None)
+            if path_panel is not None and hasattr(path_panel, "update_route"):
+                path_panel.update_route(
+                    planner=str(self.config.planner_type),
+                    simplifier=str(self.config.path_simplifier),
+                    success=False,
+                    reason=str(route_reason),
+                    capture=failed_capture,
+                    waypoints=(),
+                    start_xy=(float(robot.x), float(robot.y)),
+                    goal_xy=None if failed_target is None else tuple(failed_target),
+                    time_s=float(getattr(self, "simulation_time", 0.0)),
+                    robot_index=robot_index,
+                )
+            # At this point the dynamic-grid planner and its static-topology
+            # fallback both failed.  This is a target-specific reachability
+            # failure, not evidence that the robot arrived at the frontier.
+            # Blacklist it for the current coordination round before clearing
+            # the host target so the coordinator can choose another candidate.
+            self.ensure_multi_exploration_target_slots()
+            if (
+                0 <= robot_index < len(self.multi_exploration_targets)
+                and self.multi_exploration_targets[robot_index] is not None
+            ):
+                self.invalidate_current_multi_frontier(robot_index, route_reason)
             held = self.hold_multi_robot_position(
                 robot_index,
                 f"no valid exploration route; {route_reason}",
@@ -5698,24 +6402,77 @@ class SimulationControllerMixin:
                 return held
             waypoints = [self.final_goal_xy()]
 
-        # Validate the FULL corridor against teammates before this route is
-        # allowed to become ACTIVE. This runs earlier and stricter than the
-        # per-frame movement safety veto (segment_violates_other_robot_clearance
-        # in the movement loop), which only checks the immediate next segment
-        # once a route is already active -- that veto remains as a final
-        # backstop, it is just no longer the first place a conflict is caught.
-        # Direct is included: a single-segment route is still a full corridor.
+        # Direct deliberately has no obstacle avoidance. Once mapping reveals
+        # that its straight segment is blocked, repeatedly installing the same
+        # one-waypoint route creates ACTIVE -> STUCK_SAFETY oscillation. Keep
+        # the assigned frontier, but obtain a local grid-safe A* route around
+        # known static geometry before performing the teammate-corridor check.
+        if (
+            self.is_exploration_mode()
+            and self.config.planner_type == "Direct"
+            and not self.coordinator_runtime_profile().owns_path_planning
+        ):
+            static_points_provider = getattr(self, "obstacle_points_for_segment_safety_check", None)
+            if callable(static_points_provider):
+                static_points = static_points_provider(
+                    (float(robot.x), float(robot.y)),
+                    float(self.safety_radius_for_robot(robot)),
+                )
+            else:
+                static_points = list(self.mapped_obstacle_points)
+            direct_blocked = self.route_points_intersect_new_map_information(
+                [(float(robot.x), float(robot.y))] + list(waypoints),
+                list(static_points),
+                robot_radius=float(self.safety_radius_for_robot(robot)),
+            )
+            if direct_blocked:
+                self.log_console_message(
+                    f"R{robot_index + 1}: Direct route crosses known obstacle, trying A* fallback"
+                )
+                fb_success, fb_reason, fb_waypoints = self.compute_grid_safe_fallback_route_for_multi_robot(
+                    robot_index,
+                    force_new_exploration_target=False,
+                )
+                if fb_success and fb_waypoints:
+                    fb_waypoints = self.clean_waypoints_for_robot(
+                        robot,
+                        fb_waypoints,
+                        obstacle_points=obstacle_points,
+                    )
+                if fb_success and fb_waypoints:
+                    waypoints = fb_waypoints
+                    route_reason = fb_reason
+                else:
+                    held = self.hold_multi_robot_position(
+                        robot_index,
+                        f"Direct route blocked and no grid-safe fallback exists; {fb_reason}",
+                        state=self.ROUTE_STATE_HOLD_ROUTE_BLOCKED,
+                    )
+                    self.robot = old_robot if old_robot in self.robots else (
+                        self.robots[0] if self.robots else None
+                    )
+                    return held
+
+        # Validate the segment that can actually execute now against current
+        # teammate positions.  A disk has no time dimension; applying it to
+        # every future segment treats a moving teammate as if it permanently
+        # occupied that position and creates circular waits in narrow aisles.
+        # Each later segment is checked when it becomes active, and predicted
+        # motion plus the final pairwise-clearance guard remain exact runtime
+        # backstops. Direct is included: its one segment is its full corridor.
         if self.is_exploration_mode():
             corridor_check = validate_multi_robot_corridor(
                 start=(float(robot.x), float(robot.y)),
-                waypoints=waypoints,
+                waypoints=waypoints[:1],
                 ego_safety_radius=float(self.safety_radius_for_robot(robot)),
                 other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
-                other_routes=[
-                    route
-                    for j, route in enumerate(self.multi_active_route_points_by_robot())
-                    if j != robot_index
-                ],
+                # Future polylines have no timing information. Treating them
+                # as permanently occupied made every crossing corridor a
+                # mutex: one robot stayed still until its teammate reached F_j
+                # and the route vanished. Coordinators still penalize route
+                # overlap; hard safety here uses current robot disks, with the
+                # per-frame segment/predicted-motion veto as the final guard.
+                other_routes=[],
                 margin=self.multi_dynamic_target_margin(),
             )
             if not corridor_check.is_valid:
@@ -5751,14 +6508,10 @@ class SimulationControllerMixin:
                     if fb_success and fb_waypoints:
                         fb_corridor_check = validate_multi_robot_corridor(
                             start=(float(robot.x), float(robot.y)),
-                            waypoints=fb_waypoints,
+                            waypoints=fb_waypoints[:1],
                             ego_safety_radius=float(self.safety_radius_for_robot(robot)),
                             other_robot_disks=self.dynamic_robot_obstacles_for_target_selection(robot_index),
-                            other_routes=[
-                                route
-                                for j, route in enumerate(self.multi_active_route_points_by_robot())
-                                if j != robot_index
-                            ],
+                            other_routes=[],
                             margin=self.multi_dynamic_target_margin(),
                         )
                         if fb_corridor_check.is_valid:
@@ -5887,6 +6640,8 @@ class SimulationControllerMixin:
         self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1, preserve_hazards=True)
         self.current_exploration_target = None
         self.multi_exploration_targets = []
+        self._multi_robot_coordinator = None
+        self.last_coordination_debug = {}
         self.multi_invalidated_exploration_targets = []
         self.last_exploration_replan_sim_time = -1.0e9
         self.last_exploration_gate_message_time = -1.0e9
@@ -5897,8 +6652,13 @@ class SimulationControllerMixin:
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
         self._nav_debug_last_accepted_plan = None
+        self._nav_debug_last_accepted_plan_by_robot = {}
         self._nav_debug_live_snapshot = None
+        self._nav_debug_live_snapshots_by_robot = {}
+        self._nav_debug_last_event_by_robot = {}
         self._nav_debug_pending_plan_capture_by_robot = {}
+        self._nav_debug_current_plan_capture_by_robot = {}
+        self._nav_debug_last_tick_time_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
@@ -5906,6 +6666,8 @@ class SimulationControllerMixin:
         self.total_distance_traveled = 0.0
         self.last_explored_pose = None
         self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
         self._exhausted_idle_obstacle_count = None
@@ -5961,6 +6723,7 @@ class SimulationControllerMixin:
         self.running = True
         self.paused = False
         self.canvas.set_simulation_running_for_perf(True)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(True)
         self.update_start_pause_button()
         self.speed_button.setText(f"Speed {self.simulation_speed:.2f}x")
@@ -5990,6 +6753,62 @@ class SimulationControllerMixin:
                 force=True,
             )
         self.top_bar.set_status("running")
+
+    def assign_ipp_experiment_route_to_robot(self) -> bool:
+        """Install the precomputed RSS26 tour instead of invoking A*/frontiers.
+
+        The paper plans a complete sensing tour in a known domain.  Feeding
+        that tour to the existing waypoint controller preserves this semantic
+        distinction: the simulator executes the research result, while the
+        normal navigation stack continues to enforce physical collision
+        safety.  This is intentionally single-robot only because the paper
+        lists multi-robot planning as future work.
+        """
+        experiment = getattr(self.config, "experiment", {})
+        if not isinstance(experiment, dict) or experiment.get("kind") != "uncertainty_guaranteed_ipp_rss26":
+            return False
+        if "Multiple" in str(getattr(self.config, "agent_mode", "")):
+            self.log_console_message(
+                "[RSS26 IPP] This published experiment is single-robot; "
+                "the normal multi-robot coordinator remains active."
+            )
+            return False
+
+        bundle = getattr(self, "ipp_experiment_bundle", None)
+        raw_path = getattr(bundle, "solution_path", None)
+        if raw_path is None:
+            self.log_console_message("[RSS26 IPP] No validated solution bundle is loaded.")
+            return False
+        route_array = np.asarray(raw_path, dtype=float)
+        if route_array.ndim != 2 or route_array.shape[1:] != (2,) or len(route_array) < 2:
+            self.log_console_message("[RSS26 IPP] Solution path must contain at least two waypoints.")
+            return False
+
+        route = [(float(point[0]), float(point[1])) for point in route_array]
+        start_error = math.hypot(route[0][0] - float(self.robot.x), route[0][1] - float(self.robot.y))
+        if start_error > max(float(self.config.goal_tolerance), 0.25):
+            self.log_console_message(
+                f"[RSS26 IPP] Robot start differs from the paper tour by {start_error:.2f} m; "
+                "adding a visible connector to the first waypoint."
+            )
+
+        method = str(getattr(bundle, "metrics", {}).get("method", "paper tour"))
+        self.route_request_count += 1
+        self.last_goal_selection_reason = f"RSS26 uncertainty-guaranteed IPP ({method})"
+        self._preserve_next_route_waypoints = True
+        try:
+            self.apply_route_result(
+                True,
+                "precomputed sensing tour from validated RSS26 experiment bundle",
+                route,
+            )
+        finally:
+            self._preserve_next_route_waypoints = False
+        self.log_console_message(
+            f"[RSS26 IPP] Executing {method}: {len(route)} route points; "
+            "frontier exploration is disabled for this experiment."
+        )
+        return True
 
     def start_simulation(self):
         # Diagnostics/output only: a fresh belief-trace artifact directory
@@ -6050,6 +6869,8 @@ class SimulationControllerMixin:
         self.reset_belief_map(robot_count=len(self.robots) if getattr(self, "robots", None) else 1, preserve_hazards=True)
         self.current_exploration_target = None
         self.multi_exploration_targets = []
+        self._multi_robot_coordinator = None
+        self.last_coordination_debug = {}
         self.multi_invalidated_exploration_targets = []
         self.last_exploration_replan_sim_time = -1.0e9
         self.last_exploration_gate_message_time = -1.0e9
@@ -6060,14 +6881,22 @@ class SimulationControllerMixin:
         self._nav_debug_seq = 0
         self._nav_debug_history_index = None
         self._nav_debug_last_accepted_plan = None
+        self._nav_debug_last_accepted_plan_by_robot = {}
         self._nav_debug_live_snapshot = None
+        self._nav_debug_live_snapshots_by_robot = {}
+        self._nav_debug_last_event_by_robot = {}
         self._nav_debug_pending_plan_capture_by_robot = {}
+        self._nav_debug_current_plan_capture_by_robot = {}
+        self._nav_debug_last_tick_time_by_robot = {}
         self.sensor_update_count = 0
         self.mapping_update_count = 0
         self.safety_replan_count = 0
         self.exploration_replan_count = 0
         self.total_distance_traveled = 0.0
         self.last_explored_pose = None
+        self.multi_last_explored_poses = {}
+        self.last_visible_sensor_polygon = None
+        self.multi_visible_sensor_polygons = {}
         self.last_motion_log_time = -1.0e9
         self.multi_last_motion_log_times = {}
         self.log_console_message(self.simulation_start_summary(multi=False))
@@ -6081,11 +6910,13 @@ class SimulationControllerMixin:
         self.record_explored_area(force=True)
         self.update_sensed_obstacles(force_status=False)
         self.force_robot_pose_free_in_belief(None)
-        self.assign_route_to_robot()
+        if not self.assign_ipp_experiment_route_to_robot():
+            self.assign_route_to_robot()
 
         self.running = True
         self.paused = False
         self.canvas.set_simulation_running_for_perf(True)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(True)
 
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -6123,6 +6954,8 @@ class SimulationControllerMixin:
         self.running = False
         self.paused = False
         self.canvas.set_simulation_running_for_perf(False)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(False)
 
         self.collision_checker = CollisionChecker() if CollisionChecker is not None else None
@@ -6146,6 +6979,9 @@ class SimulationControllerMixin:
         self.exploration_replan_count = 0
         self.total_distance_traveled = 0.0
         self.last_explored_pose: tuple[float, float, float] | None = None
+        self.multi_last_explored_poses: dict[int, tuple[float, float, float]] = {}
+        self.last_visible_sensor_polygon: tuple[tuple[float, float], ...] | None = None
+        self.multi_visible_sensor_polygons: dict[int, tuple[tuple[float, float], ...]] = {}
         self.last_sensor_update_time = 0.0
         self.last_sensor_update_pose = None
         self._exhausted_idle_obstacle_count = None
@@ -6173,6 +7009,11 @@ class SimulationControllerMixin:
         self.canvas.set_path([])
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
+        self.canvas.set_frontier_reasoning_decision(None)
+        # This overlay stores a copied grid/BFS frame. Replacing belief_map
+        # does not mutate that copy, so publish the new empty run explicitly.
+        self._grid_overlay_snapshot_last_push_time = None
+        self.canvas.set_grid_overlay_snapshot(self.occupancy_grid_snapshot())
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
@@ -6183,6 +7024,18 @@ class SimulationControllerMixin:
         self._publish_explored_area_source_to_canvas()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if path_panel is not None and hasattr(path_panel, "clear"):
+            path_panel.clear()
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None and hasattr(frontier_panel, "clear"):
+            frontier_panel.clear()
+        coordinator_panel = getattr(self, "coordinator_reasoning_panel", None)
+        if coordinator_panel is not None and hasattr(coordinator_panel, "clear"):
+            coordinator_panel.clear()
+        # Restart leaves the timer stopped, so force the cleared state onto
+        # screen now instead of waiting for the next simulation tick/Play.
+        self.canvas.repaint()
 
         self.top_bar.set_status("ready")
 
@@ -6191,6 +7044,8 @@ class SimulationControllerMixin:
             return
 
         self.paused = not self.paused
+        self.canvas.set_frontier_reasoning_simulation_paused(self.paused)
+        self.update_path_reasoning_live_pose()
 
         if self.paused:
             self.canvas.set_status("Simulation paused.")
@@ -6247,92 +7102,12 @@ class SimulationControllerMixin:
         *,
         robot_radius: float,
     ) -> bool:
-        """Return whether a current route crosses thresholded hazard cells."""
-        if self.collision_checker is None or len(route_points) < 2 or not hazard_points:
-            return False
-        for start, end in zip(route_points[:-1], route_points[1:]):
-            report = self.collision_checker.check_segment_points(
-                start=start,
-                end=end,
-                obstacle_points=list(hazard_points),
-                robot_radius=max(0.0, float(robot_radius)),
-            )
-            if report.collision:
-                return True
+        """Compatibility hook: fire never intersects an aerial route."""
         return False
 
     def _replan_routes_affected_by_hazard(self) -> None:
-        """Replan only active routes that now cross a blocked, OBSERVED
-        thermal cell -- never the omniscient ground-truth HazardField."""
-        if not getattr(self, "running", False):
-            return
-
-        service = self.ensure_hazard_service()
-        hazard_points = service.observed_blocked_world_points()
-        if not hazard_points:
-            return
-
-        robots = list(getattr(self, "robots", []) or [])
-        if robots and "Multiple" in str(getattr(self.config, "agent_mode", "")):
-            old_robot = getattr(self, "robot", None)
-            try:
-                for robot_index, robot in enumerate(robots):
-                    route_points = self.current_route_points_for_robot(robot)
-                    if not self._route_intersects_hazard_points(
-                        route_points,
-                        hazard_points,
-                        robot_radius=self.safety_radius_for_robot(robot),
-                    ):
-                        continue
-                    self.robot = robot
-                    if str(getattr(self.config, "planner_type", "")) == "Direct":
-                        if hasattr(robot, "force_stop"):
-                            robot.force_stop(reason="dynamic fire hazard blocks direct route")
-                        agent = self.runtime_agent(robot_index)
-                        if agent is not None:
-                            agent.invalidate_route(
-                                reason="dynamic fire hazard blocks direct route"
-                            )
-                        self._invalidate_prefetch_request(
-                            robot_index, reason="dynamic fire hazard blocks direct route"
-                        )
-                        continue
-                    self.assign_route_to_multi_robot(
-                        robot_index,
-                        reason="Dynamic fire hazard affects current route",
-                        force_new_exploration_target=False,
-                    )
-            finally:
-                self.robot = old_robot
-            return
-
-        if self.robot is None:
-            return
-        if self._route_intersects_hazard_points(
-            self.current_route_points(),
-            hazard_points,
-            robot_radius=self.safety_radius_for_robot(self.robot),
-        ):
-            agent = self.runtime_agent(None)
-            if agent is not None:
-                agent.invalidate_pending_path(
-                    reason="dynamic fire hazard affects current route"
-                )
-                self._invalidate_prefetch_request(0, reason="dynamic fire hazard affects current route")
-            if str(getattr(self.config, "planner_type", "")) == "Direct":
-                if hasattr(self.robot, "force_stop"):
-                    self.robot.force_stop(reason="dynamic fire hazard blocks direct route")
-                if agent is not None:
-                    agent.invalidate_route(
-                        reason="dynamic fire hazard blocks direct route"
-                    )
-                self.canvas.set_status(
-                    "Fire blocks the direct route. Select A* or Dijkstra to route around it."
-                )
-                return
-            self.replan_after_new_information(
-                "Dynamic fire hazard affects current route."
-            )
+        """Compatibility hook: hazard observations never trigger replanning."""
+        return
 
     def add_fire(self, x: float, y: float) -> bool:
         """Add a temporary globally-known fire without changing occupancy."""
@@ -6349,11 +7124,7 @@ class SimulationControllerMixin:
             f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
             f"radius={source.radius:.2f}m."
         )
-        # No replan here: creating a FireSource only changes ground truth.
-        # Route repair is driven by _replan_routes_affected_by_hazard() being
-        # called after a sensor update actually OBSERVES a newly-blocked
-        # cell (see update_explored_free_points_from_polygon()) -- never by
-        # the omniscient act of a fire existing somewhere on the map.
+        # No replan: fire is a traversable information layer.
         return True
 
     def remove_fire_near(self, x: float, y: float) -> bool:
@@ -6740,14 +7511,6 @@ class SimulationControllerMixin:
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None and belief_robot_index is not None:
             observation = hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
-            # Route repair is gated on a real threshold CROSSING newly
-            # discovered by this observation -- never on `changed` alone,
-            # which is also True for e.g. a new robot merely attributing an
-            # already-known, already-blocked cell, or a newly observed but
-            # safe cell. Creating/removing a FireSource never reaches here
-            # at all (see add_fire()/on_fire_toggle_requested()).
-            if observation.newly_blocked_cells > 0:
-                self._replan_routes_affected_by_hazard()
             # Mark the render dirty only on an actual VISUAL change -- new
             # cells becoming observed, or an already-observed cell's value
             # changing. Deliberately NOT observation.changed: that is also
@@ -6765,7 +7528,7 @@ class SimulationControllerMixin:
             if visual_changed:
                 self._discovered_hazard_render_dirty = True
 
-    def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> None:
+    def record_explored_area(self, force: bool = False, robot_index: int | None = None) -> bool:
         """
         Store the current occlusion-aware sensor footprint as explored area.
 
@@ -6774,7 +7537,7 @@ class SimulationControllerMixin:
         robot moves or rotates enough to add visible information.
         """
         if self.robot is None:
-            return
+            return False
 
         x = float(self.robot.x)
         y = float(self.robot.y)
@@ -6793,7 +7556,7 @@ class SimulationControllerMixin:
             min_turn = 0.18 if "Camera" in self.config.vision_model else math.inf
 
             if moved < min_move and rotated < min_turn:
-                return
+                return False
 
         polygon = sensor_visible_polygon_world(
             origin=(x, y),
@@ -6805,7 +7568,7 @@ class SimulationControllerMixin:
         )
 
         if len(polygon) < 3:
-            return
+            return False
 
         # Update the geometric explored map used by frontier planners. This is
         # independent from the optimized visual pixmap cache.
@@ -6820,10 +7583,15 @@ class SimulationControllerMixin:
 
         if robot_index is None:
             self.last_explored_pose = (x, y, theta)
+            self.last_visible_sensor_polygon = tuple((float(px), float(py)) for px, py in polygon)
             self.canvas.append_explored_area_polygon(polygon, robot_index=None)
         else:
             self.multi_last_explored_poses[int(robot_index)] = (x, y, theta)
+            self.multi_visible_sensor_polygons[int(robot_index)] = tuple(
+                (float(px), float(py)) for px, py in polygon
+            )
             self.canvas.append_explored_area_polygon(polygon, robot_index=int(robot_index))
+        return True
 
     def update_sensed_obstacles(self, force_status: bool = True) -> list[tuple[float, float]]:
         """Update the partial obstacle map with visible boundary samples.
@@ -6871,15 +7639,17 @@ class SimulationControllerMixin:
         _obstacle_extract_perf_start = time.perf_counter()
         for obstacle in candidate_obstacles:
             for point in self.sample_obstacle_boundary_points(tuple(obstacle), spacing):
-                if not self.point_visible_from_robot(point, candidate_obstacles):
-                    continue
-
                 # Keep the sampled boundary location, only rounded to a stable
                 # key. Do not collapse it to the belief cell center; doing so
                 # destroys the visible line and weakens route safety checks.
                 mapped_point = self.quantize_map_point(point, quantization)
                 key = (round(float(mapped_point[0]), 3), round(float(mapped_point[1]), 3))
                 if key in self.mapped_obstacle_point_keys:
+                    continue
+                # Visibility is the expensive part (an occlusion ray against
+                # the nearby obstacle set).  Already-mapped samples cannot add
+                # information, so reject them before doing that work.
+                if not self.point_visible_from_robot(point, candidate_obstacles):
                     continue
 
                 self.mapped_obstacle_point_keys.add(key)
@@ -7103,16 +7873,17 @@ class SimulationControllerMixin:
         dt: float,
         robot_radius: float,
         known_obstacle_points: list[tuple[float, float]] | None = None,
+        dynamic_obstacles: list[tuple[float, float, float]] | None = None,
         use_ground_truth: bool = True,
         capture=None,
     ):
         """Check short-horizon motion before applying a control.
 
-        Known mapped-obstacle points are checked first when the installed
-        CollisionChecker supports point-cloud prediction. Ground-truth rectangles
-        are also checked as a simulator integrity guard: the simulator should
-        stop before a collision, not after the robot has already entered an
-        obstacle safety region.
+        Optional mapped points are checked when a caller has no stronger source.
+        Runtime static obstacles use their exact ground-truth rectangles, while
+        dynamic robots use exact disks. This avoids checking the same static
+        geometry twice (once as hundreds of samples and again as rectangles)
+        without weakening either safety layer.
 
         capture: optional NavigationDebugCapture. When provided, stashes the
         predicted trajectory (predict_unicycle_points() already computes
@@ -7157,6 +7928,24 @@ class SimulationControllerMixin:
             if getattr(report, "collision", False):
                 return report
 
+        if dynamic_obstacles and hasattr(self.collision_checker, "check_predicted_motion_disks"):
+            report = self.collision_checker.check_predicted_motion_disks(
+                snapshot=snapshot,
+                control=control,
+                dt=safe_dt,
+                steps=steps,
+                obstacles=dynamic_obstacles,
+                robot_radius=robot_radius,
+            )
+            if capture is not None:
+                capture.predicted_collision = clearance_terms_from_report(
+                    report,
+                    checker="check_predicted_motion_disks",
+                    required_clearance=robot_radius,
+                )
+            if getattr(report, "collision", False):
+                return report
+
         if use_ground_truth and hasattr(self.collision_checker, "check_predicted_motion"):
             report = self.collision_checker.check_predicted_motion(
                 snapshot=snapshot,
@@ -7174,6 +7963,115 @@ class SimulationControllerMixin:
                 return report
 
         return None
+
+    def multi_rotation_escape_control(
+        self,
+        *,
+        robot_index: int,
+        target: tuple[float, float] | None,
+        dt: float,
+        robot_radius: float,
+        known_obstacle_points: list[tuple[float, float]],
+        dynamic_obstacles: list[tuple[float, float, float]] | None = None,
+        capture=None,
+    ) -> np.ndarray | None:
+        """Return a safe rotate-in-place command after an unsafe tracking arc.
+
+        A geometrically valid segment can still fail short-horizon prediction
+        when the dynamic-unicycle controller is carrying forward speed while
+        turning onto it.  Replanning the same segment cannot change that local
+        control state, which previously produced an endless
+        ``ACTIVE -> STUCK_SAFETY -> ACTIVE`` loop.  Stop residual translation,
+        align with the existing waypoint, and only return the rotation when a
+        second prediction proves that it is safe.
+
+        ``None`` means rotation cannot make useful progress (already aligned,
+        no target, or even the stationary rotation fails safety validation), so
+        the caller should continue with the normal route-repair path.
+        """
+        robots = list(getattr(self, "robots", []) or [])
+        index = int(robot_index)
+        if not (0 <= index < len(robots)):
+            return None
+        robot = robots[index]
+
+        # A predicted collision is a safety-critical stop.  A gradual brake is
+        # insufficient because DynamicUnicycle2D advances position with the
+        # pre-brake velocity on this tick.  This also gives the in-place
+        # rotation a genuinely zero-translation initial state.
+        if hasattr(robot, "force_stop"):
+            robot.force_stop(reason="predicted tracking arc unsafe; prepare in-place rotation")
+        elif hasattr(robot, "v"):
+            robot.v = 0.0
+
+        if target is None:
+            return None
+        tx, ty = float(target[0]), float(target[1])
+        dx = tx - float(robot.x)
+        dy = ty - float(robot.y)
+        if math.hypot(dx, dy) <= 1e-9:
+            return None
+
+        desired_heading = math.atan2(dy, dx)
+        heading_error = wrapped_angle_error(desired_heading, float(robot.theta))
+        # Below two degrees there is no meaningful corner-cutting arc left to
+        # remove.  Let the planner repair a genuinely blocked aligned segment.
+        if abs(heading_error) < math.radians(2.0):
+            return None
+
+        max_omega = max(
+            0.0,
+            float(getattr(robot, "max_angular_speed", self.config.max_angular_speed)),
+        )
+        if max_omega <= 1e-9:
+            return None
+        angular_gain = float(getattr(getattr(robot, "controller", None), "angular_gain", 2.0))
+        omega = float(np.clip(angular_gain * heading_error, -max_omega, max_omega))
+        # Guarantee visible progress even with a very small configured gain.
+        minimum_omega = min(0.35, max_omega)
+        if abs(omega) < minimum_omega:
+            omega = math.copysign(minimum_omega, heading_error)
+        rotation_control = np.array([[0.0], [omega]], dtype=float)
+
+        old_robot = getattr(self, "robot", None)
+        self.robot = robot
+        try:
+            rotation_report = self.predicted_motion_report(
+                control=rotation_control,
+                dt=dt,
+                robot_radius=robot_radius,
+                known_obstacle_points=known_obstacle_points,
+                dynamic_obstacles=dynamic_obstacles,
+                use_ground_truth=True,
+                capture=capture,
+            )
+        finally:
+            self.robot = old_robot
+        if rotation_report is not None and getattr(rotation_report, "collision", False):
+            return None
+        return rotation_control
+
+    def update_path_reasoning_live_pose(self) -> None:
+        panel = getattr(self, "path_reasoning_panel", None)
+        if (
+            panel is None
+            or not hasattr(panel, "update_live_pose")
+            or not bool(getattr(self, "_path_reasoning_panel_visible", False))
+        ):
+            return
+        robots = list(getattr(self, "robots", ()) or ())
+        if robots:
+            for index, robot in enumerate(robots):
+                panel.update_live_pose(
+                    (float(robot.x), float(robot.y)),
+                    robot_label=f"R{index + 1}",
+                    robot_index=index,
+                )
+            return
+        robot = getattr(self, "robot", None)
+        panel.update_live_pose(
+            None if robot is None else (float(robot.x), float(robot.y)), robot_label="R1", robot_index=0
+        )
 
     def simulation_step_multi(self, real_dt: float) -> None:
         if not self.running or self.paused or not self.robots:
@@ -7199,9 +8097,14 @@ class SimulationControllerMixin:
 
             for robot_index, robot in enumerate(self.robots):
                 self.robot = robot
-                self.record_explored_area(force=True, robot_index=robot_index)
-                newly = self.update_sensed_obstacles(force_status=False)
-                newly_discovered_all.extend(newly)
+                # Static robots have no new FoV in a static map.  The forced
+                # rescan used to rasterize their polygon and ray-test every
+                # obstacle boundary at 10 Hz while they were waiting, which
+                # scales particularly badly at six robots.  Startup already
+                # performs one forced observation for every robot.
+                if self.record_explored_area(force=False, robot_index=robot_index):
+                    newly = self.update_sensed_obstacles(force_status=False)
+                    newly_discovered_all.extend(newly)
 
             self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
 
@@ -7231,6 +8134,8 @@ class SimulationControllerMixin:
         for index, robot in enumerate(self.robots):
             robot_position = (float(robot.x), float(robot.y))
             robot_radius = self.safety_radius_for_robot(robot)
+            agent = self.runtime_agent(index)
+            nav_debug_capture = NavigationDebugCapture()
 
             current_collision = self.collision_checker.check_position(
                 position=robot_position,
@@ -7240,22 +8145,58 @@ class SimulationControllerMixin:
             if current_collision.collision:
                 self.last_collision_report = current_collision
                 self.robot = robot
+                self._finalize_navigation_debug_snapshot(
+                    agent=agent,
+                    robot=robot,
+                    robot_index=index,
+                    decision_kind="HOLD",
+                    decision_reason="robot is inside an obstacle safety region",
+                    event_kind=NavigationDebugEventKind.HOLD,
+                    capture=nav_debug_capture,
+                    control=self.brake_control_for_collision(),
+                )
                 self.stop_for_collision(f"COLLISION: robot {index + 1} is inside an obstacle safety region.")
                 return
 
             self.robot = robot
+
+            # A hold waypoint is the robot's current pose. Without this
+            # explicit WAITING branch, the generic "target reached" code below
+            # reports a frontier arrival that never happened. Retry corridor
+            # coordination without completion semantics instead; a successful
+            # assignment becomes ACTIVE and moves on the next tick.
+            if (
+                self.is_exploration_mode()
+                and 0 <= index < len(getattr(self, "multi_route_states", []))
+                and self.multi_route_states[index] == self.ROUTE_STATE_WAITING_FOR_CORRIDOR
+            ):
+                if self.multi_exploration_target_replan_allowed(index):
+                    self.assign_route_to_multi_robot(
+                        index,
+                        reason="Retrying transient corridor occupancy",
+                        force_new_exploration_target=False,
+                    )
+                control = self.brake_control_for_collision()
+                new_controls.append(control)
+                continue
+
             target = self.active_target_xy()
             if target is not None:
-                dynamic_points = self.dynamic_robot_obstacle_points_for_robot(index)
                 # obstacle_points_for_segment_safety_check() (not the raw
                 # mapped_obstacle_points list) -- see that method's
-                # docstring; single-robot's build_observation() already
-                # uses it for this exact check, multi-robot must agree.
+                # docstring. Teammates are checked immediately below with
+                # exact combined-radius disks, so sampled robot point clouds
+                # would only duplicate that work.
                 active_segment_report = self.collision_checker.check_segment_points(
                     start=robot_position,
                     end=target,
-                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius) + dynamic_points,
+                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
                     robot_radius=robot_radius,
+                )
+                nav_debug_capture.active_segment = clearance_terms_from_report(
+                    active_segment_report,
+                    checker="check_segment_points",
+                    required_clearance=robot_radius,
                 )
                 robot_obstacle_violation, robot_obstacle_message = self.segment_violates_other_robot_clearance(
                     index,
@@ -7266,13 +8207,26 @@ class SimulationControllerMixin:
                     block_reason = robot_obstacle_message if robot_obstacle_violation else "Active segment blocked by known obstacle"
                     self.set_multi_route_state(index, self.ROUTE_STATE_STUCK_SAFETY, block_reason)
 
-                    # If the currently assigned frontier produces an unsafe first
-                    # segment, do not keep re-planning to that same frontier.
-                    # Blacklist it for this robot and request a different target.
-                    if self.is_exploration_mode():
-                        self.invalidate_current_multi_frontier(index, block_reason)
+                    # Freeze the blocked route BEFORE the synchronous repair
+                    # replaces it.  Otherwise the panel would combine the old
+                    # collision report with the newly assigned path and explain
+                    # a state that never actually existed.
+                    self._finalize_navigation_debug_snapshot(
+                        agent=agent,
+                        robot=robot,
+                        robot_index=index,
+                        decision_kind="REPLAN_FOR_SAFETY",
+                        decision_reason=block_reason,
+                        event_kind=NavigationDebugEventKind.SAFETY_REPLAN,
+                        capture=nav_debug_capture,
+                        control=self.brake_control_for_collision(),
+                    )
 
-                    # Re-target regardless of planner_type: assign_route_to_multi_robot
+                    # Repair the route to the SAME frontier first. A blocked
+                    # segment invalidates the corridor, not its information
+                    # target. If repair fails, route assignment enters HOLD and
+                    # clears F_i so a later tick can request a fresh assignment.
+                    # Replan regardless of planner_type: assign_route_to_multi_robot
                     # already resolves Direct/A*/Dijkstra/plugin-owned paths
                     # uniformly (see compute_route_for_multi_robot) and falls back
                     # to HOLD_ROUTE_BLOCKED/WAITING_FOR_CORRIDOR on its own when no
@@ -7284,7 +8238,7 @@ class SimulationControllerMixin:
                         if self.assign_route_to_multi_robot(
                             index,
                             reason=block_reason,
-                            force_new_exploration_target=True,
+                            force_new_exploration_target=False,
                         ):
                             control = self.brake_control_for_collision()
                             new_controls.append(control)
@@ -7302,7 +8256,10 @@ class SimulationControllerMixin:
             # may be replaced below. The safety veto further down (predicted
             # collision check) still runs on whatever control is used here, so
             # a CONTROL-owning plugin cannot bypass it.
-            legacy_control = self.nominal_control_safe(blocked=False)
+            legacy_control = self.nominal_control_safe(
+                blocked=False,
+                capture=nav_debug_capture,
+            )
             control_profile = self.coordinator_runtime_profile()
             robot_command = getattr(self, "multi_robot_commands_by_id", {}).get(index)
             control, control_reason = select_runtime_control_source(
@@ -7312,41 +8269,137 @@ class SimulationControllerMixin:
                 _LOGGER.debug("R%d control source: %s", index + 1, control_reason)
             control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
             control = self.apply_hazard_safety_filter(robot, control)
+            flattened_control = np.asarray(control, dtype=float).reshape(-1)
+            if flattened_control.size >= 2:
+                nav_debug_capture.applied_control = (
+                    float(flattened_control[0]),
+                    float(flattened_control[1]),
+                )
 
-            # obstacle_points_for_segment_safety_check() (not the raw
-            # mapped_obstacle_points list) -- matches the active-segment
-            # check above and single-robot's predicted_motion_report call.
+            # Static mapped samples represent the same rectangles available to
+            # the simulator's integrity guard, so checking both collections is
+            # redundant. Predict against exact static rectangles and exact
+            # teammate disks; keep point-cloud checks for callers that truly
+            # have only sampled geometry.
+            prediction_dynamic_obstacles = self.dynamic_robot_obstacles_for_target_selection(index)
             prediction_report = self.predicted_motion_report(
                 control=control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius)
-                + self.dynamic_robot_obstacle_points_for_robot(index),
+                known_obstacle_points=None,
+                dynamic_obstacles=prediction_dynamic_obstacles,
                 use_ground_truth=True,
+                capture=nav_debug_capture,
             )
+            used_rotation_escape = False
             if prediction_report is not None and getattr(prediction_report, "collision", False):
                 self.last_collision_report = prediction_report
                 block_reason = "Predicted collision before motion update"
-                self.set_multi_route_state(index, self.ROUTE_STATE_STUCK_SAFETY, block_reason)
-                if self.is_exploration_mode():
-                    self.invalidate_current_multi_frontier(index, block_reason)
+                rotation_escape = self.multi_rotation_escape_control(
+                    robot_index=index,
+                    target=target,
+                    dt=dt,
+                    robot_radius=robot_radius,
+                    known_obstacle_points=[],
+                    dynamic_obstacles=prediction_dynamic_obstacles,
+                    capture=nav_debug_capture,
+                )
+                if rotation_escape is not None:
+                    control = rotation_escape
+                    used_rotation_escape = True
+                    block_reason = (
+                        "Nominal tracking arc predicted a collision; "
+                        "rotating in place toward the active waypoint"
+                    )
+                    self.set_multi_route_state(index, self.ROUTE_STATE_ESCAPE_LOCAL, block_reason)
+                    flattened_control = np.asarray(control, dtype=float).reshape(-1)
+                    nav_debug_capture.applied_control = (
+                        float(flattened_control[0]),
+                        float(flattened_control[1]),
+                    )
+                else:
+                    self.set_multi_route_state(index, self.ROUTE_STATE_STUCK_SAFETY, block_reason)
+                    self._finalize_navigation_debug_snapshot(
+                        agent=agent,
+                        robot=robot,
+                        robot_index=index,
+                        decision_kind="REPLAN_FOR_SAFETY",
+                        decision_reason=block_reason,
+                        event_kind=NavigationDebugEventKind.PREDICTED_COLLISION,
+                        capture=nav_debug_capture,
+                        control=control,
+                    )
+                    # Repair toward the existing information target first.  A
+                    # repeated ground-truth veto at the same pose means that
+                    # repair is reinstalling the same unusable route; after a
+                    # bounded number of attempts, blacklist F_i and ask the
+                    # coordinator for an alternative.  Point-cloud reports may
+                    # include a moving teammate, so they never trigger this
+                    # static-frontier fallback here.
+                    if self.multi_safety_replan_allowed(index, block_reason, target):
+                        replace_frontier = bool(
+                            self.is_exploration_mode()
+                            and getattr(prediction_report, "obstacle", None) is not None
+                            and self.repeated_multi_safety_replan_requires_new_target(index)
+                        )
+                        if replace_frontier:
+                            self.invalidate_current_multi_frontier(
+                                index,
+                                "repeated static predicted collision for the same route",
+                            )
+                            self.log_console_message(
+                                f"R{index + 1}: repeated static safety veto; "
+                                "blacklisting frontier and requesting an alternative"
+                            )
+                        if self.assign_route_to_multi_robot(
+                            index,
+                            reason=block_reason,
+                            force_new_exploration_target=replace_frontier,
+                        ):
+                            control = self.brake_control_for_collision()
+                            new_controls.append(control)
+                            continue
 
-                # Re-target regardless of planner_type -- see the matching
-                # comment on the active-segment block above for why gating
-                # this on planner_type == "Direct" was wrong.
-                if self.multi_safety_replan_allowed(index, block_reason, target):
-                    if self.assign_route_to_multi_robot(
-                        index,
-                        reason=block_reason,
-                        force_new_exploration_target=True,
-                    ):
-                        control = self.brake_control_for_collision()
-                        new_controls.append(control)
-                        continue
+                    control = self.brake_control_for_collision()
+                    new_controls.append(control)
+                    continue
 
-                control = self.brake_control_for_collision()
-                new_controls.append(control)
-                continue
+            if not used_rotation_escape:
+                # A normal command passed both mapped and ground-truth
+                # prediction.  Any previous same-pose veto streak is no longer
+                # evidence of a deadlock.
+                self.reset_multi_safety_replan_streak(index)
+
+            if (
+                not used_rotation_escape
+                and 0 <= index < len(getattr(self, "multi_route_states", []))
+                and self.multi_route_states[index] == self.ROUTE_STATE_ESCAPE_LOCAL
+            ):
+                self.set_multi_route_state(
+                    index,
+                    self.ROUTE_STATE_ACTIVE,
+                    "in-place alignment complete; following existing route",
+                )
+
+            route_reason = ""
+            if 0 <= index < len(getattr(self, "multi_route_state_reasons", [])):
+                route_reason = str(self.multi_route_state_reasons[index] or "")
+            tick_event_kind = (
+                NavigationDebugEventKind.PREDICTED_COLLISION
+                if used_rotation_escape
+                else NavigationDebugEventKind.TICK
+            )
+            if tick_event_kind is not NavigationDebugEventKind.TICK or self.navigation_debug_tick_due(index):
+                self._finalize_navigation_debug_snapshot(
+                    agent=agent,
+                    robot=robot,
+                    robot_index=index,
+                    decision_kind="ESCAPE_LOCAL" if used_rotation_escape else "FOLLOW_PATH",
+                    decision_reason=route_reason or "multi-robot route active",
+                    event_kind=tick_event_kind,
+                    capture=nav_debug_capture,
+                    control=control,
+                )
 
             robot.update(control, dt)
             new_controls.append(control)
@@ -7416,6 +8469,7 @@ class SimulationControllerMixin:
             simulation_time=self.simulation_time,
             simulation_speed=self.simulation_speed,
         )
+        self.update_path_reasoning_live_pose()
 
     def _append_executed_path_point(self, new_path_point: tuple[float, float]) -> None:
         """Append one point to the single-robot executed trail
@@ -7739,12 +8793,9 @@ class SimulationControllerMixin:
             # ── New OOP flow ──────────────────────────────────────────────
             # build_observation pre-computes active_segment_blocked.
             #
-            # nav_debug_capture is always built now (see _finalize_
-            # navigation_debug_snapshot()'s docstring): every tick is
-            # recorded unconditionally, so history is already populated by
-            # the time a user turns Navigation on mid-run -- navigation_
-            # debug_enabled only gates the UI's browse/inspect/restore
-            # affordances, not whether a tick gets captured.
+            # Build capture independently of the panel switch so sparse events
+            # are never missed. Routine frames are rate-limited immediately
+            # before finalization below.
             nav_debug_capture = NavigationDebugCapture()
             _runtime_state_build_perf_start = time.perf_counter()
             obs = self.build_observation(self.robot, agent, None, capture=nav_debug_capture)
@@ -7762,7 +8813,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
+                known_obstacle_points=None,
                 use_ground_truth=True,
                 capture=nav_debug_capture,
             )
@@ -7774,6 +8825,33 @@ class SimulationControllerMixin:
             planner_services = self.ensure_planner_services()
             _nav_decision_perf_start = time.perf_counter()
             decision = agent.step(obs, planner_services, dt)
+            frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+            frontier_candidates = tuple(getattr(agent, "last_frontier_candidates", ()) or ())
+            if frontier_panel is not None and frontier_candidates:
+                signature = (
+                    str(getattr(agent, "last_frontier_planner", "")),
+                    tuple(getattr(agent, "last_frontier_selected_target", ()) or ()),
+                    str(getattr(agent, "last_frontier_selection_reason", "")),
+                )
+                if signature != getattr(self, "_last_frontier_panel_signature", None):
+                    self._last_frontier_panel_signature = signature
+                    frontier_panel.update_decision(
+                        planner=signature[0],
+                        result=SimpleNamespace(
+                            target=getattr(agent, "last_frontier_selected_target", None),
+                            candidates=frontier_candidates,
+                            reason=getattr(agent, "last_frontier_selection_reason", ""),
+                        ),
+                        robot_label="R1",
+                        time_s=float(getattr(self, "simulation_time", 0.0)),
+                        robot_xy=(float(self.robot.x), float(self.robot.y)) if self.robot is not None else None,
+                        configured_planner=str(getattr(agent, "planner_mode", signature[0])),
+                        attempt_role=(
+                            "configured planner"
+                            if signature[0] == str(getattr(agent, "planner_mode", signature[0]))
+                            else "map-wide fallback"
+                        ),
+                    )
             _record_perf(self, "nav_decision", time.perf_counter() - _nav_decision_perf_start)
             _apply_decision_perf_start = time.perf_counter()
             should_brake = self.apply_navigation_decision(self.robot, agent, decision)
@@ -7783,12 +8861,16 @@ class SimulationControllerMixin:
                 # getattr-guarded -- see the equivalent call site in
                 # apply_route_result() for why.
                 _nav_debug_finalize = getattr(self, "_finalize_navigation_debug_snapshot", None)
-                if callable(_nav_debug_finalize):
+                debug_event_kind = self._navigation_debug_event_kind_for_decision(decision, predicted_report)
+                if callable(_nav_debug_finalize) and (
+                    debug_event_kind is not NavigationDebugEventKind.TICK
+                    or self.navigation_debug_tick_due(None)
+                ):
                     _nav_debug_finalize(
                         agent=agent,
                         decision_kind=str(decision.kind),
                         decision_reason=str(decision.reason),
-                        event_kind=self._navigation_debug_event_kind_for_decision(decision, predicted_report),
+                        event_kind=debug_event_kind,
                         capture=nav_debug_capture,
                     )
 
@@ -7847,7 +8929,7 @@ class SimulationControllerMixin:
                 control=self.last_control,
                 dt=dt,
                 robot_radius=robot_radius,
-                known_obstacle_points=self.obstacle_points_for_segment_safety_check(robot_position, robot_radius),
+                known_obstacle_points=None,
                 use_ground_truth=True,
             )
             if predicted_report is not None and getattr(predicted_report, "collision", False):
@@ -7919,6 +9001,8 @@ class SimulationControllerMixin:
                 simulation_speed=self.simulation_speed,
             )
             _record_perf(self, "canvas_state_update", time.perf_counter() - _canvas_update_perf_start)
+
+        self.update_path_reasoning_live_pose()
 
         _misc_tail_perf_start = time.perf_counter()
         self.push_grid_overlay_snapshot_if_due()
@@ -8104,6 +9188,7 @@ class SimulationControllerMixin:
                 resolution=resolution,
                 robot_radius=robot_radius,
                 goal_tolerance=goal_tolerance,
+                return_details=True,
             )
         return _is_reachable
 
@@ -8497,7 +9582,12 @@ class SimulationControllerMixin:
                     self.assign_route_to_multi_robot(
                         robot_index,
                         reason=f"safety replan: {decision.reason}",
-                        force_new_exploration_target=bool(self.is_exploration_mode()),
+                        # A safety replan repairs the route to the frontier that
+                        # is already assigned.  Re-selecting F_i here turns every
+                        # transient obstruction/prediction into a task-allocation
+                        # event and makes the team continually exchange targets.
+                        # REQUEST_PLAN is the decision that owns target changes.
+                        force_new_exploration_target=False,
                     )
             else:
                 # By this point kind can only still be "REPLAN_FOR_SAFETY"

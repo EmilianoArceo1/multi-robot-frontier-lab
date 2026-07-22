@@ -47,7 +47,11 @@ no full engine/GUI instantiation.
 from __future__ import annotations
 
 from robotics_sim.environment.belief_map import BeliefMap
-from robotics_sim.planning.exploration_planners import select_exploration_goal
+from robotics_sim.planning.exploration_planners import (
+    FoVAwareDirectionalFrontierPlanner,
+    NearestFrontierPlanner,
+    select_exploration_goal,
+)
 
 
 def _belief_with_near_small_and_far_large_frontiers() -> BeliefMap:
@@ -94,6 +98,25 @@ def _select(planner_name: str, belief: BeliefMap, *, is_candidate_reachable=None
         ipp_distance_penalty=0.2,
         is_candidate_reachable=is_candidate_reachable,
     )
+
+
+def test_each_exploration_planner_can_override_clustering_independently():
+    belief = _belief_with_near_small_and_far_large_frontiers()
+
+    class PerCellNearestPlanner(NearestFrontierPlanner):
+        def cluster_frontiers(self, belief_map):
+            inherited = super().cluster_frontiers(belief_map)
+            return [[cell] for cluster in inherited for cell in cluster]
+
+    default_clusters = NearestFrontierPlanner().cluster_frontiers(belief)
+    per_cell_clusters = PerCellNearestPlanner().cluster_frontiers(belief)
+    fov_clusters = FoVAwareDirectionalFrontierPlanner().cluster_frontiers(belief)
+
+    assert len(per_cell_clusters) > len(default_clusters)
+    assert {frozenset(cluster) for cluster in fov_clusters} == {
+        frozenset(cluster) for cluster in default_clusters
+    }
+    assert all(len(cluster) == 1 for cluster in per_cell_clusters)
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +168,12 @@ def test_largest_frontier_rejects_unreachable_largest_picks_next_reachable():
 
 
 # ---------------------------------------------------------------------------
-# 3. When every candidate is rejected, selection must fail explicitly --
-#    never fabricate a target, never silently return the best-scored one.
+# 3. When every precheck rejects, preserve the exploration decision and let
+#    the real route pipeline make an explicit, observable attempt.
 # ---------------------------------------------------------------------------
 
 
-def test_frontier_planner_reports_no_reachable_candidates_when_all_rejected():
+def test_frontier_planner_probes_ranked_candidate_when_all_prechecks_reject():
     belief = _belief_with_near_small_and_far_large_frontiers()
 
     for planner_name in ("Nearest frontier", "Largest frontier", "Utility frontier", "Informative frontier / IPP-lite"):
@@ -159,9 +182,9 @@ def test_frontier_planner_reports_no_reachable_candidates_when_all_rejected():
 
         result = _select(planner_name, belief, is_candidate_reachable=lambda xy: False)
 
-        assert not result.success, planner_name
-        assert result.target is None, planner_name
-        assert "no reachable frontier candidates" in result.reason, planner_name
+        assert result.success, planner_name
+        assert result.target == baseline.target, planner_name
+        assert "probing planner-ranked candidate" in result.reason, planner_name
 
 
 # ---------------------------------------------------------------------------

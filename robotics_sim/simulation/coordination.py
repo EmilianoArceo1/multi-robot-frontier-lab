@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from robotics_interfaces import (
+    CoordinationAssignment,
     CoordinationRequest as PluginCoordinationRequest,
     CoordinationResult as PluginCoordinationResult,
     CoordinationServices,
@@ -95,6 +96,7 @@ class CoordinationResult:
     strategy: str
     debug: dict[str, Any] = field(default_factory=dict)
     commands: tuple[RobotCommand, ...] = ()
+    assignments: tuple[CoordinationAssignment, ...] = ()
 
 
 def available_coordinator_options() -> list[str]:
@@ -190,6 +192,8 @@ class MultiRobotCoordinator:
         route_points_by_robot: list[list[tuple[float, float]]] | None = None,
         explored_points_by_robot: list[list[tuple[float, float]]] | None = None,
         goal_tolerance: float = 0.25,
+        coordination_parameters: Mapping[str, Any] | None = None,
+        time_s: float = 0.0,
     ) -> CoordinationResult:
         request = self._build_plugin_request(
             planner_name=planner_name,
@@ -208,6 +212,8 @@ class MultiRobotCoordinator:
             route_points_by_robot=route_points_by_robot,
             explored_points_by_robot=explored_points_by_robot,
             goal_tolerance=goal_tolerance,
+            coordination_parameters=coordination_parameters,
+            time_s=time_s,
         )
         if self.runtime_profile.owns_target_generation:
             _LOGGER.debug(
@@ -252,6 +258,8 @@ class MultiRobotCoordinator:
         route_points_by_robot: list[list[tuple[float, float]]] | None,
         explored_points_by_robot: list[list[tuple[float, float]]] | None,
         goal_tolerance: float,
+        coordination_parameters: Mapping[str, Any] | None = None,
+        time_s: float = 0.0,
     ) -> PluginCoordinationRequest:
         normalized_existing_targets = tuple(
             _normalize_target(target)
@@ -403,6 +411,10 @@ class MultiRobotCoordinator:
             "legacy_assign_frontier_viewpoints": assign_frontier_viewpoints,
         }
 
+        algorithm_parameters = {
+            str(key): value for key, value in dict(coordination_parameters or {}).items()
+        }
+
         return PluginCoordinationRequest(
             robot_states=plugin_robot_states,
             robots_to_assign=tuple(int(index) for index in robots_to_assign),
@@ -415,6 +427,7 @@ class MultiRobotCoordinator:
             blocked_targets_by_robot=blocked_targets_by_robot,
             route_points_by_robot=normalized_route_points,
             parameters={
+                **algorithm_parameters,
                 "planner_name": planner_name,
                 "ipp_distance_penalty": float(ipp_distance_penalty),
                 "target_exclusion_radius": float(target_exclusion_radius),
@@ -426,6 +439,7 @@ class MultiRobotCoordinator:
                 "min_frontier_travel_distance": min_frontier_travel_distance,
             },
             shared=shared,
+            time_s=float(time_s),
         )
 
     def _adapt_plugin_result(
@@ -448,6 +462,7 @@ class MultiRobotCoordinator:
             strategy=result.strategy,
             debug=dict(result.debug),
             commands=tuple(result.commands),
+            assignments=tuple(result.assignments),
         )
 
 

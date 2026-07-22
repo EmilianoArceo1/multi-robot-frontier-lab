@@ -39,10 +39,12 @@ leaves grid_overlay_toggle out of it, verified by inspection there.
 """
 from __future__ import annotations
 
+import inspect
 import time
 from types import SimpleNamespace
 
-from PySide6.QtCore import Qt
+import numpy as np
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -63,11 +65,12 @@ from robotics_sim.app.widgets import (
     grid_resolution_from_slider,
     slider_value_from_grid_resolution,
 )
-from robotics_sim.environment.belief_map import FREE, OCCUPIED, BeliefMap
+from robotics_sim.environment.belief_map import FREE, OCCUPIED, UNKNOWN, BeliefMap
 from robotics_sim.simulation.config import SimulationConfig
 from robotics_sim.simulation.engine import (
     PlannerWorker,
     SimulationControllerMixin,
+    frontier_bfs_steps,
     occupancy_grid_snapshot_from_belief,
 )
 
@@ -295,6 +298,54 @@ def test_occupancy_grid_snapshot_is_read_only_copy():
 
 def test_occupancy_grid_snapshot_is_none_without_belief_map():
     assert occupancy_grid_snapshot_from_belief(None) is None
+
+
+def test_occupancy_snapshot_keeps_frontiers_separate_from_cell_values():
+    belief = BeliefMap(bounds=(0.0, 3.0, 0.0, 3.0), resolution=1.0)
+    belief.grid[:, :] = UNKNOWN
+    belief.grid[1, 1] = FREE
+
+    snapshot = occupancy_grid_snapshot_from_belief(belief)
+
+    assert snapshot["grid"][1, 1] == FREE
+    assert (1, 1) in snapshot["frontier_cells"]
+    assert set(np.unique(snapshot["grid"])).issubset({UNKNOWN, FREE, OCCUPIED})
+
+
+def test_grid_debug_layers_can_be_toggled_independently():
+    canvas = SimulationCanvas()
+
+    canvas.set_grid_cell_values_enabled(True)
+    assert canvas.grid_cell_values_enabled is True
+    assert canvas.grid_overlay_enabled is False
+    assert canvas.frontier_decisions_enabled is False
+
+    canvas.set_frontier_decisions_enabled(True)
+    assert canvas.frontier_decisions_enabled is True
+    assert canvas.grid_overlay_enabled is False
+
+
+def test_grid_debug_labels_scale_instead_of_using_a_visibility_cutoff():
+    source = inspect.getsource(SimulationCanvas._draw_grid_debug_labels)
+
+    assert "show_text" not in source
+    assert "max(4, min(14" in source
+
+
+def test_frontier_bfs_uses_four_connected_known_free_cells_only():
+    grid = np.array([
+        [0, 0, -1],
+        [0, 1, 0],
+        [0, 0, 0],
+    ], dtype=np.int8)
+
+    steps = frontier_bfs_steps(grid, (0, 0))
+
+    assert steps[0, 0] == 0
+    assert steps[0, 1] == 1
+    assert steps[0, 2] == -1  # unknown is not traversed
+    assert steps[1, 1] == -1  # occupied is not traversed
+    assert steps[2, 2] == 4
 
 
 def test_grid_overlay_snapshot_setter_does_not_mutate_config():
@@ -814,3 +865,56 @@ def test_snapshot_frequency_returns_to_normal_when_not_degraded():
     SimulationControllerMixin.push_grid_overlay_snapshot_if_due(fake_engine)
 
     assert canvas._grid_overlay_snapshot_version == version_after_first + 1
+# Frontier-reasoning annotations are intentionally pause-only: the panel may
+# stay open during execution without covering the live map.
+def test_frontier_reasoning_canvas_annotations_require_panel_and_pause():
+    canvas = SimulationCanvas()
+    canvas.set_frontier_reasoning_decision({
+        "robot": (0.0, 0.0), "frontier": (1.0, 1.0), "distance": 1.414, "terms": (),
+    })
+
+    class PainterThatMustNotBeUsed:
+        def save(self):
+            raise AssertionError("overlay should be gated before painting")
+
+    painter = PainterThatMustNotBeUsed()
+    canvas.set_frontier_reasoning_overlay_enabled(False)
+    canvas.set_frontier_reasoning_simulation_paused(True)
+    canvas.draw_frontier_reasoning_overlay(painter)
+
+    canvas.set_frontier_reasoning_overlay_enabled(True)
+    canvas.set_frontier_reasoning_simulation_paused(False)
+    canvas.draw_frontier_reasoning_overlay(painter)
+
+    assert canvas.frontier_reasoning_overlay_enabled is True
+    assert canvas.frontier_reasoning_simulation_paused is False
+
+
+def test_frontier_candidate_focus_ring_is_hidden_while_simulation_runs():
+    canvas = SimulationCanvas()
+    canvas.set_frontier_reasoning_overlay_enabled(True)
+    canvas.set_frontier_reasoning_simulation_paused(False)
+    canvas.set_frontier_reasoning_inspection({
+        "frontier": (1.0, 1.0), "index": 1, "count": 3,
+    })
+
+    class PainterThatMustNotBeUsed:
+        def save(self):
+            raise AssertionError("candidate focus ring must be pause-only")
+
+    canvas.draw_frontier_candidate_inspection(PainterThatMustNotBeUsed())
+    assert canvas.frontier_reasoning_inspection["frontier"] == (1.0, 1.0)
+
+
+def test_mouse_coordinates_follow_cursor_and_toggle_clears_them():
+    canvas = SimulationCanvas()
+    canvas.resize(900, 700)
+    center = canvas.plot_rect().center()
+    canvas.mouseMoveEvent(SimpleNamespace(position=lambda: QPointF(center)))
+
+    assert canvas.cursor_coordinate_position == (center.x(), center.y())
+    assert canvas.cursor_coordinate_world is not None
+
+    canvas.set_cursor_coordinates_enabled(False)
+    assert canvas.cursor_coordinate_position is None
+    assert canvas.cursor_coordinate_world is None

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import copy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -228,6 +229,10 @@ TARGET_FRAME_MS = 16
 SENSOR_UPDATE_PERIOD_SEC = 0.10
 MIN_SENSOR_UPDATE_DISTANCE = 0.05
 MIN_SENSOR_UPDATE_ROTATION = 0.10
+# Navigation Reasoning stores compressed sensor/belief frames.  Ten samples
+# per simulated second are enough for a readable replay and prevent Multiple
+# mode from serializing one complete debug frame per robot at the GUI rate.
+NAVIGATION_DEBUG_TICK_PERIOD_SEC = 0.10
 
 # Ray counts intentionally differ by purpose. The current sensor footprint is
 # visual, so it can use more rays. The explored-area cache and physics-loop
@@ -351,6 +356,11 @@ class SimulationConfig:
     # Multiple Robot Mode when an exploration planner is active.
     coordinator_type: str = DEFAULT_COORDINATOR
 
+    # Algorithm-specific coordinator settings.  These are intentionally a
+    # plain JSON object so paper replicas can pin their published parameters
+    # without adding one-off GUI controls for every external algorithm.
+    coordination_parameters: dict = field(default_factory=dict)
+
     # Minimum simulated time between exploration-target replans.
     # Safety replans caused by newly discovered obstacles can still happen immediately.
     exploration_replan_cooldown: float = 1.00
@@ -444,6 +454,16 @@ class SimulationConfig:
     selected_robot_index: int = 0
     same_robot_configuration: bool = True
     robots: list[RobotStartConfig] = field(default_factory=default_robot_start_configs)
+
+    # Optional research-experiment metadata stored verbatim in the .sim file.
+    # Keeping this separate from normal planner fields prevents a paper preset
+    # from being confused with the simulator's frontier-exploration modes.
+    experiment: dict = field(default_factory=dict)
+
+    # Absolute path of the .sim file that produced this configuration.  This is
+    # runtime-only (never serialized) and lets experiment assets be resolved
+    # relative to a portable preset instead of the process working directory.
+    source_path: str = field(default="", repr=False, compare=False)
 
 
 # ============================================================
@@ -594,7 +614,7 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
     A .sim file is JSON on purpose. It should be easy to inspect, edit by hand,
     version, and generate from tests.
     """
-    return {
+    payload = {
         "schema": SIM_FILE_SCHEMA,
         "version": SIM_FILE_VERSION,
         "world": {
@@ -656,6 +676,7 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
         },
         "coordination": {
             "strategy": config.coordinator_type,
+            "parameters": copy.deepcopy(config.coordination_parameters),
         },
         "sensor": {
             "type": config.vision_model,
@@ -698,6 +719,9 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "mapping_point_spacing": config.mapping_point_spacing,
         },
     }
+    if config.experiment:
+        payload["experiment"] = copy.deepcopy(config.experiment)
+    return payload
 
 
 def config_from_sim_payload(payload: dict) -> SimulationConfig:
@@ -718,11 +742,17 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     planner = payload.get("planner", {}) if isinstance(payload.get("planner", {}), dict) else {}
     exploration = payload.get("exploration", {}) if isinstance(payload.get("exploration", {}), dict) else {}
     coordination = payload.get("coordination", {}) if isinstance(payload.get("coordination", {}), dict) else {}
+    coordination_parameters = (
+        copy.deepcopy(coordination.get("parameters", {}))
+        if isinstance(coordination.get("parameters", {}), dict)
+        else {}
+    )
     sensor = payload.get("sensor", {}) if isinstance(payload.get("sensor", {}), dict) else {}
     simulation = payload.get("simulation", {}) if isinstance(payload.get("simulation", {}), dict) else {}
     camera = payload.get("camera", {}) if isinstance(payload.get("camera", {}), dict) else {}
     multi_robot = payload.get("multi_robot", {}) if isinstance(payload.get("multi_robot", {}), dict) else {}
     hazard = payload.get("hazard", {}) if isinstance(payload.get("hazard", {}), dict) else {}
+    experiment = payload.get("experiment", {}) if isinstance(payload.get("experiment", {}), dict) else {}
 
     planner_type = str(planner.get("type", default.planner_type))
     if planner_type not in PLANNER_OPTIONS:
@@ -828,6 +858,7 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         path_simplifier=path_simplifier,
         exploration_planner=exploration_planner,
         coordinator_type=coordinator_type,
+        coordination_parameters=coordination_parameters,
         exploration_replan_cooldown=_as_float(
             exploration.get(
                 "replan_cooldown",
@@ -967,6 +998,7 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         selected_robot_index=max(0, int(_as_float(multi_robot.get("selected_robot_index", default.selected_robot_index), default.selected_robot_index))),
         same_robot_configuration=bool(multi_robot.get("same_robot_configuration", default.same_robot_configuration)),
         robots=_as_robot_start_list(multi_robot.get("robots", default.robots)),
+        experiment=copy.deepcopy(experiment),
     )
 
 
@@ -979,7 +1011,9 @@ def load_sim_file(path: str) -> SimulationConfig:
     with open(path, "r", encoding="utf-8") as file:
         payload = json.load(file)
 
-    return config_from_sim_payload(payload)
+    config = config_from_sim_payload(payload)
+    config.source_path = os.path.abspath(path)
+    return config
 
 
 def find_tamu_image() -> str | None:

@@ -191,26 +191,22 @@ def test_simplifier_does_not_shortcut_through_an_l_shaped_corner():
 # ---------------------------------------------------------------------------
 
 
-def test_robot_near_known_obstacle_does_not_get_an_impossible_first_segment():
+def test_robot_inside_known_obstacle_envelope_is_rejected_by_planner():
     near_robot_sample = (0.10, 0.05)  # inside ROBOT_RADIUS (0.3) of (0, 0)
     wall = _wall_points(x=3.0, y_min=-3.0, y_max=3.0)
     fake = _make_engine_fake(robot_xy=(0.0, 0.0), mapped_obstacle_points=[near_robot_sample] + wall)
 
     success, reason, waypoints = _plan_route(fake, (0.0, 0.0), (6.0, 0.0))
-    assert success, reason
-    assert waypoints
+    assert not success
+    assert "start cell is not traversable" in reason
+    assert not waypoints
 
     robot_radius = fake.safety_radius()
     obstacle_points = fake.obstacle_points_for_segment_safety_check((0.0, 0.0), robot_radius)
-    assert near_robot_sample not in obstacle_points, (
-        "the near-start sample must be sanitized the same way the planner already sanitizes it"
-    )
+    assert near_robot_sample in obstacle_points
     assert route_first_segment_blocked(
         fake.collision_checker, (0.0, 0.0), waypoints[0], obstacle_points, robot_radius,
-    ) is False, (
-        "a route the planner already found safe on the sanitized grid must not be "
-        "rejected by a validator using a stricter, unsanitized obstacle set"
-    )
+    ) is True
 
 
 # ---------------------------------------------------------------------------

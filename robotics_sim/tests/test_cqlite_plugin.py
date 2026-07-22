@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import pytest
+
+from algorithms.cqlite.plugin import CQLITE_COORDINATOR, CQLitePlugin
+from experiments.run_cqlite_experiments import run_matrix
+from robotics_interfaces.coordination import CoordinationRequest
+from robotics_interfaces.observations import RobotCoordinationState, WorldSnapshot
+from robotics_interfaces.plugins import PluginCapability
+from robotics_interfaces.proposals import ExplorationCandidate
+from robotics_interfaces.results import PathPlanningResponse
+from robotics_interfaces.services import CoordinationServices
+from robotics_sim.environment.collision_checker import CollisionChecker
+from robotics_sim.simulation.config import (
+    config_from_sim_payload,
+    config_to_sim_payload,
+    normalized_robot_start_configs,
+)
+from robotics_sim.simulation.plugin_loader import list_coordination_plugin_names, load_coordination_plugin
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PRESETS = (
+    ROOT / "examples" / "cqlite_house_3.sim",
+    ROOT / "examples" / "cqlite_bookstore_3.sim",
+    ROOT / "examples" / "cqlite_bookstore_6.sim",
+)
+
+
+def _robot(robot_id: int, x: float, y: float, current_target=None) -> RobotCoordinationState:
+    return RobotCoordinationState(
+        robot_id=robot_id,
+        xy=(x, y),
+        safety_radius=0.22,
+        sensor_range=15.0,
+        vision_model="LiDAR",
+        current_target=current_target,
+    )
+
+
+def _candidate(x: float, y: float, gain: float = 1.0) -> ExplorationCandidate:
+    return ExplorationCandidate(target=(x, y), information_gain=gain)
+
+
+def _parameters(**overrides):
+    values = {
+        "grid_resolution": 0.5,
+        "min_frontier_travel_distance": 0.1,
+        "target_exclusion_radius": 0.25,
+        "cqlite_alpha": 0.6,
+        "cqlite_gamma": 0.95,
+        "cqlite_step_cost": 2.0,
+        "cqlite_overlap_radius": 1.0,
+        "cqlite_communication_range": 50.0,
+        "cqlite_nominal_speed": 0.5,
+        "cqlite_rho": 2.0,
+        "cqlite_sigma": 0.01,
+        "cqlite_information_weight": 0.0,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_plugin_is_discoverable_and_stays_outside_simulator_package() -> None:
+    assert CQLITE_COORDINATOR in list_coordination_plugin_names()
+    plugin = load_coordination_plugin(CQLITE_COORDINATOR)
+    assert PluginCapability.COORDINATION in plugin.metadata.capabilities
+    assert PluginCapability.TASK_ALLOCATION in plugin.metadata.capabilities
+    assert PluginCapability.PATH_PLANNING not in plugin.metadata.capabilities
+    source = (ROOT / "algorithms" / "cqlite" / "plugin.py").read_text(encoding="utf-8")
+    assert "import robotics_sim" not in source
+    assert "from robotics_sim" not in source
+
+
+def test_first_q_update_matches_paper_equations_one_and_seven() -> None:
+    plugin = CQLitePlugin()
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (_candidate(1.0, 0.0),)},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    # reward = lambda - Q + rho*(1-overlap) + sigma*rc
+    #        = 2 - 0 + 2*(1-0) + .01*50 = 4.5
+    # Q' = .4*0 + .6*(4.5 + .95*0) = 2.7
+    command = result.commands[0]
+    assert command.metadata["cqlite_reward"] == pytest.approx(4.5)
+    assert command.metadata["cqlite_q_after"] == pytest.approx(2.7)
+
+
+def test_travel_time_priority_prefers_near_frontier_when_q_values_match() -> None:
+    plugin = CQLitePlugin()
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (_candidate(1.0, 0.0), _candidate(6.0, 0.0))},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets == ((1.0, 0.0),)
+    assert result.commands[0].metadata["cqlite_travel_time"] == pytest.approx(2.0)
+
+
+def test_optional_path_service_refines_only_a_bounded_shortlist() -> None:
+    class CountingPathService:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def plan_path(self, request):
+            self.requests.append(request)
+            return PathPlanningResponse(success=True, waypoints=(request.goal,))
+
+    service = CountingPathService()
+    candidates = tuple(_candidate(float(index), 0.0) for index in range(1, 13))
+    request = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: candidates},
+        world=WorldSnapshot(bounds=(-10.0, 20.0, -10.0, 10.0), resolution=0.5),
+        services=CoordinationServices(path_planning_service=service),
+        parameters=_parameters(
+            cqlite_use_path_service=True,
+            cqlite_path_service_candidate_limit=3,
+        ),
+        time_s=1.0,
+    )
+
+    result = CQLitePlugin().assign(request)
+
+    assert len(service.requests) == 3
+    assert result.debug["per_robot"]["0"]["rejected"]["path_prefiltered"] == 9
+    assert result.debug["per_robot"]["0"]["scored_candidates"] == 3
+
+
+def test_voronoi_allocation_gives_distinct_local_targets_to_team() -> None:
+    plugin = CQLitePlugin()
+    robots = (_robot(0, 0.0, 0.0), _robot(1, 4.0, 0.0))
+    candidates = (_candidate(1.0, 0.0), _candidate(5.0, 0.0))
+    request = CoordinationRequest(
+        robot_states=robots,
+        robots_to_assign=(0, 1),
+        proposals_by_robot={0: candidates, 1: candidates},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets == ((1.0, 0.0), (5.0, 0.0))
+    assert len(set(result.targets)) == 2
+    assert all(command.metadata["cqlite_in_voronoi_region"] for command in result.commands)
+
+
+def test_voronoi_fallback_runs_when_local_candidates_are_all_reserved() -> None:
+    plugin = CQLitePlugin()
+    reserved_local = _candidate(0.8, 0.0)
+    free_nonlocal = _candidate(3.0, 0.0)
+    request = CoordinationRequest(
+        robot_states=(
+            _robot(0, 0.0, 0.0),
+            _robot(1, 2.0, 0.0, current_target=reserved_local.target),
+        ),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (reserved_local, free_nonlocal)},
+        existing_targets_by_robot={1: reserved_local.target},
+        parameters=_parameters(cqlite_voronoi_fallback=True),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    assert result.targets[0] == free_nonlocal.target
+    assert result.commands[0].metadata["cqlite_in_voronoi_region"] is False
+    assert result.debug["per_robot"]["0"]["voronoi_fallback"] is True
+
+
+def test_lite_messages_only_follow_communication_graph_edges() -> None:
+    plugin = CQLitePlugin()
+    robots = (_robot(0, 0.0, 0.0), _robot(1, 2.0, 0.0), _robot(2, 20.0, 0.0))
+    request = CoordinationRequest(
+        robot_states=robots,
+        robots_to_assign=(0, 1, 2),
+        proposals_by_robot={
+            0: (_candidate(-1.0, 0.0),),
+            1: (_candidate(3.0, 0.0),),
+            2: (_candidate(21.0, 0.0),),
+        },
+        parameters=_parameters(cqlite_communication_range=3.0),
+        time_s=1.0,
+    )
+
+    result = plugin.assign(request)
+
+    assert result.debug["network"]["undirected_edge_count"] == 1
+    assert result.debug["network"]["neighbors_by_robot"] == {"0": [1], "1": [0], "2": []}
+    assert result.debug["communication"]["messages_this_decision"] == 2
+    assert result.debug["communication"]["payload_bytes_this_decision"] == 80
+
+
+def test_completed_frontier_is_learned_and_not_selected_again() -> None:
+    plugin = CQLitePlugin()
+    first = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (_candidate(1.0, 0.0),)},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+    assert plugin.assign(first).targets == ((1.0, 0.0),)
+
+    second = CoordinationRequest(
+        robot_states=(_robot(0, 1.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (_candidate(1.0, 0.0), _candidate(2.0, 0.0))},
+        parameters=_parameters(),
+        time_s=2.0,
+    )
+    result = plugin.assign(second)
+
+    assert result.targets == ((2.0, 0.0),)
+    assert result.debug["per_robot"]["0"]["rejected"]["already_explored"] == 1
+    assert result.debug["q_updates"]["0"] == 3
+
+
+def test_cleared_target_without_arrival_is_not_falsely_learned_as_explored() -> None:
+    plugin = CQLitePlugin()
+    failed_target = _candidate(3.0, 0.0)
+    first = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (failed_target,)},
+        parameters=_parameters(),
+        time_s=1.0,
+    )
+    assert plugin.assign(first).targets == ((3.0, 0.0),)
+
+    # This is the host state after A* or corridor validation rejects the
+    # route: current_target was cleared, but the robot never reached F_i.
+    retry = CoordinationRequest(
+        robot_states=(_robot(0, 0.0, 0.0, current_target=None),),
+        robots_to_assign=(0,),
+        proposals_by_robot={0: (failed_target, _candidate(4.0, 0.0))},
+        parameters=_parameters(),
+        time_s=2.0,
+    )
+    result = plugin.assign(retry)
+
+    assert result.debug["per_robot"]["0"]["rejected"]["already_explored"] == 0
+    assert result.debug["target_lifecycle"]["confirmed_completed_robot_ids"] == []
+    assert result.debug["target_lifecycle"]["cleared_without_arrival_robot_ids"] == [0]
+    assert plugin._learners[0].explored == set()
+
+
+def test_paper_presets_pin_parameters_and_round_trip_coordination_settings() -> None:
+    expected_counts = [3, 3, 6]
+    for preset, expected_count in zip(PRESETS, expected_counts):
+        payload = json.loads(preset.read_text(encoding="utf-8"))
+        assert payload["multi_robot"]["robot_count"] == expected_count
+        assert payload["sensor"]["range"] == 15.0
+        assert payload["coordination"]["strategy"] == CQLITE_COORDINATOR
+        params = payload["coordination"]["parameters"]
+        assert params["cqlite_alpha"] == 0.6
+        assert params["cqlite_gamma"] == 0.95
+        assert params["cqlite_step_cost"] == 2.0
+        assert params["cqlite_overlap_radius"] == 1.0
+        assert params["cqlite_use_path_service"] is False
+        assert params["cqlite_path_service_candidate_limit"] == 4
+        assert payload["simulation"]["mapping_point_spacing"] >= 0.1
+        config = config_from_sim_payload(payload)
+        assert config.coordination_parameters == params
+        assert config_to_sim_payload(config)["coordination"]["parameters"] == params
+
+
+def test_paper_preset_start_poses_are_collision_free() -> None:
+    checker = CollisionChecker()
+    for preset in PRESETS:
+        payload = json.loads(preset.read_text(encoding="utf-8"))
+        config = config_from_sim_payload(payload)
+        starts = normalized_robot_start_configs(config)
+
+        for index, start in enumerate(starts):
+            report = checker.check_position(
+                position=(start.x, start.y),
+                obstacles=config.obstacles,
+                robot_radius=start.safety_radius,
+            )
+            assert not report.collision, f"{preset.name} R{index + 1}: {report.reason}"
+
+        for left_index, left in enumerate(starts):
+            for right_index, right in enumerate(starts[left_index + 1 :], start=left_index + 1):
+                distance = math.hypot(left.x - right.x, left.y - right.y)
+                assert distance > left.safety_radius + right.safety_radius, (
+                    f"{preset.name} R{left_index + 1}/R{right_index + 1} overlap at start"
+                )
+
+
+def test_native_proxy_matrix_is_deterministic_and_separates_published_results() -> None:
+    first = run_matrix(trial_count=1, seed_base=23)
+    second = run_matrix(trial_count=1, seed_base=23)
+
+    assert first == second
+    assert first["fidelity"] == "decision_level_native_proxy_not_gazebo_slam"
+    assert set(first["native_results"]) == {"house_3", "bookstore_3", "bookstore_6"}
+    assert first["published_table_i_reference"]["bookstore_6"]["CQLite"]["communication_mb"] == [0.2, 0.01]
+    for scenario in first["native_results"].values():
+        assert scenario["aggregate"]["exploration_percent"]["mean"] == pytest.approx(100.0)

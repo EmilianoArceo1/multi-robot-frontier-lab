@@ -29,6 +29,7 @@ class PlanningResult:
     simplified_grid_path: list[GridCell]
     world_path: list[tuple[float, float]]
     total_cost: float
+    expanded_nodes: int = 0
 
 
 class AStarPlanner:
@@ -130,6 +131,7 @@ class AStarPlanner:
                     simplified,
                     world_path,
                     g_score[current],
+                    len(visited),
                 )
 
             for neighbor, move_cost in grid.neighbors(

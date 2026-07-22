@@ -110,6 +110,7 @@ class NavigationReasoningWindow(QFrame):
     """
 
     closeRequested = Signal()
+    nextRobotRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -140,6 +141,12 @@ class NavigationReasoningWindow(QFrame):
         title_stack.addWidget(self.title_label)
         title_stack.addWidget(subtitle)
         header.addLayout(title_stack, 1)
+
+        self.robot_selector_button = QPushButton("ROBOT R1")
+        self.robot_selector_button.setObjectName("reasoningRobotSelector")
+        self.robot_selector_button.setToolTip("Show Navigation Reasoning for the next robot")
+        self.robot_selector_button.clicked.connect(self.nextRobotRequested.emit)
+        header.addWidget(self.robot_selector_button)
 
         self._view_badge = QLabel("WAITING")
         self._view_badge.setObjectName("reasoningViewBadge")
@@ -433,6 +440,25 @@ class NavigationReasoningWindow(QFrame):
                 background: {with_alpha(c.text_primary, 22)};
                 border-radius: 5px;
             }}
+            QPushButton#reasoningRobotSelector {{
+                color: {c.text_primary};
+                background: {c.panel_background};
+                border: 1px solid {c.border};
+                border-radius: 8px;
+                padding: 5px 8px;
+                font-size: 9px;
+                font-weight: 900;
+            }}
+            QPushButton#reasoningRobotSelector:hover {{
+                color: {c.accent};
+                border-color: {c.accent};
+                background: {with_alpha(c.accent, 24)};
+            }}
+            QPushButton#reasoningRobotSelector:disabled {{
+                color: {c.text_secondary};
+                background: {with_alpha(c.panel_background, 110)};
+                border-color: {c.border};
+            }}
             QScrollArea#navigationReasoningScroll {{
                 background: {c.app_background};
                 border: none;
@@ -449,6 +475,14 @@ class NavigationReasoningWindow(QFrame):
         self.setStyleSheet(self._build_stylesheet(theme_colors(self._theme_mode)))
         self._set_decision_accent(self._last_tracking_mode, self._last_decision_kind)
         self.update()
+
+    def set_robot_selector(self, robot_index: int, robot_count: int) -> None:
+        """Update the compact cycle button without changing simulation state."""
+        count = max(1, int(robot_count))
+        index = max(0, min(int(robot_index), count - 1))
+        suffix = "  ›" if count > 1 else ""
+        self.robot_selector_button.setText(f"ROBOT R{index + 1} / {count}{suffix}")
+        self.robot_selector_button.setEnabled(count > 1)
 
     def set_no_snapshot(self) -> None:
         self.placeholder.setVisible(True)

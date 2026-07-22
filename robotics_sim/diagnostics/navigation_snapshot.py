@@ -310,6 +310,9 @@ class FrontierDebug:
     selected_target: Maybe[Point2D]
     selected_score: Maybe[float]
     reason: Maybe[str]
+    configured_planner: Maybe[str] = field(default_factory=Maybe.missing)
+    effective_planner: Maybe[str] = field(default_factory=Maybe.missing)
+    attempt_role: Maybe[str] = field(default_factory=Maybe.missing)
 
 
 class NavigationDebugEventKind(Enum):

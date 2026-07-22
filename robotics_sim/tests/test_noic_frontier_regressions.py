@@ -289,3 +289,36 @@ def test_safety_disk_crossing_rejects_only_the_bad_candidate(monkeypatch):
     )
 
     assert result.targets[0] == (3.0, 0.0)
+
+
+def test_corridor_crossing_is_penalized_when_frontier_is_beyond_teammate(monkeypatch):
+    """Crossing a teammate must not depend on the endpoint being nearby."""
+
+    monkeypatch.setattr(
+        cfp,
+        "_detect_global_frontier_viewpoints",
+        lambda **kwargs: [
+            _candidate(5.0, 0.0, gain=8.0),
+            _candidate(4.0, 3.0, gain=6.0),
+        ],
+    )
+
+    result = cfp.assign_frontier_viewpoints(
+        robot_states=[_state(0.0, 0.0), _state(2.0, 0.0)],
+        existing_targets=[None, None],
+        robots_to_assign=[0],
+        invalidated_targets_by_robot=[[], []],
+        explored_points=[(0.0, 0.0)],
+        mapped_obstacle_points=[],
+        bounds=(-10.0, 10.0, -10.0, 10.0),
+        resolution=0.5,
+        final_goal_xy=(8.0, 6.0),
+        ipp_distance_penalty=0.0,
+        target_exclusion_radius=0.8,
+        dynamic_obstacle_margin=0.25,
+        route_points_by_robot=[[], []],
+        explored_points_by_robot=[[], []],
+    )
+
+    assert result.targets[0] == (4.0, 3.0)
+    assert result.assignments[0] is not None

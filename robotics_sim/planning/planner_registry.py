@@ -17,6 +17,7 @@ or path simplification.
 from __future__ import annotations
 
 from collections import deque
+import math
 from typing import Iterable, Any
 
 from robotics_sim.diagnostics.capture import PlanDebugCapture
@@ -319,6 +320,10 @@ def compute_planned_waypoints(
             debug_capture.first_waypoint_world = direct_goal
             debug_capture.unknown_is_traversable = bool(unknown_is_traversable)
             debug_capture.start_cell_cleared = bool(start_was_occupied)
+            debug_capture.total_cost = float(math.dist(start_world, direct_goal))
+            debug_capture.expanded_nodes = 0
+            debug_capture.goal_cell = goal_cell
+            debug_capture.grid_resolution = float(grid.resolution)
 
         reason_parts = [
             f"direct line-of-sight route with {planner_name}",
@@ -383,5 +388,9 @@ def compute_planned_waypoints(
         )
         debug_capture.unknown_is_traversable = bool(unknown_is_traversable)
         debug_capture.start_cell_cleared = bool(start_was_occupied)
+        debug_capture.total_cost = float(result.total_cost)
+        debug_capture.expanded_nodes = int(result.expanded_nodes)
+        debug_capture.goal_cell = goal_cell
+        debug_capture.grid_resolution = float(grid.resolution)
 
     return True, "; ".join(reason_parts), waypoints

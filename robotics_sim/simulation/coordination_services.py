@@ -11,6 +11,7 @@ engine.py, Qt, canvas objects, or concrete planner modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 from typing import Mapping, Sequence
 
 from robotics_interfaces.coordination import CoordinationRequest
@@ -22,6 +23,33 @@ from robotics_sim.planning.coordinated_frontier_planner import (
 )
 
 Point2D = tuple[float, float]
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_global_frontier_candidates(
+    detector,
+    explored_points: tuple[Point2D, ...],
+    mapped_obstacle_points: tuple[Point2D, ...],
+    bounds: tuple[float, float, float, float],
+    resolution: float,
+    robot_radius: float,
+    sensor_range: float,
+):
+    """Cache pure frontier extraction for repeated assignments on one map.
+
+    Reassignment retries and several robots reaching nearby targets can ask for
+    the same shared-map frontier pool many times before the belief changes.
+    Include the detector callable itself in the key so monkeypatched tests and
+    alternative adapters cannot receive stale results from another detector.
+    """
+    return detector(
+        explored_points=explored_points,
+        mapped_obstacle_points=mapped_obstacle_points,
+        bounds=bounds,
+        resolution=resolution,
+        robot_radius=robot_radius,
+        sensor_range=sensor_range,
+    )
 
 
 @dataclass(frozen=True)
@@ -70,13 +98,14 @@ class RuntimeTeamFrontierProvider:
             / max(len(request.robot_states), 1)
         )
 
-        global_candidates = detect_global_frontier_candidates(
-            explored_points=tuple(_valid_points(world.explored_points)),
-            mapped_obstacle_points=tuple(_valid_points(world.mapped_obstacle_points)),
-            bounds=tuple(float(value) for value in world.bounds),
-            resolution=float(world.resolution),
-            robot_radius=max_robot_radius,
-            sensor_range=avg_sensor_range,
+        global_candidates = _cached_global_frontier_candidates(
+            detect_global_frontier_candidates,
+            tuple(_valid_points(world.explored_points)),
+            tuple(_valid_points(world.mapped_obstacle_points)),
+            tuple(float(value) for value in world.bounds),
+            float(world.resolution),
+            max_robot_radius,
+            avg_sensor_range,
         )
 
         candidates_by_robot: dict[int, tuple[ExplorationCandidate, ...]] = {}

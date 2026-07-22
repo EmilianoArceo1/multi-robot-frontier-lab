@@ -268,10 +268,20 @@ def test_repeat_observation_with_no_new_points_does_not_increment_revision():
     fake.update_sensed_obstacles(force_status=False)
     after_first = fake.mapped_obstacle_revision
 
+    visibility_calls = 0
+
+    def _count_visibility(point, candidate_obstacles=None):
+        nonlocal visibility_calls
+        visibility_calls += 1
+        return True
+
+    fake.point_visible_from_robot = _count_visibility
+
     newly_mapped_again = fake.update_sensed_obstacles(force_status=False)
 
     assert newly_mapped_again == []  # same stubbed points, already known
     assert fake.mapped_obstacle_revision == after_first
+    assert visibility_calls == 0  # known samples are rejected before ray casting
 
 
 def test_snapshot_points_are_an_independent_tuple():

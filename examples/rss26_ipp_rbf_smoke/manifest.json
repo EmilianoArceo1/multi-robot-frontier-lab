@@ -1,0 +1,25 @@
+{
+  "dataset_bounds": [
+    0.0,
+    20.0,
+    0.0,
+    16.0
+  ],
+  "metrics": {
+    "certificate_passed": true,
+    "fidelity": "integration_smoke_not_paper_benchmark",
+    "kernel": "stationary RBF",
+    "max_posterior_variance": 0.3042524546003441,
+    "method": "GreedyCover (RBF smoke test)",
+    "noise_variance": 0.02,
+    "path_length_dataset_units": 75.53995305855881,
+    "seed": 1234,
+    "sensing_point_count": 29,
+    "target_variance": 0.5,
+    "theorem_coverage_passed": true
+  },
+  "npz": "data.npz",
+  "raster_origin": "lower",
+  "schema": "robotics_sim.rss26_ipp_bundle",
+  "version": 1
+}

@@ -182,6 +182,44 @@ def test_runtime_team_frontier_provider_exposes_raw_candidate_pool(monkeypatch):
         )
 
 
+def test_runtime_team_frontier_provider_reuses_candidate_pool_for_unchanged_map(monkeypatch):
+    from robotics_sim.simulation import coordination_services as services_module
+    from robotics_sim.planning.exploration_planners import FrontierCandidate
+
+    calls = 0
+
+    def fake_detect_global_frontier_candidates(**kwargs):
+        nonlocal calls
+        calls += 1
+        return (
+            FrontierCandidate(
+                target=(2.0, 0.0),
+                size=3,
+                distance_from_robot=0.0,
+                score=8.0,
+                information_gain=7.0,
+                reason="cache probe",
+            ),
+        )
+
+    monkeypatch.setattr(
+        services_module,
+        "detect_global_frontier_candidates",
+        fake_detect_global_frontier_candidates,
+    )
+    services_module._cached_global_frontier_candidates.cache_clear()
+    request = CoordinationRequest(
+        robot_states=(_robot(0, (0.0, 0.0)),),
+        robots_to_assign=(0,),
+        world=_world(),
+    )
+    provider = RuntimeTeamFrontierProvider()
+
+    assert provider.candidates_for_team(request)[0]
+    assert provider.candidates_for_team(request)[0]
+    assert calls == 1
+
+
 def test_blacklisted_candidate_with_higher_information_gain_is_excluded(monkeypatch):
     """A blacklisted target must be excluded even when it is the single best
     candidate by information_gain -- the filter runs before any ranking."""

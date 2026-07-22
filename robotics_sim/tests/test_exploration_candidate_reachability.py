@@ -197,7 +197,7 @@ def test_fov_planner_prefers_reachable_candidate_over_unreachable_high_score_can
 # ---------------------------------------------------------------------------
 
 
-def test_fov_planner_reports_no_reachable_candidates_when_all_candidates_unreachable():
+def test_fov_planner_probes_best_candidate_when_all_prechecks_reject():
     belief = _belief_with_two_frontier_regions()
 
     baseline = _select(belief)
@@ -206,13 +206,9 @@ def test_fov_planner_reports_no_reachable_candidates_when_all_candidates_unreach
 
     result = _select(belief, is_candidate_reachable=lambda xy: False)
 
-    assert not result.success
-    assert result.target is None, (
-        "no candidate may be selected when the reachability check rejects everything, "
-        "even the best-scored one"
-    )
-    assert result.target != best_target
-    assert "no reachable frontier candidates" in result.reason
+    assert result.success
+    assert result.target == best_target
+    assert "probing best FoV-ranked candidate" in result.reason
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from robotics_interfaces import (
+    CandidateInputMode,
     CoordinationAssignment,
     CoordinationRequest,
     CoordinationResult,
@@ -32,6 +33,11 @@ class GlobalNoicLegacyPlugin:
             PluginCapability.TASK_ALLOCATION,
         ),
         source="legacy simulator NOIC / coordinated frontier planner",
+        # Detection and allocation are not actually separated here -- this
+        # plugin delegates directly to the legacy assign_frontier_viewpoints
+        # function injected via request.shared. It must identify as legacy
+        # rather than claim a real detection/allocation split.
+        candidate_input_mode=CandidateInputMode.LEGACY_INTEGRATED,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

@@ -301,6 +301,37 @@ def build_config_panel(window):
         DEFAULT_CUSTOM_EXPLORED_COLOR,
         "Choose explored-area color",
     )
+    window.custom_obstacle_color_button = ColorPickerButton(
+        DEFAULT_CUSTOM_OBSTACLE_COLOR,
+        "Choose obstacle color",
+    )
+    window.custom_obstacle_color_button.setToolTip(
+        "Visual color for physical obstacles in Custom Discovery; mapped samples keep their own color."
+    )
+    window.custom_explored_opacity_input = SteppedSliderRow(
+        "Explored opacity",
+        DEFAULT_CUSTOM_EXPLORED_OPACITY * 100.0,
+        0.0,
+        100.0,
+        5.0,
+        decimals=0,
+        unit_suffix="%",
+    )
+    window.custom_explored_opacity_input.setToolTip(
+        "Opacity of the discovered free-space layer in Custom Discovery."
+    )
+    window.mapped_obstacle_line_width_input = SteppedSliderRow(
+        "Mapped obstacle width",
+        DEFAULT_MAPPED_OBSTACLE_LINE_WIDTH,
+        0.25,
+        6.0,
+        0.25,
+        decimals=2,
+        unit_suffix="px",
+    )
+    window.mapped_obstacle_line_width_input.setToolTip(
+        "Screen-space thickness of discovered obstacle boundary samples; planning is unchanged."
+    )
 
     window.robot_icon_combo = QComboBox()
     window.robot_icon_combo.addItems(ROBOT_ICON_OPTIONS)
@@ -308,6 +339,14 @@ def build_config_panel(window):
 
     window.obstacles_switch = ToggleSwitch(True)
     window.explored_area_switch = ToggleSwitch(True)
+    window.traveled_path_switch = ToggleSwitch(False)
+    window.planned_route_switch = ToggleSwitch(True)
+    window.traveled_path_switch.setToolTip(
+        "Draw the accumulated trajectory already traveled by each robot."
+    )
+    window.planned_route_switch.setToolTip(
+        "Draw the remaining accepted route, its waypoints, and the selected frontier."
+    )
 
     # Visual toggles go first because they are runtime-safe and apply to
     # all robots, independent of whether robots share configuration.
@@ -327,8 +366,18 @@ def build_config_panel(window):
         1,
     )
     options_grid.addWidget(
-        labeled_combo("Map Visualization", window.map_visualization_combo),
+        labeled_toggle("Traveled Route", window.traveled_path_switch),
         1,
+        0,
+    )
+    options_grid.addWidget(
+        labeled_toggle("Planned Route + Frontier", window.planned_route_switch),
+        1,
+        1,
+    )
+    options_grid.addWidget(
+        labeled_combo("Map Visualization", window.map_visualization_combo),
+        2,
         0,
         1,
         2,
@@ -341,18 +390,26 @@ def build_config_panel(window):
         "Explored Color",
         window.custom_explored_color_button,
     )
-    options_grid.addWidget(window.custom_unexplored_color_field, 2, 0)
-    options_grid.addWidget(window.custom_explored_color_field, 2, 1)
+    window.custom_obstacle_color_field = labeled_color_picker(
+        "Obstacle Color",
+        window.custom_obstacle_color_button,
+    )
+    window.custom_explored_opacity_field = window.custom_explored_opacity_input
+    options_grid.addWidget(window.custom_unexplored_color_field, 3, 0)
+    options_grid.addWidget(window.custom_explored_color_field, 3, 1)
+    options_grid.addWidget(window.custom_obstacle_color_field, 4, 0)
+    options_grid.addWidget(window.custom_explored_opacity_field, 4, 1)
+    options_grid.addWidget(window.mapped_obstacle_line_width_input, 5, 0, 1, 2)
     options_grid.addWidget(
         labeled_combo("Robot Icon", window.robot_icon_combo),
-        3,
+        6,
         0,
         1,
         2,
     )
     options_grid.addWidget(
         labeled_combo("Path Planner Service", window.planner_combo),
-        4,
+        7,
         0,
         1,
         2,
@@ -363,7 +420,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.vision_model_field,
-        5,
+        8,
         0,
         1,
         2,
@@ -374,7 +431,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        6,
+        9,
         0,
         1,
         2,
@@ -386,7 +443,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        7,
+        10,
         0,
         1,
         2,
@@ -398,7 +455,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        8,
+        11,
         0,
         1,
         2,
@@ -414,7 +471,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        9,
+        12,
         0,
         1,
         2,
@@ -430,7 +487,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        9,
+        12,
         0,
         1,
         2,
@@ -452,7 +509,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        10,
+        13,
         0,
         1,
         2,
@@ -468,7 +525,7 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        11,
+        14,
         0,
     )
     window.grid_cell_values_toggle = ToggleSwitch(False)
@@ -481,12 +538,12 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Cell Values", window.grid_cell_values_toggle),
-        12,
+        15,
         0,
     )
     options_grid.addWidget(
         labeled_toggle("Frontier Decisions", window.frontier_decisions_toggle),
-        12,
+        15,
         1,
     )
 
@@ -507,7 +564,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Hazard Map", window.hazard_map_toggle),
-        11,
+        14,
         1,
     )
     window.fire_markers_toggle = ToggleSwitch(False)
@@ -516,7 +573,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Fire Markers", window.fire_markers_toggle),
-        13,
+        16,
         0,
     )
     window.cursor_coordinates_toggle = ToggleSwitch(True)
@@ -525,7 +582,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Mouse Coordinates", window.cursor_coordinates_toggle),
-        13,
+        16,
         1,
     )
 
@@ -850,15 +907,22 @@ def build_config_panel(window):
         visible = str(mode) == "Custom Discovery"
         window.custom_unexplored_color_field.setVisible(visible)
         window.custom_explored_color_field.setVisible(visible)
+        window.custom_obstacle_color_field.setVisible(visible)
+        window.custom_explored_opacity_field.setVisible(visible)
 
     window.map_visualization_combo.currentTextChanged.connect(update_custom_color_visibility)
     window.map_visualization_combo.currentTextChanged.connect(window.update_preview)
     window.custom_unexplored_color_button.colorChanged.connect(window.update_preview)
     window.custom_explored_color_button.colorChanged.connect(window.update_preview)
+    window.custom_obstacle_color_button.colorChanged.connect(window.update_preview)
+    window.custom_explored_opacity_input.valueChanged.connect(window.update_preview)
+    window.mapped_obstacle_line_width_input.valueChanged.connect(window.update_preview)
     update_custom_color_visibility(window.map_visualization_combo.currentText())
     window.robot_icon_combo.currentTextChanged.connect(window.update_preview)
     window.obstacles_switch.toggled.connect(window.update_preview)
     window.explored_area_switch.toggled.connect(window.update_preview)
+    window.traveled_path_switch.toggled.connect(window.update_preview)
+    window.planned_route_switch.toggled.connect(window.update_preview)
     window.body_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
     window.safety_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
     window.grid_resolution_input.valueChanged.connect(window.on_grid_resolution_control_changed)

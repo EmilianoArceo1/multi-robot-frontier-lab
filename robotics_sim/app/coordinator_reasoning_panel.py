@@ -75,13 +75,17 @@ class CoordinatorReasoningPanel(QFrame):
         layout.setSpacing(9)
         self.summary = self._label("Waiting for a coordination decision", "coordinatorSummary")
         layout.addWidget(self.summary)
-        self.ownership = self._card(layout, "ALGORITHM OWNERSHIP")
+        self.provenance = self._card(layout, "DECISION PROVENANCE")
+        self.candidate_source = self._card(layout, "CANDIDATE INPUT MODE / ACTUAL SOURCE")
+        self.ownership = self._card(layout, "STAGE OWNERSHIP")
         self.formula = self._card(layout, "COORDINATION / ASSIGNMENT FORMULA", rich=True)
         self.variables = self._card(layout, "REAL INPUTS FOR THE SELECTED ROBOT", rich=True)
         self.computation = self._card(layout, "STEP-BY-STEP COORDINATION", rich=True)
         self.assignments = self._card(layout, "TEAM ASSIGNMENTS")
         self.matrix = self._card(layout, "UTILITY / FEASIBILITY MATRIX")
-        self.debug = self._card(layout, "EXPORTED COORDINATOR DEBUG")
+        self.host_services = self._card(layout, "HOST SERVICES CALLED")
+        self.contract_warnings = self._card(layout, "CONTRACT WARNINGS")
+        self.debug = self._card(layout, "PLUGIN-SPECIFIC DEBUG (SECONDARY)")
         layout.addStretch(1)
         scroll.setWidget(body)
         root.addWidget(scroll, 1)
@@ -141,12 +145,16 @@ class CoordinatorReasoningPanel(QFrame):
         self._last_update = None
         self.summary.setText("Waiting for a coordination decision")
         for label in (
+            self.provenance,
+            self.candidate_source,
             self.ownership,
             self.formula,
             self.variables,
             self.computation,
             self.assignments,
             self.matrix,
+            self.host_services,
+            self.contract_warnings,
             self.debug,
         ):
             label.setText("—")
@@ -159,8 +167,28 @@ class CoordinatorReasoningPanel(QFrame):
         result,
         time_s: float,
         runtime_profile=None,
+        decision_context=None,
+        apply_report=None,
+        service_audit=None,
     ) -> None:
-        self._last_update = (planner, coordinator, result, float(time_s), runtime_profile)
+        """decision_context/apply_report/service_audit are optional structured
+        provenance (CoordinationDecisionContext, coordination_result_
+        applier.ApplyReport, coordination_service_audit.ServiceAuditReport).
+        They render as "not available" when omitted -- the live engine.py
+        call site does not build them yet (scheduler/applier/audit are not
+        wired into the real coordination loop), so this panel must not
+        pretend to know trigger/scope/robots-actually-updated/service-call
+        counts it was never given."""
+        self._last_update = (
+            planner,
+            coordinator,
+            result,
+            float(time_s),
+            runtime_profile,
+            decision_context,
+            apply_report,
+            service_audit,
+        )
         count = max(
             len(getattr(result, "targets", ()) or ()),
             len(getattr(result, "reasons", ()) or ()),
@@ -180,10 +208,32 @@ class CoordinatorReasoningPanel(QFrame):
         per_robot = _mapping(debug.get("per_robot", {}))
         return _mapping(per_robot.get(str(robot_index), per_robot.get(robot_index, {})))
 
+    @staticmethod
+    def _actual_candidate_source(debug: dict, robot_debug: dict, assignment) -> str:
+        if "candidate_source" in robot_debug:
+            return str(robot_debug["candidate_source"])
+        if "candidate_source" in debug:
+            return str(debug["candidate_source"])
+        proposal = getattr(assignment, "proposal", None)
+        if proposal is not None:
+            source = getattr(proposal, "source", None)
+            if source:
+                return str(source)
+        return "not exported by this decision"
+
     def _render(self) -> None:
         if self._last_update is None:
             return
-        planner, coordinator, result, time_s, profile = self._last_update
+        (
+            planner,
+            coordinator,
+            result,
+            time_s,
+            profile,
+            decision_context,
+            apply_report,
+            service_audit,
+        ) = self._last_update
         idx = max(0, self.robot_selector.currentIndex())
         targets = list(getattr(result, "targets", ()) or ())
         reasons = list(getattr(result, "reasons", ()) or ())
@@ -210,15 +260,100 @@ class CoordinatorReasoningPanel(QFrame):
             f"t={time_s:.2f}s · {coordinator}\n"
             f"Inspecting R{idx + 1} · status={status} · target={target}\n{reason}"
         )
+
+        # --- Decision provenance: trigger/scope/requesting ids/robots
+        # actually updated. None when the live call site did not build a
+        # CoordinationDecisionContext/ApplyReport yet -- say so explicitly
+        # rather than guessing from result contents.
+        if decision_context is None:
+            self.provenance.setText(
+                "Decision trigger/scope: not available (this run did not attach a "
+                "CoordinationDecisionContext to the request)."
+            )
+        else:
+            requesting_ids = getattr(decision_context, "requesting_robot_ids", ())
+            trigger = getattr(decision_context, "trigger", "unavailable")
+            scope = getattr(decision_context, "scope", "unavailable")
+            provenance_lines = [
+                f"trigger: {getattr(trigger, 'value', trigger)}",
+                f"scope: {getattr(scope, 'value', scope)}",
+                f"requesting robot ids: {list(requesting_ids)}",
+                f"decision id: {getattr(decision_context, 'decision_id', 'unavailable')}",
+            ]
+            if apply_report is not None:
+                provenance_lines.append(
+                    f"robots actually updated: {list(getattr(apply_report, 'updated_robot_ids', ()))}"
+                )
+                provenance_lines.append(
+                    f"robots preserved: {list(getattr(apply_report, 'preserved_robot_ids', ()))}"
+                )
+                provenance_lines.append(
+                    f"robots cleared: {list(getattr(apply_report, 'cleared_robot_ids', ()))}"
+                )
+                rejected = list(getattr(apply_report, "rejected_robot_ids", ()))
+                if rejected:
+                    provenance_lines.append(f"robots rejected (unknown/duplicate ids): {rejected}")
+            else:
+                provenance_lines.append("robots actually updated: not available (no ApplyReport attached)")
+            self.provenance.setText("\n".join(provenance_lines))
+
+        # --- Candidate input mode + the actual source used for THIS robot.
+        # Never inferred from the coordinator's name -- read from
+        # profile.candidate_input_mode and per-robot debug/proposal.source.
+        candidate_input_mode = getattr(profile, "candidate_input_mode", None) if profile is not None else None
+        candidate_input_mode_text = (
+            "unavailable"
+            if candidate_input_mode is None
+            else getattr(candidate_input_mode, "value", candidate_input_mode)
+        )
+        actual_source = self._actual_candidate_source(debug, robot_debug, assignment)
+        self.candidate_source.setText(
+            f"candidate_input_mode: {candidate_input_mode_text}\n"
+            f"actual source for R{idx + 1}: {actual_source}"
+        )
+
+        # --- Stage ownership: read the semantically-correct
+        # PluginRuntimeProfile fields (detects_frontiers/generates_tasks/
+        # allocates_tasks/plans_paths/controls_motion). Falls back to the
+        # deprecated owns_* fields only when a caller's profile stand-in
+        # does not carry the new fields (e.g. an older test double), so this
+        # never crashes on an incomplete profile and never silently reports
+        # "False" for something that is simply not known.
+        def _stage(new_name: str, legacy_name: str) -> str:
+            if profile is None:
+                return "unavailable"
+            value = getattr(profile, new_name, None)
+            if value is None:
+                value = getattr(profile, legacy_name, None)
+            return "unavailable" if value is None else str(bool(value))
+
         if profile is None:
             self.ownership.setText(f"Exploration planner: {planner}\nCoordinator: {coordinator}")
         else:
             self.ownership.setText(
-                f"owns target generation: {bool(getattr(profile, 'owns_target_generation', False))}\n"
-                f"owns task allocation: {bool(getattr(profile, 'owns_task_allocation', False))}\n"
-                f"owns path planning: {bool(getattr(profile, 'owns_path_planning', False))}\n"
-                f"owns control: {bool(getattr(profile, 'owns_control', False))}"
+                f"frontier detection: {_stage('detects_frontiers', 'owns_target_generation')}\n"
+                f"task generation: {_stage('generates_tasks', 'owns_target_generation')}\n"
+                f"task allocation: {_stage('allocates_tasks', 'owns_task_allocation')}\n"
+                f"path planning: {_stage('plans_paths', 'owns_path_planning')}\n"
+                f"control: {_stage('controls_motion', 'owns_control')}"
             )
+
+        # --- Host services called + contract warnings. Both require a
+        # ServiceAuditReport the live call site does not build yet.
+        if service_audit is None:
+            self.host_services.setText(
+                "Not instrumented in this run (no ServiceAuditReport attached; "
+                "see coordination_service_audit.CoordinationServiceAuditor)."
+            )
+            self.contract_warnings.setText("No contract audit available for this decision.")
+        else:
+            call_counts = _mapping(getattr(service_audit, "call_counts_by_service", {}))
+            if call_counts:
+                self.host_services.setText(_json(call_counts))
+            else:
+                self.host_services.setText("No host services were called for this decision.")
+            warnings = tuple(getattr(service_audit, "warnings", ()) or ())
+            self.contract_warnings.setText("\n".join(warnings) if warnings else "No contract warnings.")
 
         scalar_terms = {key: float(value) for key, value in _NUMBER.findall(str(reason))}
         if "utility_matrix" in debug:

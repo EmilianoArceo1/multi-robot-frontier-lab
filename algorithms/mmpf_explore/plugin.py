@@ -12,6 +12,7 @@ from robotics_interfaces.coordination import (
 )
 from robotics_interfaces.observations import Point2D, RobotCoordinationState
 from robotics_interfaces.plugins import (
+    CandidateInputMode,
     CoordinationPlugin,
     PluginCapability,
     PluginMetadata,
@@ -44,6 +45,11 @@ class MmpfExplorePlugin:
             PluginCapability.TASK_ALLOCATION,
             PluginCapability.TARGET_GENERATION,
         ),
+        # TARGET_GENERATION is the deprecated capability, kept for backward
+        # compatibility. MMPF only ranks candidates a team_frontier_provider/
+        # frontier_provider/explicit proposal already produced -- it does not
+        # detect frontiers itself, hence HOST_CANDIDATES.
+        candidate_input_mode=CandidateInputMode.HOST_CANDIDATES,
     )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:

@@ -14,11 +14,16 @@ from dataclasses import dataclass
 import functools
 from typing import Mapping, Sequence
 
+from robotics_interfaces.candidate_generation import (
+    CandidateGenerationRequest,
+    CandidateGenerationResult,
+)
 from robotics_interfaces.coordination import CoordinationRequest
 from robotics_interfaces.observations import RobotCoordinationState, WorldSnapshot
 from robotics_interfaces.proposals import ExplorationCandidate
 from robotics_sim.planning.coordinated_frontier_planner import (
     assign_frontier_viewpoints,
+    detect_connected_frontier_components,
     detect_global_frontier_candidates,
 )
 
@@ -54,11 +59,21 @@ def _cached_global_frontier_candidates(
 
 @dataclass(frozen=True)
 class RuntimeTeamFrontierProvider:
-    """TeamFrontierProvider backed by the current coordinated frontier planner.
+    """TeamFrontierProvider backed by the raw connected-frontier candidate pool.
 
-    Important: this calls the legacy planner once with the whole team.  Calling
-    the planner independently per robot loses target reservations and is the
-    failure mode that caused duplicated/too-close frontiers in MMPF.
+    Despite the historical name, this does NOT call the legacy per-robot task
+    allocator (assign_frontier_viewpoints) at all -- see
+    test_coordination_runtime_services.py::
+    test_runtime_team_frontier_provider_exposes_raw_candidate_pool, which
+    asserts that call never happens. Instead it calls
+    detect_global_frontier_candidates() exactly once for the whole map (cached
+    per-map/detector via _cached_global_frontier_candidates), then, for each
+    robot being assigned, filters that same shared pool by that robot's own
+    blocked_targets and ranks it by utility. "Team-synchronized" here means
+    every requested robot sees the same underlying candidate pool and the
+    same set of already-reserved existing_targets, not that a team-level
+    allocator picks one target per robot -- allocation is still each
+    consuming plugin's own job (see PluginCapability.TASK_ALLOCATION).
     """
 
     ipp_distance_penalty: float = 0.5
@@ -344,3 +359,101 @@ def _normalize_point(value: object) -> Point2D | None:
         return (float(x), float(y))
     except (TypeError, ValueError):
         return None
+
+
+@dataclass(frozen=True)
+class HostFrontierCandidateGenerator:
+    """CandidateGenerator adapter over the host's existing frontier pipeline.
+
+    Wraps detect_global_frontier_candidates() (flat pool, cached the same way
+    RuntimeTeamFrontierProvider caches it) and detect_connected_frontier_
+    components() (clusters) -- the exact same functions
+    RuntimeTeamFrontierProvider/RuntimeFrontierInformationService already
+    call -- behind the neutral robotics_interfaces.candidate_generation
+    contract. This does not re-implement or re-define frontier detection; it
+    only adapts the existing one so a future CandidateGenerator-based caller
+    (or a composed algorithm) has one thing to depend on instead of importing
+    robotics_sim.planning internals directly.
+
+    Not yet wired into RuntimeTeamFrontierProvider/RuntimeFrontierInformation
+    Service -- see robotics_sim/simulation/coordination_services.py module
+    docstring history and the refactor's final report for why that
+    integration is deferred rather than forced in this phase.
+    """
+
+    target_exclusion_radius: float = 1.5
+
+    def generate(self, request: CandidateGenerationRequest) -> CandidateGenerationResult:
+        world = request.world
+        if world is None or world.bounds is None:
+            return CandidateGenerationResult(source_name="host_frontier_candidate_pipeline")
+
+        max_robot_radius = max(
+            (float(robot.safety_radius) for robot in request.robot_states),
+            default=0.35,
+        )
+        avg_sensor_range = (
+            sum(float(robot.sensor_range) for robot in request.robot_states) / len(request.robot_states)
+            if request.robot_states
+            else 2.5
+        )
+
+        explored = tuple(_valid_points(world.explored_points))
+        obstacles = tuple(_valid_points(world.mapped_obstacle_points))
+        bounds = tuple(float(value) for value in world.bounds)
+        resolution = float(world.resolution)
+
+        global_candidates = _cached_global_frontier_candidates(
+            detect_global_frontier_candidates,
+            explored,
+            obstacles,
+            bounds,
+            resolution,
+            max_robot_radius,
+            avg_sensor_range,
+        )
+        clusters = detect_connected_frontier_components(
+            explored_points=explored,
+            mapped_obstacle_points=obstacles,
+            bounds=bounds,
+            resolution=resolution,
+            robot_radius=max_robot_radius,
+            sensor_range=avg_sensor_range,
+        )
+
+        robot_ids = request.robot_ids or tuple(int(robot.robot_id) for robot in request.robot_states)
+        candidates_by_robot: dict[int, tuple[ExplorationCandidate, ...]] = {}
+        for robot_id in robot_ids:
+            blocked = tuple(_valid_points(request.blocked_targets_by_robot.get(robot_id, ())))
+            pool = []
+            for candidate in global_candidates:
+                target = _normalize_point(candidate.target)
+                if target is None:
+                    continue
+                if _point_near_any(target, blocked, self.target_exclusion_radius):
+                    continue
+                pool.append(
+                    ExplorationCandidate(
+                        target=target,
+                        source="host_frontier_candidate_pipeline",
+                        information_gain=float(getattr(candidate, "information_gain", 0.0)),
+                        metadata={
+                            "robot_id": robot_id,
+                            "provider": type(self).__name__,
+                            "frontier_size": int(getattr(candidate, "size", 0)),
+                            "raw_score": float(getattr(candidate, "score", 0.0)),
+                        },
+                    )
+                )
+            candidates_by_robot[robot_id] = tuple(pool)
+
+        return CandidateGenerationResult(
+            candidates_by_robot=candidates_by_robot,
+            frontier_clusters=clusters or None,
+            source_name="host_frontier_candidate_pipeline",
+            diagnostics={
+                "raw_candidate_count": len(global_candidates),
+                "cluster_count": len(clusters),
+            },
+            generated_at_s=float(request.time_s),
+        )

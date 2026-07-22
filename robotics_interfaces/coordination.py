@@ -11,10 +11,11 @@ from robotics_interfaces.observations import (
     WorldSnapshot,
 )
 from robotics_interfaces.commands import RobotCommand
+from robotics_interfaces.decision_context import CoordinationDecisionContext
 from robotics_interfaces.proposals import CandidateProposal, ExplorationCandidate
 from robotics_interfaces.services import CoordinationServices
 
-AssignmentStatus = Literal["ASSIGNED", "HOLD", "FAILED"]
+AssignmentStatus = Literal["ASSIGNED", "HOLD", "FAILED", "CLEAR"]
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,12 @@ class CoordinationRequest:
     parameters: Mapping[str, Any] = field(default_factory=dict)
     shared: Mapping[str, Any] = field(default_factory=dict)
     time_s: float = 0.0
+    # Optional structured "why was this decision run" contract. None is the
+    # backward-compatible default: existing construction sites (engine.py,
+    # tests, experiments) do not need to supply it. See
+    # robotics_sim.simulation.coordination_scheduler for the component that
+    # will populate it.
+    decision_context: CoordinationDecisionContext | None = None
 
 
 @dataclass(frozen=True)

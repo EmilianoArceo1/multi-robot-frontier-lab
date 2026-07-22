@@ -960,6 +960,21 @@ class SimulationCanvas(QWidget):
         previous_discovery_colors = (
             getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
             getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
+            getattr(
+                self.config,
+                "custom_explored_opacity",
+                DEFAULT_CUSTOM_EXPLORED_OPACITY,
+            ),
+        )
+        previous_custom_obstacle_color = getattr(
+            self.config,
+            "custom_obstacle_color",
+            DEFAULT_CUSTOM_OBSTACLE_COLOR,
+        )
+        previous_mapped_obstacle_line_width = getattr(
+            self.config,
+            "mapped_obstacle_line_width",
+            DEFAULT_MAPPED_OBSTACLE_LINE_WIDTH,
         )
         previous_camera = (
             getattr(self.config, "camera_center_x", None),
@@ -971,6 +986,7 @@ class SimulationCanvas(QWidget):
         current_discovery_colors = (
             config.custom_unexplored_color,
             config.custom_explored_color,
+            config.custom_explored_opacity,
         )
         if (
             previous_visualization != config.map_visualization
@@ -980,6 +996,13 @@ class SimulationCanvas(QWidget):
             self.invalidate_explored_area_cache()
             self._grid_overlay_cache = None
             self._grid_overlay_cache_key = None
+        if (
+            previous_visualization != config.map_visualization
+            or previous_custom_obstacle_color != config.custom_obstacle_color
+        ):
+            self.invalidate_obstacles_cache()
+        if previous_mapped_obstacle_line_width != config.mapped_obstacle_line_width:
+            self.invalidate_mapped_points_cache()
         if previous_spacing != config.mapping_point_spacing or previous_obstacles != config.obstacles:
             self.invalidate_obstacle_coverage_cache()
             self.invalidate_obstacles_cache()
@@ -1115,8 +1138,9 @@ class SimulationCanvas(QWidget):
         Append one explored sensor footprint without copying the whole history.
 
         For single-robot mode the footprint is painted into the standard blue
-        homogeneous cache. For multi-robot mode each robot gets its own colored
-        cache, so coverage remains attributable without cluttering the main UI.
+        homogeneous cache. Multi-robot Current mode keeps one attributed cache
+        per robot; shared monochrome/custom styles use one team-union cache so
+        translucent overlaps remain uniform.
         """
         if len(polygon) < 3:
             return
@@ -2358,8 +2382,23 @@ class SimulationCanvas(QWidget):
         near-white canvas) up for dark mode, where the same low alpha over a
         near-black backdrop barely reads. Same hue/robot color either way --
         only how strongly it stands out from the backdrop changes."""
-        if self.is_shared_discovery_mode():
+        if self.is_monochrome_discovery_mode():
             return 255
+        if self.is_custom_discovery_mode():
+            opacity = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            self.config,
+                            "custom_explored_opacity",
+                            DEFAULT_CUSTOM_EXPLORED_OPACITY,
+                        )
+                    ),
+                ),
+            )
+            return int(round(255.0 * opacity))
         if self._theme_mode == ThemeMode.DARK:
             return min(255, int(light_alpha * 2.8))
         return light_alpha
@@ -2423,6 +2462,21 @@ class SimulationCanvas(QWidget):
         if cell_bounds is None:
             return
         cache_painter.setPen(Qt.NoPen)
+        if self.is_shared_discovery_mode():
+            # Custom/monochrome discovery represents team coverage as one
+            # shared set. Rasterize the OR-union once so opacity cannot stack
+            # where two robots explored the same cell.
+            color = self.explored_area_color(None)
+            color.setAlpha(alpha)
+            self._paint_explored_mask_layer_to_cache(
+                cache_painter,
+                np.any(mask, axis=0),
+                resolution,
+                bounds,
+                color=color,
+                cell_bounds=cell_bounds,
+            )
+            return
         for robot_index in range(mask.shape[0]):
             color = self.explored_area_color(
                 None if mask.shape[0] == 1 else robot_index
@@ -2524,6 +2578,62 @@ class SimulationCanvas(QWidget):
         multi_robot_mask_indices = set(range(mask.shape[0])) if (mask is not None and mask.shape[0] > 1) else set()
         multi_robot_indices = int_path_indices | multi_robot_mask_indices
 
+        if multi_robot_indices and self.is_shared_discovery_mode():
+            # A shared discovery style has no per-robot visual attribution.
+            # Paint the geometric union into ONE cache and apply opacity once;
+            # compositing independent translucent robot caches would make
+            # overlaps progressively more opaque.
+            cache_painter = QPainter(cache)
+            cache_painter.save()
+            cache_painter.setClipRect(self.plot_rect())
+            cache_painter.setCompositionMode(QPainter.CompositionMode_Source)
+
+            combined_path = QPainterPath()
+            combined_path.setFillRule(Qt.WindingFill)
+            mask_fallback_indices: list[int] = []
+            for robot_index in sorted(multi_robot_indices):
+                world_path = paths_by_robot.get(robot_index)
+                if world_path is not None and not world_path.isEmpty():
+                    combined_path.addPath(world_path)
+                elif mask is not None and 0 <= robot_index < mask.shape[0]:
+                    mask_fallback_indices.append(robot_index)
+
+            if not combined_path.isEmpty():
+                self._paint_explored_path_to_cache(
+                    cache_painter,
+                    combined_path,
+                    color=self.explored_area_color(None),
+                    alpha=self._explored_area_alpha(24),
+                )
+
+            if mask is not None and mask_fallback_indices:
+                cell_bounds = self._grid_overlay_cell_bounds(
+                    self._explored_area_seed_resolution,
+                    {
+                        "grid": mask[0],
+                        "bounds": self._explored_area_seed_bounds,
+                        "resolution": self._explored_area_seed_resolution,
+                    },
+                )
+                if cell_bounds is not None:
+                    combined_mask = np.any(mask[mask_fallback_indices], axis=0)
+                    color = self.explored_area_color(None)
+                    color.setAlpha(self._explored_area_alpha(24))
+                    cache_painter.setPen(Qt.NoPen)
+                    self._paint_explored_mask_layer_to_cache(
+                        cache_painter,
+                        combined_mask,
+                        self._explored_area_seed_resolution,
+                        self._explored_area_seed_bounds,
+                        color=color,
+                        cell_bounds=cell_bounds,
+                    )
+
+            cache_painter.restore()
+            cache_painter.end()
+            self._explored_area_cached_count = len(self.explored_area_polygons)
+            return
+
         if multi_robot_indices:
             # Multi-robot: one attributed cache per robot. Continuous
             # geometry takes priority over the discrete mask, per robot --
@@ -2623,7 +2733,7 @@ class SimulationCanvas(QWidget):
         if len(polygon) < 3:
             return
 
-        if robot_index is None:
+        if robot_index is None or self.is_shared_discovery_mode():
             if (
                 self._explored_area_cache is None
                 or self._explored_area_cache_size != self.size()
@@ -2690,15 +2800,30 @@ class SimulationCanvas(QWidget):
         cache_painter = QPainter(self._mapped_points_cache)
         cache_painter.setRenderHint(QPainter.Antialiasing)
         cache_painter.setClipRect(self.plot_rect())
-        # Obstacle mapping intentionally ignores the map presentation mode.
-        # These are the same neon samples used by the existing/default view.
-        cache_painter.setPen(QPen(QColor(179, 0, 54, 210), 0.6))
-        cache_painter.setBrush(QBrush(QColor(255, 23, 92, 235)))
+        line_width = min(
+            6.0,
+            max(
+                0.25,
+                float(
+                    getattr(
+                        self.config,
+                        "mapped_obstacle_line_width",
+                        DEFAULT_MAPPED_OBSTACLE_LINE_WIDTH,
+                    )
+                ),
+            ),
+        )
+        # Mapped obstacle samples deliberately keep their established neon
+        # palette. They are sensor-derived map evidence, not the physical
+        # obstacle layer configured by custom_obstacle_color.
+        stroke = QColor(179, 0, 54, 210)
+        fill = QColor(255, 23, 92, 235)
+        cache_painter.setPen(QPen(stroke, line_width))
+        cache_painter.setBrush(QBrush(fill))
 
-        # Keep this small. The density comes from mapping_point_spacing, not
-        # from drawing large circles -- just a touch bigger than before so
-        # the bolder color reads clearly.
-        point_radius = 0.24
+        # The map sample spacing controls geometric density; this setting is
+        # screen-space only and therefore cannot change occupancy/planning.
+        point_radius = max(0.24, line_width * 0.5)
 
         for px, py in points:
             sx, sy = self.world_to_screen(px, py)
@@ -2819,18 +2944,20 @@ class SimulationCanvas(QWidget):
         self._route_detail["executed_trail_build_ms"] = 0.0
         self._route_detail["executed_trail_paint_ms"] = 0.0
         self._route_detail["executed_trail_segments_painted"] = 0
-        # Planned route/waypoints are always visible now ("Robot Orders" was
-        # removed as a toggle -- see the Navigation Debug eye icon for the
-        # richer diagnostic layer). The executed trail line and the FOV
-        # heading arrow were dropped entirely, not merged, per explicit
-        # request -- they cluttered the view without explaining a decision.
         history_position, _history_total = self._nav_debug_history_position
-        if self.navigation_debug_enabled and history_position is not None:
-            self.draw_historical_planned_route(painter)
-        elif self.robots and "Multiple" in self.config.agent_mode:
-            self.draw_multi_planned_routes(painter)
-        else:
-            self.draw_planned_route(painter)
+        history_active = self.navigation_debug_enabled and history_position is not None
+        if self.config.show_traveled_path and not history_active:
+            if self.robots and "Multiple" in self.config.agent_mode:
+                self.draw_multi_executed_paths(painter)
+            else:
+                self.draw_executed_path(painter)
+        if self.config.show_path:
+            if history_active:
+                self.draw_historical_planned_route(painter)
+            elif self.robots and "Multiple" in self.config.agent_mode:
+                self.draw_multi_planned_routes(painter)
+            else:
+                self.draw_planned_route(painter)
         self._render_layer_ms["route_path"] = (time.perf_counter() - _route_path_start) * 1000.0
 
         _robot_body_start = time.perf_counter()
@@ -3763,6 +3890,11 @@ class SimulationCanvas(QWidget):
             getattr(self.config, "map_visualization", DEFAULT_MAP_VISUALIZATION),
             getattr(self.config, "custom_unexplored_color", DEFAULT_CUSTOM_UNEXPLORED_COLOR),
             getattr(self.config, "custom_explored_color", DEFAULT_CUSTOM_EXPLORED_COLOR),
+            getattr(
+                self.config,
+                "custom_explored_opacity",
+                DEFAULT_CUSTOM_EXPLORED_OPACITY,
+            ),
         )
         if self._nav_debug_explored_cache is None or self._nav_debug_explored_cache_key != cache_key:
             cache = QPixmap(self.size())
@@ -3837,7 +3969,14 @@ class SimulationCanvas(QWidget):
 
         fill = QColor(color)
         stroke = QColor(color)
-        if self.is_shared_discovery_mode():
+        if self.is_custom_discovery_mode():
+            # Custom Discovery's opacity describes accumulated team coverage.
+            # A second translucent FoV fill per robot would stack on top and
+            # create the non-uniform wedges the shared style is meant to avoid.
+            # Keep the live FoV boundary, but leave its interior transparent.
+            fill.setAlpha(0)
+            stroke.setAlpha(max(alpha_stroke, 205))
+        elif self.is_monochrome_discovery_mode():
             fill.setAlpha(max(alpha_fill, 48))
             stroke.setAlpha(max(alpha_stroke, 205))
         else:
@@ -4077,7 +4216,7 @@ class SimulationCanvas(QWidget):
         self._obstacle_coverage_cache_count = len(self.mapped_obstacle_points)
 
     def obstacles_cache_signature(self) -> tuple:
-        return tuple(
+        geometry = tuple(
             (
                 round(float(ox), 4),
                 round(float(oy), 4),
@@ -4085,6 +4224,17 @@ class SimulationCanvas(QWidget):
                 round(float(oh), 4),
             )
             for ox, oy, ow, oh in self.config.obstacles
+        )
+        return (
+            geometry,
+            bool(self.is_custom_discovery_mode()),
+            str(
+                getattr(
+                    self.config,
+                    "custom_obstacle_color",
+                    DEFAULT_CUSTOM_OBSTACLE_COLOR,
+                )
+            ).upper(),
         )
 
     def ensure_obstacles_cache(self):
@@ -4224,9 +4374,9 @@ class SimulationCanvas(QWidget):
     ) -> None:
         """Draw one connected obstacle object without internal seams.
 
-        Obstacle rendering is intentionally independent from map visualization.
-        Switching discovery colors must not alter ground-truth or mapped
-        obstacle appearance.
+        Default/monochrome modes retain the theme-aware neutral obstacle
+        palette. Custom Discovery deliberately uses its configured obstacle
+        color; this is rendering-only and never changes collision geometry.
         """
         path = self.obstacle_group_screen_path(indices)
         if path.isEmpty():
@@ -4242,7 +4392,26 @@ class SimulationCanvas(QWidget):
             coverage = self.obstacle_group_mapping_coverage(indices)
             fully_discovered = coverage >= OBSTACLE_COMPLETE_COVERAGE
 
-            if fully_discovered:
+            if self.is_custom_discovery_mode():
+                base = self._valid_config_color(
+                    getattr(
+                        self.config,
+                        "custom_obstacle_color",
+                        DEFAULT_CUSTOM_OBSTACLE_COLOR,
+                    ),
+                    DEFAULT_CUSTOM_OBSTACLE_COLOR,
+                )
+                fill = QColor(base)
+                stroke = QColor(base)
+                if fully_discovered:
+                    fill.setAlpha(180)
+                    stroke.setAlpha(240)
+                    pen_width = 1.7
+                else:
+                    fill.setAlpha(85)
+                    stroke.setAlpha(135)
+                    pen_width = 1.2
+            elif fully_discovered:
                 fill = QColor(224, 227, 233, 195) if dark else QColor(190, 194, 202, 170)
                 stroke = QColor(176, 181, 191, 235) if dark else QColor(82, 84, 92, 210)
                 pen_width = 1.7
@@ -5246,6 +5415,8 @@ class SimulationCanvas(QWidget):
         occupancy/heatmap background remains the current map, but motion,
         active waypoint and route all come from the same immutable snapshot.
         """
+        if not self.config.show_path:
+            return
         snapshot = self._nav_debug_snapshot
         if snapshot is None:
             return
@@ -5292,6 +5463,8 @@ class SimulationCanvas(QWidget):
         a reached waypoint cannot remain visually connected after the robot has
         advanced to the next one.
         """
+        if not self.config.show_path:
+            return
         remaining, active_index = self._remaining_single_planned_route()
         if len(remaining) < 2:
             return
@@ -5340,7 +5513,7 @@ class SimulationCanvas(QWidget):
 
     def draw_multi_planned_routes(self, painter: QPainter):
         """Draw one remaining accepted route per robot, never historical paths."""
-        if not self.multi_planned_path_points or not self.robots:
+        if not self.config.show_path or not self.multi_planned_path_points or not self.robots:
             return
 
         painter.save()
@@ -5394,6 +5567,28 @@ class SimulationCanvas(QWidget):
                     endpoint_fill=None if endpoint_is_goal else color,
                     endpoint_label=None if endpoint_is_goal else f"F{robot_index + 1}",
                 )
+        painter.restore()
+
+    def draw_multi_executed_paths(self, painter: QPainter) -> None:
+        """Draw each robot's accumulated trajectory using its identity color.
+
+        Multi-robot histories are bounded by the engine, so rebuilding these
+        short screen-space polylines is deterministic and does not mutate the
+        recorded path used by metrics or snapshot export.
+        """
+        if not self.config.show_traveled_path or not self.multi_path_points:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(Qt.NoBrush)
+        for robot_index, points in enumerate(self.multi_path_points):
+            if len(points) < 2:
+                continue
+            color = QColor(robot_color(robot_index))
+            color.setAlpha(205)
+            painter.setPen(QPen(color, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPath(self._rebuild_route_path(list(points)))
         painter.restore()
 
     def _executed_trail_style_signature(self) -> tuple:
@@ -5480,6 +5675,8 @@ class SimulationCanvas(QWidget):
         check below, since a length-only comparison would miss an
         in-place truncation that keeps the same length forever after), or
         the trail's stroke style changes."""
+        if not self.config.show_traveled_path:
+            return
         if len(self.path_points) < 2:
             self._route_detail["executed_trail_points"] = len(self.path_points)
             self._route_detail["executed_trail_segments_painted"] = 0
@@ -5807,11 +6004,10 @@ class SimulationCanvas(QWidget):
             painter.drawEllipse(QRectF(gx_s - 3, gy_s - 3, 6, 6))
             painter.restore()
 
-        # Exploration target marker(s): always visible now (was gated behind
-        # the removed "Robot Orders" toggle). In multi-robot mode each robot
-        # owns its own F marker; do not draw a single shared F because that
-        # makes the robots look coupled.
-        if self.robots and "Multiple" in self.config.agent_mode:
+        # Exploration target markers belong to the planned-route layer. In
+        # multi-robot mode each robot owns its own F marker; do not draw a
+        # single shared F because that makes the robots look coupled.
+        if self.config.show_path and self.robots and "Multiple" in self.config.agent_mode:
             painter.save()
             painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
             for target_index, target in enumerate(self.multi_exploration_targets):
@@ -5843,7 +6039,7 @@ class SimulationCanvas(QWidget):
                     f"F{target_index + 1}",
                 )
             painter.restore()
-        elif self.exploration_target_xy is not None:
+        elif self.config.show_path and self.exploration_target_xy is not None:
             tx, ty = self.exploration_target_xy
             route_represents_target = bool(self.planned_path_points) and math.hypot(
                 float(self.planned_path_points[-1][0]) - tx,

@@ -199,6 +199,9 @@ MAP_VISUALIZATION_OPTIONS = [
 DEFAULT_MAP_VISUALIZATION = MAP_VISUALIZATION_OPTIONS[0]
 DEFAULT_CUSTOM_UNEXPLORED_COLOR = "#000000"
 DEFAULT_CUSTOM_EXPLORED_COLOR = "#F8F9FB"
+DEFAULT_CUSTOM_OBSTACLE_COLOR = "#6A6D75"
+DEFAULT_CUSTOM_EXPLORED_OPACITY = 1.0
+DEFAULT_MAPPED_OBSTACLE_LINE_WIDTH = 0.5
 
 ROBOT_ICON_OPTIONS = [
     "Circle",
@@ -361,6 +364,18 @@ class SimulationConfig:
     # without adding one-off GUI controls for every external algorithm.
     coordination_parameters: dict = field(default_factory=dict)
 
+    # Periodic full-team replanning interval, in simulated seconds. 0.0 (the
+    # default) disables it entirely, preserving today's purely event-driven
+    # coordination (missing/reached/invalidated targets only). See
+    # robotics_sim.simulation.coordination_scheduler.
+    coordination_replan_interval_s: float = 0.0
+
+    # When True, coordination_service_audit.py raises a contract error
+    # instead of only warning when a plugin's observed service usage
+    # contradicts its declared CandidateInputMode. Intended for tests/
+    # experiments, not default interactive use.
+    coordination_strict_contracts: bool = False
+
     # Minimum simulated time between exploration-target replans.
     # Safety replans caused by newly discovered obstacles can still happen immediately.
     exploration_replan_cooldown: float = 1.00
@@ -378,6 +393,9 @@ class SimulationConfig:
     map_visualization: str = DEFAULT_MAP_VISUALIZATION
     custom_unexplored_color: str = DEFAULT_CUSTOM_UNEXPLORED_COLOR
     custom_explored_color: str = DEFAULT_CUSTOM_EXPLORED_COLOR
+    custom_obstacle_color: str = DEFAULT_CUSTOM_OBSTACLE_COLOR
+    custom_explored_opacity: float = DEFAULT_CUSTOM_EXPLORED_OPACITY
+    mapped_obstacle_line_width: float = DEFAULT_MAPPED_OBSTACLE_LINE_WIDTH
     robot_icon: str = DEFAULT_ROBOT_ICON
 
     # Dynamic fire/hazard layer. Occupancy remains UNKNOWN/FREE/OCCUPIED;
@@ -428,7 +446,10 @@ class SimulationConfig:
     )
 
     show_goal_preview: bool = True
+    # Remaining accepted route plus its goal/frontier endpoint.
     show_path: bool = True
+    # Accumulated trajectory already executed by each robot.
+    show_traveled_path: bool = False
     show_vision: bool = True
 
     # Accumulated visible area traced by the robot sensor. This is a world/map
@@ -677,6 +698,8 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
         "coordination": {
             "strategy": config.coordinator_type,
             "parameters": copy.deepcopy(config.coordination_parameters),
+            "replan_interval_s": config.coordination_replan_interval_s,
+            "strict_contracts": config.coordination_strict_contracts,
         },
         "sensor": {
             "type": config.vision_model,
@@ -709,9 +732,13 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "map_visualization": config.map_visualization,
             "custom_unexplored_color": config.custom_unexplored_color,
             "custom_explored_color": config.custom_explored_color,
+            "custom_obstacle_color": config.custom_obstacle_color,
+            "custom_explored_opacity": config.custom_explored_opacity,
+            "mapped_obstacle_line_width": config.mapped_obstacle_line_width,
             "robot_icon": config.robot_icon,
             "show_goal_preview": config.show_goal_preview,
             "show_path": config.show_path,
+            "show_traveled_path": config.show_traveled_path,
             "show_vision": config.show_vision,
             "show_explored_area": config.show_explored_area,
             "show_obstacles": config.show_obstacles,
@@ -810,6 +837,33 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         simulation.get("custom_explored_color", default.custom_explored_color),
         default.custom_explored_color,
     )
+    custom_obstacle_color = _as_hex_color(
+        simulation.get("custom_obstacle_color", default.custom_obstacle_color),
+        default.custom_obstacle_color,
+    )
+    custom_explored_opacity = min(
+        1.0,
+        max(
+            0.0,
+            _as_float(
+                simulation.get("custom_explored_opacity", default.custom_explored_opacity),
+                default.custom_explored_opacity,
+            ),
+        ),
+    )
+    mapped_obstacle_line_width = min(
+        6.0,
+        max(
+            0.25,
+            _as_float(
+                simulation.get(
+                    "mapped_obstacle_line_width",
+                    default.mapped_obstacle_line_width,
+                ),
+                default.mapped_obstacle_line_width,
+            ),
+        ),
+    )
 
     robot_icon = str(simulation.get("robot_icon", default.robot_icon))
     if robot_icon not in ROBOT_ICON_OPTIONS:
@@ -859,6 +913,13 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         exploration_planner=exploration_planner,
         coordinator_type=coordinator_type,
         coordination_parameters=coordination_parameters,
+        coordination_replan_interval_s=_as_float(
+            coordination.get("replan_interval_s", default.coordination_replan_interval_s),
+            default.coordination_replan_interval_s,
+        ),
+        coordination_strict_contracts=bool(
+            coordination.get("strict_contracts", default.coordination_strict_contracts)
+        ),
         exploration_replan_cooldown=_as_float(
             exploration.get(
                 "replan_cooldown",
@@ -885,6 +946,9 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         map_visualization=map_visualization,
         custom_unexplored_color=custom_unexplored_color,
         custom_explored_color=custom_explored_color,
+        custom_obstacle_color=custom_obstacle_color,
+        custom_explored_opacity=custom_explored_opacity,
+        mapped_obstacle_line_width=mapped_obstacle_line_width,
         robot_icon=robot_icon,
         default_fire_intensity=min(
             1.0,
@@ -982,6 +1046,9 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
             simulation.get("show_goal_preview", default.show_goal_preview)
         ),
         show_path=bool(simulation.get("show_path", default.show_path)),
+        show_traveled_path=bool(
+            simulation.get("show_traveled_path", default.show_traveled_path)
+        ),
         show_vision=bool(simulation.get("show_vision", default.show_vision)),
         show_explored_area=bool(
             simulation.get("show_explored_area", default.show_explored_area)

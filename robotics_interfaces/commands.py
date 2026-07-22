@@ -5,7 +5,11 @@ from typing import Any, Literal, Mapping
 
 from robotics_interfaces.observations import Point2D
 
-RobotCommandStatus = Literal["ASSIGNED", "HOLD", "BRAKE", "FAILED"]
+RobotCommandStatus = Literal["ASSIGNED", "HOLD", "BRAKE", "FAILED", "CLEAR"]
+"""CLEAR is an explicit "remove this robot's target" instruction, distinct
+from HOLD ("no new decision, do not touch the existing target"). See
+robotics_sim.simulation.coordination_result_applier, which is the first
+consumer that actually distinguishes the two."""
 
 
 @dataclass(frozen=True)

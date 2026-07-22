@@ -22,6 +22,8 @@ import numbers
 import os
 import time
 import zlib
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,7 +59,6 @@ from robotics_sim.diagnostics.snapshot_export import (
     export_navigation_snapshots_xlsx,
     select_navigation_snapshot_events,
 )
-from robotics_sim.planning.planning_costmap import apply_hazard_belief_to_planning_grid
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
 from robotics_sim.simulation.hazard_safety_runtime import HazardSafetyRuntime
@@ -170,11 +171,60 @@ def occupancy_grid_snapshot_from_belief(belief_map) -> dict | None:
     if belief_map is None:
         return None
 
+    grid = belief_map.grid.copy()
+    free = grid == 0
+    unknown = grid == -1
+    adjacent_unknown = np.zeros_like(unknown, dtype=np.bool_)
+    adjacent_unknown[1:, :] |= unknown[:-1, :]
+    adjacent_unknown[:-1, :] |= unknown[1:, :]
+    adjacent_unknown[:, 1:] |= unknown[:, :-1]
+    adjacent_unknown[:, :-1] |= unknown[:, 1:]
+    frontier_rows, frontier_cols = np.where(free & adjacent_unknown)
+
     return {
         "resolution": float(belief_map.resolution),
         "bounds": tuple(belief_map.bounds),
-        "grid": belief_map.grid.copy(),
+        "grid": grid,
+        "frontier_cells": tuple(
+            (int(row), int(col)) for row, col in zip(frontier_rows, frontier_cols)
+        ),
     }
+
+
+def frontier_bfs_steps(grid: np.ndarray, start_cell: tuple[int, int] | None) -> np.ndarray:
+    """Four-connected BFS levels through known FREE cells only."""
+    steps = np.full(grid.shape, -1, dtype=np.int32)
+    if start_cell is None:
+        return steps
+    start_row, start_col = map(int, start_cell)
+    if not (0 <= start_row < grid.shape[0] and 0 <= start_col < grid.shape[1]):
+        return steps
+    if int(grid[start_row, start_col]) != 0:
+        free_rows, free_cols = np.where(grid == 0)
+        if free_rows.size == 0:
+            return steps
+        index = min(
+            range(int(free_rows.size)),
+            key=lambda i: (
+                abs(int(free_rows[i]) - start_row) + abs(int(free_cols[i]) - start_col),
+                int(free_rows[i]), int(free_cols[i]),
+            ),
+        )
+        start_row, start_col = int(free_rows[index]), int(free_cols[index])
+
+    queue = deque([(start_row, start_col)])
+    steps[start_row, start_col] = 0
+    while queue:
+        row, col = queue.popleft()
+        next_step = int(steps[row, col]) + 1
+        for nr, nc in ((row + 1, col), (row - 1, col), (row, col + 1), (row, col - 1)):
+            if not (0 <= nr < grid.shape[0] and 0 <= nc < grid.shape[1]):
+                continue
+            if steps[nr, nc] >= 0 or int(grid[nr, nc]) != 0:
+                continue
+            steps[nr, nc] = next_step
+            queue.append((nr, nc))
+    return steps
 
 
 class PlannerWorkerSignals(QObject):
@@ -547,6 +597,22 @@ def effective_planning_clearance(robot_radius: float, safety_radius: float) -> f
     return max(float(robot_radius), float(safety_radius))
 
 
+@dataclass(frozen=True, eq=False)
+class CandidateReachabilityResult:
+    reachable: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return bool(self.reachable)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, (bool, np.bool_)):
+            return self.reachable == bool(other)
+        if isinstance(other, CandidateReachabilityResult):
+            return (self.reachable, self.reason) == (other.reachable, other.reason)
+        return NotImplemented
+
+
 def candidate_reachable_on_planning_grid(
     planning_grid,
     planner_type: str,
@@ -557,7 +623,8 @@ def candidate_reachable_on_planning_grid(
     resolution: float,
     robot_radius: float,
     goal_tolerance: float,
-) -> bool:
+    return_details: bool = False,
+) -> bool | CandidateReachabilityResult:
     """True when compute_planned_waypoints() can find a route from start_xy
     to candidate_xy on the given, already-built planning_grid, AND that
     route's final waypoint actually reaches candidate_xy within
@@ -584,9 +651,13 @@ def candidate_reachable_on_planning_grid(
     plain OccupancyGrid, without instantiating the Qt-based simulation
     engine.
     """
+    def result(reachable: bool, reason: str):
+        detail = CandidateReachabilityResult(bool(reachable), str(reason))
+        return detail if return_details else bool(detail)
+
     if compute_planned_waypoints is None or planning_grid is None:
-        return True
-    success, _reason, waypoints = compute_planned_waypoints(
+        return result(True, "reachability check unavailable; assumed reachable")
+    success, plan_reason, waypoints = compute_planned_waypoints(
         planner_type=planner_type,
         start_xy=start_xy,
         goal_xy=candidate_xy,
@@ -597,9 +668,21 @@ def candidate_reachable_on_planning_grid(
         unknown_is_traversable=True,
         obstacle_points=[],
     )
-    if not success or not waypoints:
-        return False
-    return NavigationSupervisor.validate_route_endpoint(waypoints, candidate_xy, goal_tolerance)
+    if not success:
+        return result(False, f"path planner failed: {plan_reason}")
+    if not waypoints:
+        return result(False, "path planner returned no executable waypoints")
+    endpoint_valid = NavigationSupervisor.validate_route_endpoint(
+        waypoints, candidate_xy, goal_tolerance
+    )
+    if not endpoint_valid:
+        endpoint = waypoints[-1]
+        miss = math.hypot(float(endpoint[0]) - candidate_xy[0], float(endpoint[1]) - candidate_xy[1])
+        return result(
+            False,
+            f"route endpoint misses candidate by {miss:.3f} m (tolerance={goal_tolerance:.3f} m)",
+        )
+    return result(True, "reachable: valid path and endpoint")
 
 
 # ============================================================
@@ -862,39 +945,13 @@ class SimulationControllerMixin:
         return runtime
 
     def apply_hazard_safety_filter(self, robot, control: np.ndarray) -> np.ndarray:
-        """Filter one robot's proposed control through the Observed Hazard
-        OGM-HOCBF safety filter.
+        """Return nominal control unchanged.
 
-        Pure wiring: gathers the team's observed HazardBelief snapshot, the
-        robot's own state/limits/safety radius, and delegates to
-        HazardSafetyRuntime -- no SDF construction, no gradients/Hessians,
-        no HOCBF equations, and no QP solving live here (see
-        hazard_safety_runtime.py / hazard_hocbf_filter.py /
-        hazard_distance_field.py).
-
-        Must be called AFTER the nominal control is decided (nominal_
-        control_safe() for single-robot, select_runtime_control_source() for
-        multi-robot, so a CONTROL-owning plugin cannot skip it) and BEFORE
-        predicted_motion_report() -- see the call sites in simulation_step()
-        and simulation_step_multi() for the exact ordering.
+        Fire is traversable information for aerial robots, not physical
+        occupancy.  The compatibility hook remains at existing call sites,
+        but HazardBelief must never modify motion.
         """
-        if not bool(getattr(self.config, "hazard_cbf_enabled", True)):
-            return control
-
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is None or robot is None:
-            return control
-
-        runtime = self.ensure_hazard_safety_runtime()
-        result = runtime.filter_control(
-            belief_frame=hazard_service.belief.snapshot(),
-            geometry=hazard_service.belief.geometry,
-            state=robot.state,
-            limits=robot.limits,
-            nominal_control=control,
-            safety_radius=self.safety_radius_for_robot(robot),
-        )
-        return result.control
+        return control
 
     def push_hazard_snapshot(self) -> None:
         """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
@@ -957,7 +1014,20 @@ class SimulationControllerMixin:
         routing, or exploration, and does not create or rebuild the belief
         map -- returns None if none exists yet.
         """
-        return occupancy_grid_snapshot_from_belief(getattr(self, "belief_map", None))
+        belief = getattr(self, "belief_map", None)
+        snapshot = occupancy_grid_snapshot_from_belief(belief)
+        if snapshot is None:
+            return None
+
+        selected_index = int(getattr(self, "selected_robot_index", 0))
+        robots = list(getattr(self, "robots", []) or [])
+        robot = robots[selected_index] if 0 <= selected_index < len(robots) else getattr(self, "robot", None)
+        start_cell = None
+        if robot is not None:
+            start_cell = belief.world_to_cell((float(robot.x), float(robot.y)), clamp=True)
+        snapshot["bfs_steps"] = frontier_bfs_steps(snapshot["grid"], start_cell)
+        snapshot["bfs_robot_index"] = selected_index
+        return snapshot
 
     def push_grid_overlay_snapshot_if_due(self) -> None:
         """Push a fresh occupancy snapshot into the canvas's grid overlay,
@@ -977,7 +1047,12 @@ class SimulationControllerMixin:
         simulation tick for no visible benefit.
         """
         canvas = getattr(self, "canvas", None)
-        if canvas is None or not getattr(canvas, "grid_overlay_enabled", False):
+        overlay_requested = bool(
+            getattr(canvas, "grid_overlay_enabled", False)
+            or getattr(canvas, "grid_cell_values_enabled", False)
+            or getattr(canvas, "frontier_decisions_enabled", False)
+        ) if canvas is not None else False
+        if not overlay_requested:
             return
 
         is_degraded = getattr(canvas, "is_grid_overlay_degraded", None)
@@ -1264,6 +1339,7 @@ class SimulationControllerMixin:
         self.canvas.set_preview_config(self.config)
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
+        self.canvas.set_frontier_reasoning_decision(None)
 
     def save_simulation_config(self) -> None:
         self.config = self.read_config()
@@ -1556,6 +1632,17 @@ class SimulationControllerMixin:
             score=selected_score,
             candidate_count=len(result.candidates),
         )
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None:
+            frontier_panel.update_decision(
+                planner=str(planner_name),
+                result=result,
+                robot_label="R1",
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                robot_xy=(float(self.robot.x), float(self.robot.y)) if self.robot is not None else None,
+                configured_planner=str(getattr(self.config, "exploration_planner", planner_name)),
+                attempt_role="configured planner",
+            )
 
         if not result.success or result.target is None:
             self.current_exploration_target = None
@@ -1710,10 +1797,8 @@ class SimulationControllerMixin:
         (normalization is not a new observation, so the revision does not
         change).
 
-        Hazard enters exclusively via hazard_service.belief.snapshot() +
-        hazard_service.belief.geometry -- never mapped_obstacle_points or
-        dynamic_obstacle_points. Ground truth (config.obstacles) never
-        enters at all.
+        Hazard is deliberately absent: fire is traversable information, not
+        physical occupancy. Ground truth (config.obstacles) never enters.
         """
         belief = self.ensure_belief_map()
         exploration = belief.snapshot()
@@ -1738,19 +1823,10 @@ class SimulationControllerMixin:
             source=observed_static.source,
         )
 
-        hazard_belief = None
-        hazard_geometry = None
-        hazard_block_threshold = None
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            hazard_belief = hazard_service.belief.snapshot()
-            hazard_geometry = hazard_service.belief.geometry
-            hazard_block_threshold = float(hazard_service.block_threshold)
-
         policy = PlanningCostmapPolicy(
             unknown_is_traversable=True,
             obstacle_padding=radius,
-            hazard_block_threshold=hazard_block_threshold,
+            hazard_block_threshold=None,
         )
 
         return PlanningCostmapBuilder().build(
@@ -1758,8 +1834,8 @@ class SimulationControllerMixin:
             observed_obstacles=sanitized_static_snapshot,
             policy=policy,
             dynamic_obstacle_points=tuple(sanitized_dynamic_points),
-            hazard_belief=hazard_belief,
-            hazard_geometry=hazard_geometry,
+            hazard_belief=None,
+            hazard_geometry=None,
         )
 
     def _planning_grid_from_costmap_snapshot(self, snapshot) -> OccupancyGrid:
@@ -1856,17 +1932,6 @@ class SimulationControllerMixin:
         if obstacle_points:
             planning_grid.add_obstacle_points(obstacle_points, padding=max(0.0, radius))
 
-        # Project the team's DISCOVERED hazard belief into this derived
-        # binary planning grid -- never the omniscient ground-truth
-        # HazardField. BeliefMap.grid is never modified either way.
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            apply_hazard_belief_to_planning_grid(
-                planning_grid,
-                hazard_service.belief,
-                block_threshold=hazard_service.block_threshold,
-                inflate_radius=max(0.0, radius),
-            )
         return planning_grid
 
     def build_refined_static_planning_grid_for_robot(
@@ -1891,19 +1956,12 @@ class SimulationControllerMixin:
         base_resolution = max(1e-6, float(self.config.grid_resolution))
         refined_resolution = max(0.05, base_resolution / factor)
         radius = max(0.0, float(robot_radius))
-        hazard_service = getattr(self, "hazard_service", None)
-        hazard_revision = (
-            int(hazard_service.belief.revision)
-            if hazard_service is not None
-            else -1
-        )
         cache_key = (
             id(belief),
             int(getattr(self, "mapped_obstacle_revision", 0)),
             len(getattr(self, "mapped_obstacle_points", ())),
             round(radius, 9),
             round(refined_resolution, 9),
-            hazard_revision,
             tuple(float(value) for value in belief.bounds),
         )
         if getattr(self, "_refined_static_grid_cache_key", None) == cache_key:
@@ -1929,11 +1987,6 @@ class SimulationControllerMixin:
         )
         if static_points:
             grid.add_obstacle_points(static_points, padding=radius)
-        if hazard_service is not None:
-            hazard_points = hazard_service.observed_blocked_world_points()
-            if hazard_points:
-                grid.add_obstacle_points(hazard_points, padding=radius)
-
         self._refined_static_grid_cache_key = cache_key
         self._refined_static_grid_cache = grid.copy()
         return grid
@@ -2580,6 +2633,29 @@ class SimulationControllerMixin:
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
         self.last_coordination_debug = dict(result.debug)
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None:
+            runtime_profile = self.coordinator_runtime_profile()
+            frontier_panel.update_coordination(
+                planner=str(self.config.exploration_planner),
+                coordinator=str(self.config.coordinator_type),
+                result=result,
+                robot_index=int(getattr(self, "selected_robot_index", requesting_robot_index)),
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                runtime_profile=runtime_profile,
+                robot_positions=tuple(
+                    (float(robot.x), float(robot.y)) for robot in self.robots
+                ),
+            )
+        coordinator_panel = getattr(self, "coordinator_reasoning_panel", None)
+        if coordinator_panel is not None and hasattr(coordinator_panel, "update_coordination"):
+            coordinator_panel.update_coordination(
+                planner=str(self.config.exploration_planner),
+                coordinator=str(self.config.coordinator_type),
+                result=result,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                runtime_profile=self.coordinator_runtime_profile(),
+            )
 
         if not hasattr(self, "multi_robot_commands_by_id"):
             self.multi_robot_commands_by_id = {}
@@ -3004,9 +3080,6 @@ class SimulationControllerMixin:
             return cleaned
 
         points_for_clearance = list(self.mapped_obstacle_points if obstacle_points is None else obstacle_points)
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            points_for_clearance.extend(hazard_service.observed_blocked_world_points())
 
         # Runtime invariant: if the final target is directly safe from the
         # robot's CURRENT pose, never execute an older/grid-artifact detour.
@@ -3101,18 +3174,14 @@ class SimulationControllerMixin:
 
         This is intentionally checked against mapped_obstacle_points, not the
         ground-truth rectangles. The robot should be allowed to plan through
-        unknown space; if a hidden obstacle is discovered later, the safety
-        layer will trigger replanning. Hazard is held to the same rule: only
-        observed_blocked_world_points() (discovered), never the omniscient
-        ground-truth HazardField.
+        unknown space; if a hidden physical obstacle is discovered later, the
+        safety layer will trigger replanning. Fire is excluded because it is
+        traversable information for an aerial robot.
         """
         if self.collision_checker is None:
             return True
 
         obstacle_points = list(self.mapped_obstacle_points)
-        hazard_service = getattr(self, "hazard_service", None)
-        if hazard_service is not None:
-            obstacle_points.extend(hazard_service.observed_blocked_world_points())
 
         report = self.collision_checker.check_segment_points(
             start=(float(start[0]), float(start[1])),
@@ -3226,6 +3295,26 @@ class SimulationControllerMixin:
         # reaches the success branch that would otherwise clear it).
         pending_plan_capture = getattr(self, "_nav_debug_last_plan_capture", None)
         self._nav_debug_last_plan_capture = None
+
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if path_panel is not None and hasattr(path_panel, "update_route"):
+            start_xy = (float(self.robot.x), float(self.robot.y))
+            intended_goal = (
+                tuple(self.current_exploration_target)
+                if self.is_exploration_mode() and self.current_exploration_target is not None
+                else self.final_goal_xy()
+            )
+            path_panel.update_route(
+                planner=str(self.config.planner_type),
+                simplifier=str(self.config.path_simplifier),
+                success=bool(success),
+                reason=str(reason),
+                capture=pending_plan_capture,
+                waypoints=tuple(waypoints or ()),
+                start_xy=start_xy,
+                goal_xy=intended_goal,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+            )
 
         self.route_result_count += 1
 
@@ -3906,6 +3995,10 @@ class SimulationControllerMixin:
         )
 
         selected_frontier = getattr(agent, "exploration_target_xy", None) if agent is not None else None
+        configured_frontier_planner = str(getattr(agent, "planner_mode", "")) if agent is not None else ""
+        effective_frontier_planner = str(
+            getattr(agent, "last_frontier_planner", "") or configured_frontier_planner
+        ) if agent is not None else ""
         frontier = FrontierDebug(
             candidate_count=(
                 Maybe.of(int(getattr(agent, "last_frontier_candidate_count", 0)))
@@ -3921,6 +4014,17 @@ class SimulationControllerMixin:
             reason=(
                 Maybe.of(str(getattr(agent, "last_frontier_selection_reason", "") or decision_reason))
                 if agent is not None
+                else Maybe.missing()
+            ),
+            configured_planner=(Maybe.of(configured_frontier_planner) if configured_frontier_planner else Maybe.missing()),
+            effective_planner=(Maybe.of(effective_frontier_planner) if effective_frontier_planner else Maybe.missing()),
+            attempt_role=(
+                Maybe.of(
+                    "configured planner"
+                    if effective_frontier_planner == configured_frontier_planner
+                    else "map-wide fallback"
+                )
+                if configured_frontier_planner and effective_frontier_planner
                 else Maybe.missing()
             ),
         )
@@ -5705,6 +5809,17 @@ class SimulationControllerMixin:
         # 10. Return the view to LIVE.
         self._nav_debug_history_index = None
 
+        # Frontier Reasoning is separate from Navigation Reasoning history.
+        # Explicitly replace any discarded-future decision still displayed.
+        self._last_frontier_panel_signature = None
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None and hasattr(frontier_panel, "restore_from_snapshot"):
+            frontier_panel.restore_from_snapshot(
+                snapshot=snapshot,
+                configured_planner=str(getattr(self.config, "exploration_planner", "")),
+                robot_label="R1",
+            )
+
         self.canvas.set_robot(self.robot)
         self.canvas.set_path(self.path_points)
         self.canvas.set_planned_path([(self.robot.x, self.robot.y)] + active_path)
@@ -6172,6 +6287,23 @@ class SimulationControllerMixin:
                 self._nav_debug_last_accepted_plan_by_robot = {}
                 accepted_by_robot = self._nav_debug_last_accepted_plan_by_robot
             accepted_by_robot[int(robot_index)] = plan_capture
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if (
+            path_panel is not None
+            and hasattr(path_panel, "update_route")
+        ):
+            path_panel.update_route(
+                planner=str(self.config.planner_type),
+                simplifier=str(self.config.path_simplifier),
+                success=True,
+                reason=str(route_reason),
+                capture=plan_capture,
+                waypoints=tuple(waypoints),
+                start_xy=(float(robot.x), float(robot.y)),
+                goal_xy=tuple(waypoints[-1]) if waypoints else None,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+                robot_index=int(robot_index),
+            )
         self.set_robot_goal_or_waypoints(robot, waypoints)
         self.set_multi_route_state(robot_index, self.ROUTE_STATE_ACTIVE, route_reason)
 
@@ -6217,6 +6349,25 @@ class SimulationControllerMixin:
         )
 
         if (not success or not waypoints) and self.is_exploration_mode():
+            failed_target = (
+                self.multi_exploration_targets[robot_index]
+                if 0 <= robot_index < len(self.multi_exploration_targets) else None
+            )
+            failed_capture = getattr(self, "_nav_debug_current_plan_capture_by_robot", {}).get(robot_index)
+            path_panel = getattr(self, "path_reasoning_panel", None)
+            if path_panel is not None and hasattr(path_panel, "update_route"):
+                path_panel.update_route(
+                    planner=str(self.config.planner_type),
+                    simplifier=str(self.config.path_simplifier),
+                    success=False,
+                    reason=str(route_reason),
+                    capture=failed_capture,
+                    waypoints=(),
+                    start_xy=(float(robot.x), float(robot.y)),
+                    goal_xy=None if failed_target is None else tuple(failed_target),
+                    time_s=float(getattr(self, "simulation_time", 0.0)),
+                    robot_index=robot_index,
+                )
             # At this point the dynamic-grid planner and its static-topology
             # fallback both failed.  This is a target-specific reachability
             # failure, not evidence that the robot arrived at the frontier.
@@ -6572,6 +6723,7 @@ class SimulationControllerMixin:
         self.running = True
         self.paused = False
         self.canvas.set_simulation_running_for_perf(True)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(True)
         self.update_start_pause_button()
         self.speed_button.setText(f"Speed {self.simulation_speed:.2f}x")
@@ -6764,6 +6916,7 @@ class SimulationControllerMixin:
         self.running = True
         self.paused = False
         self.canvas.set_simulation_running_for_perf(True)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(True)
 
         self.path_points = [(self.robot.x, self.robot.y)]
@@ -6801,6 +6954,8 @@ class SimulationControllerMixin:
         self.running = False
         self.paused = False
         self.canvas.set_simulation_running_for_perf(False)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
+        self.canvas.set_frontier_reasoning_simulation_paused(False)
         self.set_configuration_locked(False)
 
         self.collision_checker = CollisionChecker() if CollisionChecker is not None else None
@@ -6854,6 +7009,11 @@ class SimulationControllerMixin:
         self.canvas.set_path([])
         self.canvas.set_planned_path([])
         self.canvas.set_exploration_target(None)
+        self.canvas.set_frontier_reasoning_decision(None)
+        # This overlay stores a copied grid/BFS frame. Replacing belief_map
+        # does not mutate that copy, so publish the new empty run explicitly.
+        self._grid_overlay_snapshot_last_push_time = None
+        self.canvas.set_grid_overlay_snapshot(self.occupancy_grid_snapshot())
         self.canvas.set_known_obstacles(self.known_obstacles)
         self.canvas.set_mapped_obstacle_points(self.mapped_obstacle_points)
         self.push_hazard_snapshot()
@@ -6864,6 +7024,18 @@ class SimulationControllerMixin:
         self._publish_explored_area_source_to_canvas()
         self.canvas.set_last_control(self.last_control)
         self.canvas.set_status("Reset complete. Press Start Simulation to run.")
+        path_panel = getattr(self, "path_reasoning_panel", None)
+        if path_panel is not None and hasattr(path_panel, "clear"):
+            path_panel.clear()
+        frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+        if frontier_panel is not None and hasattr(frontier_panel, "clear"):
+            frontier_panel.clear()
+        coordinator_panel = getattr(self, "coordinator_reasoning_panel", None)
+        if coordinator_panel is not None and hasattr(coordinator_panel, "clear"):
+            coordinator_panel.clear()
+        # Restart leaves the timer stopped, so force the cleared state onto
+        # screen now instead of waiting for the next simulation tick/Play.
+        self.canvas.repaint()
 
         self.top_bar.set_status("ready")
 
@@ -6872,6 +7044,8 @@ class SimulationControllerMixin:
             return
 
         self.paused = not self.paused
+        self.canvas.set_frontier_reasoning_simulation_paused(self.paused)
+        self.update_path_reasoning_live_pose()
 
         if self.paused:
             self.canvas.set_status("Simulation paused.")
@@ -6928,92 +7102,12 @@ class SimulationControllerMixin:
         *,
         robot_radius: float,
     ) -> bool:
-        """Return whether a current route crosses thresholded hazard cells."""
-        if self.collision_checker is None or len(route_points) < 2 or not hazard_points:
-            return False
-        for start, end in zip(route_points[:-1], route_points[1:]):
-            report = self.collision_checker.check_segment_points(
-                start=start,
-                end=end,
-                obstacle_points=list(hazard_points),
-                robot_radius=max(0.0, float(robot_radius)),
-            )
-            if report.collision:
-                return True
+        """Compatibility hook: fire never intersects an aerial route."""
         return False
 
     def _replan_routes_affected_by_hazard(self) -> None:
-        """Replan only active routes that now cross a blocked, OBSERVED
-        thermal cell -- never the omniscient ground-truth HazardField."""
-        if not getattr(self, "running", False):
-            return
-
-        service = self.ensure_hazard_service()
-        hazard_points = service.observed_blocked_world_points()
-        if not hazard_points:
-            return
-
-        robots = list(getattr(self, "robots", []) or [])
-        if robots and "Multiple" in str(getattr(self.config, "agent_mode", "")):
-            old_robot = getattr(self, "robot", None)
-            try:
-                for robot_index, robot in enumerate(robots):
-                    route_points = self.current_route_points_for_robot(robot)
-                    if not self._route_intersects_hazard_points(
-                        route_points,
-                        hazard_points,
-                        robot_radius=self.safety_radius_for_robot(robot),
-                    ):
-                        continue
-                    self.robot = robot
-                    if str(getattr(self.config, "planner_type", "")) == "Direct":
-                        if hasattr(robot, "force_stop"):
-                            robot.force_stop(reason="dynamic fire hazard blocks direct route")
-                        agent = self.runtime_agent(robot_index)
-                        if agent is not None:
-                            agent.invalidate_route(
-                                reason="dynamic fire hazard blocks direct route"
-                            )
-                        self._invalidate_prefetch_request(
-                            robot_index, reason="dynamic fire hazard blocks direct route"
-                        )
-                        continue
-                    self.assign_route_to_multi_robot(
-                        robot_index,
-                        reason="Dynamic fire hazard affects current route",
-                        force_new_exploration_target=False,
-                    )
-            finally:
-                self.robot = old_robot
-            return
-
-        if self.robot is None:
-            return
-        if self._route_intersects_hazard_points(
-            self.current_route_points(),
-            hazard_points,
-            robot_radius=self.safety_radius_for_robot(self.robot),
-        ):
-            agent = self.runtime_agent(None)
-            if agent is not None:
-                agent.invalidate_pending_path(
-                    reason="dynamic fire hazard affects current route"
-                )
-                self._invalidate_prefetch_request(0, reason="dynamic fire hazard affects current route")
-            if str(getattr(self.config, "planner_type", "")) == "Direct":
-                if hasattr(self.robot, "force_stop"):
-                    self.robot.force_stop(reason="dynamic fire hazard blocks direct route")
-                if agent is not None:
-                    agent.invalidate_route(
-                        reason="dynamic fire hazard blocks direct route"
-                    )
-                self.canvas.set_status(
-                    "Fire blocks the direct route. Select A* or Dijkstra to route around it."
-                )
-                return
-            self.replan_after_new_information(
-                "Dynamic fire hazard affects current route."
-            )
+        """Compatibility hook: hazard observations never trigger replanning."""
+        return
 
     def add_fire(self, x: float, y: float) -> bool:
         """Add a temporary globally-known fire without changing occupancy."""
@@ -7030,11 +7124,7 @@ class SimulationControllerMixin:
             f"Fire placed at ({source.position[0]:.2f}, {source.position[1]:.2f}); "
             f"radius={source.radius:.2f}m."
         )
-        # No replan here: creating a FireSource only changes ground truth.
-        # Route repair is driven by _replan_routes_affected_by_hazard() being
-        # called after a sensor update actually OBSERVES a newly-blocked
-        # cell (see update_explored_free_points_from_polygon()) -- never by
-        # the omniscient act of a fire existing somewhere on the map.
+        # No replan: fire is a traversable information layer.
         return True
 
     def remove_fire_near(self, x: float, y: float) -> bool:
@@ -7421,14 +7511,6 @@ class SimulationControllerMixin:
         hazard_service = getattr(self, "hazard_service", None)
         if hazard_service is not None and belief_robot_index is not None:
             observation = hazard_service.observe_visible_polygon(polygon, robot_index=belief_robot_index)
-            # Route repair is gated on a real threshold CROSSING newly
-            # discovered by this observation -- never on `changed` alone,
-            # which is also True for e.g. a new robot merely attributing an
-            # already-known, already-blocked cell, or a newly observed but
-            # safe cell. Creating/removing a FireSource never reaches here
-            # at all (see add_fire()/on_fire_toggle_requested()).
-            if observation.newly_blocked_cells > 0:
-                self._replan_routes_affected_by_hazard()
             # Mark the render dirty only on an actual VISUAL change -- new
             # cells becoming observed, or an already-observed cell's value
             # changing. Deliberately NOT observation.changed: that is also
@@ -7969,6 +8051,28 @@ class SimulationControllerMixin:
             return None
         return rotation_control
 
+    def update_path_reasoning_live_pose(self) -> None:
+        panel = getattr(self, "path_reasoning_panel", None)
+        if (
+            panel is None
+            or not hasattr(panel, "update_live_pose")
+            or not bool(getattr(self, "_path_reasoning_panel_visible", False))
+        ):
+            return
+        robots = list(getattr(self, "robots", ()) or ())
+        if robots:
+            for index, robot in enumerate(robots):
+                panel.update_live_pose(
+                    (float(robot.x), float(robot.y)),
+                    robot_label=f"R{index + 1}",
+                    robot_index=index,
+                )
+            return
+        robot = getattr(self, "robot", None)
+        panel.update_live_pose(
+            None if robot is None else (float(robot.x), float(robot.y)), robot_label="R1", robot_index=0
+        )
+
     def simulation_step_multi(self, real_dt: float) -> None:
         if not self.running or self.paused or not self.robots:
             return
@@ -8365,6 +8469,7 @@ class SimulationControllerMixin:
             simulation_time=self.simulation_time,
             simulation_speed=self.simulation_speed,
         )
+        self.update_path_reasoning_live_pose()
 
     def _append_executed_path_point(self, new_path_point: tuple[float, float]) -> None:
         """Append one point to the single-robot executed trail
@@ -8720,6 +8825,33 @@ class SimulationControllerMixin:
             planner_services = self.ensure_planner_services()
             _nav_decision_perf_start = time.perf_counter()
             decision = agent.step(obs, planner_services, dt)
+            frontier_panel = getattr(self, "frontier_reasoning_panel", None)
+            frontier_candidates = tuple(getattr(agent, "last_frontier_candidates", ()) or ())
+            if frontier_panel is not None and frontier_candidates:
+                signature = (
+                    str(getattr(agent, "last_frontier_planner", "")),
+                    tuple(getattr(agent, "last_frontier_selected_target", ()) or ()),
+                    str(getattr(agent, "last_frontier_selection_reason", "")),
+                )
+                if signature != getattr(self, "_last_frontier_panel_signature", None):
+                    self._last_frontier_panel_signature = signature
+                    frontier_panel.update_decision(
+                        planner=signature[0],
+                        result=SimpleNamespace(
+                            target=getattr(agent, "last_frontier_selected_target", None),
+                            candidates=frontier_candidates,
+                            reason=getattr(agent, "last_frontier_selection_reason", ""),
+                        ),
+                        robot_label="R1",
+                        time_s=float(getattr(self, "simulation_time", 0.0)),
+                        robot_xy=(float(self.robot.x), float(self.robot.y)) if self.robot is not None else None,
+                        configured_planner=str(getattr(agent, "planner_mode", signature[0])),
+                        attempt_role=(
+                            "configured planner"
+                            if signature[0] == str(getattr(agent, "planner_mode", signature[0]))
+                            else "map-wide fallback"
+                        ),
+                    )
             _record_perf(self, "nav_decision", time.perf_counter() - _nav_decision_perf_start)
             _apply_decision_perf_start = time.perf_counter()
             should_brake = self.apply_navigation_decision(self.robot, agent, decision)
@@ -8869,6 +9001,8 @@ class SimulationControllerMixin:
                 simulation_speed=self.simulation_speed,
             )
             _record_perf(self, "canvas_state_update", time.perf_counter() - _canvas_update_perf_start)
+
+        self.update_path_reasoning_live_pose()
 
         _misc_tail_perf_start = time.perf_counter()
         self.push_grid_overlay_snapshot_if_due()
@@ -9054,6 +9188,7 @@ class SimulationControllerMixin:
                 resolution=resolution,
                 robot_radius=robot_radius,
                 goal_tolerance=goal_tolerance,
+                return_details=True,
             )
         return _is_reachable
 

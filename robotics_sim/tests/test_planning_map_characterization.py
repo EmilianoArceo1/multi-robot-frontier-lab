@@ -162,11 +162,11 @@ def test_runtime_planning_grid_includes_observed_obstacle_points():
 
 
 # ---------------------------------------------------------------------------
-# 2. Runtime planning grid includes observed hazards.
+# 2. Runtime planning grid excludes observed hazards for aerial robots.
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_planning_grid_includes_observed_hazards():
+def test_runtime_planning_grid_keeps_observed_hazards_traversable():
     belief = _make_belief_all_free()
     grid_before = belief.grid.copy()
 
@@ -182,9 +182,9 @@ def test_runtime_planning_grid_includes_observed_hazards():
 
     hazard_cell = planning_grid.world_to_grid(*observed_point)
     other_cell = planning_grid.world_to_grid(*unobserved_point)
-    assert planning_grid.get_value(hazard_cell) == OG_OCCUPIED
+    assert planning_grid.get_value(hazard_cell) != OG_OCCUPIED
     assert planning_grid.get_value(other_cell) != OG_OCCUPIED
-    assert (belief.grid == grid_before).all(), "belief_map.grid must never be mutated by hazard projection"
+    assert (belief.grid == grid_before).all(), "hazard sensing must never mutate occupancy"
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +247,11 @@ def test_fov_scoring_grid_currently_omits_mapped_obstacle_projection(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# 4. FoV-aware internal scoring grid currently omits hazard projection that
-#    the real runtime grid (case 2) includes.
+# 4. FoV scoring and runtime navigation both keep hazards traversable.
 # ---------------------------------------------------------------------------
 
 
-def test_fov_scoring_grid_currently_omits_hazard_projection(monkeypatch):
+def test_fov_scoring_and_runtime_both_keep_hazard_traversable(monkeypatch):
     belief = _make_belief_all_free()
     robot_xy = (0.5, 5.5)
     hazard_point = (2.5, 5.5)  # directly ahead of the robot, within max_forward_distance
@@ -293,17 +292,9 @@ def test_fov_scoring_grid_currently_omits_hazard_projection(monkeypatch):
     runtime_grid = fake.build_planning_grid_for_robot(fake.robot, obstacle_points=[], robot_radius=ROBOT_RADIUS)
     runtime_cell = runtime_grid.world_to_grid(*hazard_point)
 
-    assert runtime_grid.get_value(runtime_cell) == OG_OCCUPIED, (
-        "sanity: the real runtime planning grid does project the observed hazard"
-    )
+    assert runtime_grid.get_value(runtime_cell) != OG_OCCUPIED
     assert internal_grid.get_value(internal_cell) != OG_OCCUPIED, (
-        "when no planning_grid= is supplied (as here -- a direct select_exploration_goal() "
-        "call, not through engine.py's select_navigation_goal()), FoVAwareDirectionalFrontier"
-        "Planner.select_goal() never reads hazard_service at all, so its fallback scoring "
-        "grid cannot reflect this observed hazard -- unchanged fallback behavior. The REAL "
-        "runtime path (engine.py's select_navigation_goal()) now supplies a "
-        "PlanningCostmapBuilder-backed planning_grid= that DOES project observed hazard -- "
-        "see test_fov_costmap_integration.py for that path's own coverage."
+        "hazard is an information layer and must not become physical occupancy"
     )
 
 

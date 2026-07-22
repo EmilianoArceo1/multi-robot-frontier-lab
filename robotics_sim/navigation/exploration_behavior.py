@@ -408,15 +408,15 @@ class ExplorationBehavior:
         # RobotAgent.invalidate_failed_exploration_route().
         map_signature = len(observation.mapped_obstacle_points)
 
-        # Exploration exhausted: enough consecutive recovery failures have
-        # happened with no new map information since we gave up. Stay in a
-        # stable hold instead of re-running frontier detection every
-        # cooldown cycle forever -- this is what distinguishes "one target
-        # failed, try another" from "nothing reachable remains, stop
-        # asking". exploration_exhausted() itself clears this state (and
-        # lets recovery resume) once map_signature changes.
-        if agent.exploration_exhausted(map_signature=map_signature):
-            return hold(reason="exploration exhausted: no reachable frontier candidates")
+        # Once an exhausted episode has performed one final selection pass
+        # and confirmed that no untried candidate remains, keep a stable
+        # hold until the map changes.  The confirmation flag prevents the
+        # old bug where the fixed failure count stopped selection *before*
+        # that final pass.
+        if agent.exploration_exhaustion_confirmed_empty:
+            if agent.exploration_exhausted(map_signature=map_signature):
+                return hold(reason="exploration exhausted: no reachable frontier candidates")
+            agent.exploration_exhaustion_confirmed_empty = False
 
         # Gate re-selection behind a cooldown so a fully-explored map does
         # not re-run frontier detection every single tick.
@@ -440,6 +440,14 @@ class ExplorationBehavior:
             next_target = self._pick_map_wide_fallback_target(agent, observation, planner_services)
 
         if next_target is None:
+            # Exhaustion is checked only AFTER both exploration planners had
+            # a chance to propose another not-recently-failed target.  A
+            # fixed failure budget must never prevent candidate 4+ from being
+            # attempted merely because the first three routes failed.
+            if agent.exploration_exhausted(map_signature=map_signature):
+                agent.exploration_exhaustion_confirmed_empty = True
+                return hold(reason="exploration exhausted: no reachable frontier candidates")
+
             # Both the configured planner and the map-wide fallback found
             # nothing this cycle -- before treating that as a failure (and
             # counting towards exhaustion), try a small, deterministic
@@ -504,6 +512,7 @@ class ExplorationBehavior:
         # place recovery memory is cleared -- deliberately not on any
         # map_signature change, see recent_recovery_targets above.
         agent.clear_recovery_memory()
+        agent.exploration_exhaustion_confirmed_empty = False
         return request_plan(
             next_target,
             reason="recovered after planner failure; requesting fresh frontier",
@@ -691,6 +700,12 @@ class ExplorationBehavior:
         # for any decision here.
         agent.last_frontier_selection_reason = str(result.reason)
         agent.last_frontier_candidate_count = len(result.candidates)
+        agent.exploration_failure_budget_hint = max(
+            int(agent.exploration_failure_budget_hint), len(result.candidates)
+        )
+        agent.last_frontier_candidates = tuple(result.candidates)
+        agent.last_frontier_selected_target = result.target
+        agent.last_frontier_planner = str(agent.planner_mode)
 
         if not result.success or result.target is None:
             return None
@@ -741,6 +756,12 @@ class ExplorationBehavior:
 
         agent.last_frontier_selection_reason = str(result.reason)
         agent.last_frontier_candidate_count = len(result.candidates)
+        agent.exploration_failure_budget_hint = max(
+            int(agent.exploration_failure_budget_hint), len(result.candidates)
+        )
+        agent.last_frontier_candidates = tuple(result.candidates)
+        agent.last_frontier_selected_target = result.target
+        agent.last_frontier_planner = str(self._MAP_WIDE_FALLBACK_PLANNER)
 
         if not result.success or result.target is None:
             return None

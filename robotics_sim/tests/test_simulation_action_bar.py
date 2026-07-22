@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tempfile
 
+import numpy as np
 import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
@@ -60,6 +61,26 @@ def test_action_bar_buttons_stay_wired_after_theme_toggle(window, monkeypatch):
 
     assert start_calls == [True]
     assert reset_calls == [True]
+
+
+def test_restart_replaces_stale_frontier_bfs_overlay_immediately(window):
+    stale = {
+        "resolution": 1.0,
+        "bounds": (-1.0, 1.0, -1.0, 1.0),
+        "grid": np.zeros((2, 2), dtype=np.int8),
+        "frontier_cells": ((0, 0),),
+        "bfs_steps": np.zeros((2, 2), dtype=np.int32),
+    }
+    window.canvas.set_grid_overlay_snapshot(stale)
+    window.canvas.set_frontier_reasoning_decision({"robot": (0, 0), "frontier": (1, 1)})
+
+    window.restart_simulation()
+
+    fresh = window.canvas._grid_overlay_snapshot
+    assert fresh is not stale
+    assert fresh["frontier_cells"] == ()
+    assert np.all(fresh["bfs_steps"] == -1)
+    assert window.canvas.frontier_reasoning_decision is None
 
 
 def test_action_bar_icons_are_regenerated_per_theme(window):

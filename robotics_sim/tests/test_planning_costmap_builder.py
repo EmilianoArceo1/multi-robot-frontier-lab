@@ -729,20 +729,14 @@ def test_builder_matches_current_runtime_planning_grid_for_same_inputs(case):
         points=tuple(mapped_points), bounds=belief.bounds, resolution=belief.resolution, revision=2,
     )
     policy_kwargs: dict = {"unknown_is_traversable": True, "obstacle_padding": padding}
-    hazard_frame = None
-    hazard_geometry = None
-    if include_hazard:
-        hazard_frame = hazard_service.belief.snapshot()
-        hazard_geometry = hazard_service.belief.geometry
-        policy_kwargs["hazard_block_threshold"] = hazard_service.block_threshold
     policy = PlanningCostmapPolicy(**policy_kwargs)
 
     builder_result = PlanningCostmapBuilder().build(
         exploration=exploration,
         observed_obstacles=observed,
         policy=policy,
-        hazard_belief=hazard_frame,
-        hazard_geometry=hazard_geometry,
+        hazard_belief=None,
+        hazard_geometry=None,
     )
 
     # Equivalence with the runtime is defined by cell data, shape, origin
@@ -765,9 +759,9 @@ def test_builder_matches_current_runtime_planning_grid_for_same_inputs(case):
     )
 
     if include_hazard:
-        assert runtime_grid.get_value(GridCell(hazard_row, hazard_col)) == OG_OCCUPIED
+        assert runtime_grid.get_value(GridCell(hazard_row, hazard_col)) != OG_OCCUPIED
         assert runtime_grid.get_value(GridCell(unobserved_row, unobserved_col)) != OG_OCCUPIED
-        assert builder_result.grid[hazard_row, hazard_col] == COSTMAP_OCCUPIED
+        assert builder_result.grid[hazard_row, hazard_col] != COSTMAP_OCCUPIED
         assert builder_result.grid[unobserved_row, unobserved_col] != COSTMAP_OCCUPIED
 
 

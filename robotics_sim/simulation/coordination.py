@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 from robotics_interfaces import (
+    CoordinationAssignment,
     CoordinationRequest as PluginCoordinationRequest,
     CoordinationResult as PluginCoordinationResult,
     CoordinationServices,
@@ -95,6 +96,7 @@ class CoordinationResult:
     strategy: str
     debug: dict[str, Any] = field(default_factory=dict)
     commands: tuple[RobotCommand, ...] = ()
+    assignments: tuple[CoordinationAssignment, ...] = ()
 
 
 def available_coordinator_options() -> list[str]:
@@ -460,6 +462,7 @@ class MultiRobotCoordinator:
             strategy=result.strategy,
             debug=dict(result.debug),
             commands=tuple(result.commands),
+            assignments=tuple(result.assignments),
         )
 
 

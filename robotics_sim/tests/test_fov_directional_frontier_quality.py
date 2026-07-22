@@ -13,9 +13,12 @@ import pytest
 
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.planning.exploration_planners import (
+    FrontierCandidate,
     FoVAwareDirectionalFrontierPlanner,
+    NearestFrontierPlanner,
     _InternalCandidate,
     _frontier_candidates,
+    _prefer_forward_continuation,
     _sample_frontier_viewpoints,
     _score_candidate,
 )
@@ -67,6 +70,36 @@ def test_connected_frontier_exposes_aligned_and_spatially_diverse_viewpoints():
         "ring, not only one arbitrary centroid representative"
     )
     assert max(item.target[0] for item in viewpoints) - min(item.target[0] for item in viewpoints) >= 4.0
+
+
+def test_fov_clustering_does_not_merge_diagonal_doorway_faces():
+    belief = _belief()
+    belief.mark_free_cell((4, 4))
+    belief.mark_free_cell((5, 5))
+
+    generic = NearestFrontierPlanner().cluster_frontiers(belief)
+    fov = FoVAwareDirectionalFrontierPlanner().cluster_frontiers(belief)
+
+    assert len(generic) == 1
+    assert len(fov) == 2
+
+
+def test_forward_continuation_beats_small_score_advantage_for_a_uturn():
+    behind = FrontierCandidate(
+        target=(-2.0, 0.0), size=10, distance_from_robot=2.0, score=-3.0,
+        reason="kind=frontier", information_gain=30.0, heading_alignment=-0.88,
+    )
+    corridor = FrontierCandidate(
+        target=(2.0, 0.0), size=4, distance_from_robot=2.0, score=-3.8,
+        reason="kind=frontier", information_gain=12.0, heading_alignment=0.95,
+    )
+
+    chosen, overridden = _prefer_forward_continuation(
+        [behind, corridor], score_margin=1.5, min_alignment=0.5,
+    )
+
+    assert overridden is True
+    assert chosen is corridor
 
 
 def test_failed_viewpoint_does_not_exclude_its_entire_frontier_component():

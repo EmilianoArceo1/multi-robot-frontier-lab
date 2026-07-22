@@ -39,6 +39,10 @@ class PlanDebugCapture:
     first_waypoint_world: Point2D | None = None
     unknown_is_traversable: bool | None = None
     start_cell_cleared: bool | None = None
+    total_cost: float | None = None
+    expanded_nodes: int | None = None
+    goal_cell: GridCell | None = None
+    grid_resolution: float | None = None
 
 
 @dataclass

@@ -150,8 +150,7 @@ def test_recovery_stops_after_repeated_no_path_failures_without_new_map_informat
 
     assert agent.consecutive_exploration_failures == RobotAgent._EXPLORATION_FAILURE_BUDGET
 
-    # The failure budget is now exhausted: the very next tick must NOT ask
-    # the frontier planner again.
+    # Reaching the old fixed budget must not suppress an untried candidate.
     t += behavior._FAILURE_RETRY_COOLDOWN + 0.1
     fake_services = _FakePlannerServices(target=(4.0, 4.0))
     observation = _make_observation(
@@ -159,9 +158,23 @@ def test_recovery_stops_after_repeated_no_path_failures_without_new_map_informat
     )
     decision = behavior.update(agent, observation, fake_services)
 
+    assert decision.kind == "REQUEST_PLAN"
+    assert decision.target == (4.0, 4.0)
+    assert len(fake_services.calls) == 1
+
+    agent.set_exploration_target((4.0, 4.0), reason="probe after precheck failures")
+    agent.invalidate_failed_exploration_route(
+        reason="planner failed: no path found", current_time=t, map_signature=len(map_points)
+    )
+    t += behavior._FAILURE_RETRY_COOLDOWN + 0.1
+    empty_services = _FakePlannerServices(target=None)
+    observation = _make_observation(
+        robot_xy=agent.position, current_time=t, mapped_obstacle_points=list(map_points),
+    )
+    decision = behavior.update(agent, observation, empty_services)
     assert decision.kind == "HOLD"
     assert decision.reason == "exploration exhausted: no reachable frontier candidates"
-    assert len(fake_services.calls) == 0, "must not call the frontier planner while exhausted"
+    calls_after_confirmation = len(empty_services.calls)
 
     # And it must stay exhausted indefinitely -- not just for one tick --
     # across many more cooldown cycles, as long as the map does not change.
@@ -170,13 +183,11 @@ def test_recovery_stops_after_repeated_no_path_failures_without_new_map_informat
         observation = _make_observation(
             robot_xy=agent.position, current_time=t, mapped_obstacle_points=list(map_points),
         )
-        decision = behavior.update(agent, observation, fake_services)
+        decision = behavior.update(agent, observation, empty_services)
         assert decision.kind == "HOLD"
         assert decision.reason == "exploration exhausted: no reachable frontier candidates"
 
-    assert len(fake_services.calls) == 0, (
-        "the frontier planner must never be called again while exhausted and the map is unchanged"
-    )
+    assert len(empty_services.calls) == calls_after_confirmation
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +257,7 @@ def test_exploration_recovery_resumes_after_new_map_information():
     # end state of test 1's failure loop, but without repeating it here).
     for _ in range(RobotAgent._EXPLORATION_FAILURE_BUDGET):
         agent.register_exploration_failure(map_signature=len(old_map_points))
+    agent.exploration_exhaustion_confirmed_empty = True
     assert agent.exploration_exhausted(map_signature=len(old_map_points))
 
     # While the map is unchanged, recovery stays exhausted -- no REQUEST_PLAN.

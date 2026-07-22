@@ -504,9 +504,9 @@ class PlanningCostmapBuilder:
             ("observed_obstacles", observed_obstacles.revision),
         ]
 
-        # 4. observed hazard projection -- only ever observed cells, never
-        #    ground truth. Applied last, matching build_planning_grid_for_
-        #    robot()'s current composition order.
+        # Optional legacy projection retained for explicit offline/debug
+        # callers. The live aerial-robot runtime never supplies hazard_belief:
+        # fire is traversable information there, not physical occupancy.
         if hazard_belief is not None:
             if policy.hazard_block_threshold is None:
                 raise ValueError(

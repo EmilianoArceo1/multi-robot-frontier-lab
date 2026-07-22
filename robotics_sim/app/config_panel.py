@@ -258,6 +258,7 @@ def build_config_panel(window):
     options_card = SectionCard("options", "Simulation Options")
 
     options_grid = QGridLayout()
+    window.simulation_options_grid = options_grid
     options_grid.setHorizontalSpacing(10)
     options_grid.setVerticalSpacing(9)
 
@@ -356,8 +357,12 @@ def build_config_panel(window):
         1,
         2,
     )
+    window.vision_model_field = labeled_combo(
+        "Vision Model",
+        window.vision_combo,
+    )
     options_grid.addWidget(
-        labeled_combo("Vision Model", window.vision_combo),
+        window.vision_model_field,
         5,
         0,
         1,
@@ -369,7 +374,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        5,
+        6,
         0,
         1,
         2,
@@ -381,7 +386,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.exploration_planner_field,
-        6,
+        7,
         0,
         1,
         2,
@@ -393,7 +398,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        7,
+        8,
         0,
         1,
         2,
@@ -409,7 +414,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        8,
+        9,
         0,
         1,
         2,
@@ -425,7 +430,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        8,
+        9,
         0,
         1,
         2,
@@ -447,7 +452,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        9,
+        10,
         0,
         1,
         2,
@@ -463,8 +468,26 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        10,
+        11,
         0,
+    )
+    window.grid_cell_values_toggle = ToggleSwitch(False)
+    window.frontier_decisions_toggle = ToggleSwitch(False)
+    window.grid_cell_values_toggle.setToolTip(
+        "Show occupancy values: -1 unknown, 0 discovered/free, 1 occupied."
+    )
+    window.frontier_decisions_toggle.setToolTip(
+        "Show BFS levels from the selected robot and highlight frontier cells as F:level."
+    )
+    options_grid.addWidget(
+        labeled_toggle("Cell Values", window.grid_cell_values_toggle),
+        12,
+        0,
+    )
+    options_grid.addWidget(
+        labeled_toggle("Frontier Decisions", window.frontier_decisions_toggle),
+        12,
+        1,
     )
 
     # "Hazard Map" / "Fire Markers" are two independent rendering-only
@@ -484,7 +507,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Hazard Map", window.hazard_map_toggle),
-        10,
+        11,
         1,
     )
     window.fire_markers_toggle = ToggleSwitch(False)
@@ -493,8 +516,17 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Fire Markers", window.fire_markers_toggle),
-        11,
+        13,
         0,
+    )
+    window.cursor_coordinates_toggle = ToggleSwitch(True)
+    window.cursor_coordinates_toggle.setToolTip(
+        "Show the world (x, y) coordinate beside the mouse over the map."
+    )
+    options_grid.addWidget(
+        labeled_toggle("Mouse Coordinates", window.cursor_coordinates_toggle),
+        13,
+        1,
     )
 
     # "Navigation Debug" is controlled solely by the Navigation switch in
@@ -831,8 +863,11 @@ def build_config_panel(window):
     window.safety_radius_slider.valueChanged.connect(window.enforce_radius_consistency)
     window.grid_resolution_input.valueChanged.connect(window.on_grid_resolution_control_changed)
     window.grid_overlay_toggle.toggled.connect(window.on_grid_overlay_toggled)
+    window.grid_cell_values_toggle.toggled.connect(window.on_grid_cell_values_toggled)
+    window.frontier_decisions_toggle.toggled.connect(window.on_frontier_decisions_toggled)
     window.hazard_map_toggle.toggled.connect(window.on_hazard_map_toggled)
     window.fire_markers_toggle.toggled.connect(window.on_fire_markers_toggled)
+    window.cursor_coordinates_toggle.toggled.connect(window.on_cursor_coordinates_toggled)
     window.top_bar.mode_selector.currentTextChanged.connect(window.on_agent_mode_changed)
     window.robot_count_input.valueChanged.connect(window.on_robot_count_changed)
     window.same_config_switch.toggled.connect(window.on_same_config_toggled)

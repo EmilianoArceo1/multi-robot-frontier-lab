@@ -21,7 +21,7 @@ Compatibility:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Iterable, Mapping
 
@@ -59,6 +59,9 @@ class FrontierCandidate:
     score: float
     reason: str
     information_gain: float = 0.0
+    cluster_points: tuple[tuple[float, float], ...] = ()
+    cluster_resolution: float = 0.0
+    heading_alignment: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,30 @@ def _cluster_frontiers(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]
     return clusters
 
 
+def _cluster_frontiers4(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Four-connected frontier components for viewpoint-sensitive planners.
+
+    Diagonal contact often joins two different doorway/wall faces under
+    eight-connectivity.  FoV should evaluate those openings independently.
+    """
+    remaining = set(cells)
+    clusters: list[list[tuple[int, int]]] = []
+    while remaining:
+        start = remaining.pop()
+        queue: deque[tuple[int, int]] = deque([start])
+        cluster = [start]
+        while queue:
+            cell = queue.popleft()
+            for neighbor in _neighbors4(cell):
+                if neighbor not in remaining:
+                    continue
+                remaining.remove(neighbor)
+                queue.append(neighbor)
+                cluster.append(neighbor)
+        clusters.append(cluster)
+    return clusters
+
+
 def _candidate_from_cluster(belief: BeliefMap, cluster: list[tuple[int, int]]) -> _InternalCandidate | None:
     if not cluster:
         return None
@@ -315,10 +342,15 @@ def _frontier_candidates(
     viewpoints_per_cluster: int = 1,
     robot_xy: tuple[float, float] | None = None,
     robot_heading: float = 0.0,
+    clusters: list[list[tuple[int, int]]] | None = None,
 ) -> list[_InternalCandidate]:
     candidates: list[_InternalCandidate] = []
 
-    for cluster in _cluster_frontiers(_frontier_cells(belief)):
+    frontier_clusters = clusters
+    if frontier_clusters is None:
+        frontier_clusters = _cluster_frontiers(_frontier_cells(belief))
+
+    for cluster in frontier_clusters:
         candidate = _candidate_from_cluster(belief, cluster)
         if candidate is None:
             continue
@@ -866,13 +898,14 @@ def _score_candidate(
 
     reason = (
         f"kind={candidate.kind}, size={candidate.size}, "
-        f"info={info:.0f}, novelty={novelty:.2f}, terminal_info={terminal_info:.0f}, "
-        f"info_utility={information_utility:.2f}, "
-        f"fov_repeat={fov_repeat:.2f}, path_repeat={path_repeat:.2f}, "
-        f"length={result.total_cost:.2f}, turn={turn_norm:.2f}, "
-        f"align={align:.2f}, detour={detour_penalty:.2f}, "
-        f"backtrack={backtrack_penalty:.2f}, switch={switch_penalty:.0f}, "
-        f"multi={multi_penalty:.2f}, score={score:.3f}"
+        f"info={info:.0f}, novelty={novelty:.6f}, terminal_info={terminal_info:.0f}, "
+        f"info_utility={information_utility:.6f}, "
+        f"frontier_norm={frontier_norm:.6f}, "
+        f"fov_repeat={fov_repeat:.6f}, path_repeat={path_repeat:.6f}, "
+        f"length={result.total_cost:.6f}, length_norm={length_norm:.6f}, turn={turn_norm:.6f}, "
+        f"align={align:.6f}, detour={detour_penalty:.6f}, "
+        f"backtrack={backtrack_penalty:.6f}, switch={switch_penalty:.0f}, "
+        f"multi={multi_penalty:.6f}, score={score:.6f}"
     )
 
     return FrontierCandidate(
@@ -882,11 +915,34 @@ def _score_candidate(
         score=float(score),
         reason=reason,
         information_gain=info,
+        cluster_points=tuple(belief.cell_to_world(cell) for cell in candidate.cluster_cells),
+        cluster_resolution=float(belief.resolution),
+        heading_alignment=float(align),
     )
+
+
+def _prefer_forward_continuation(
+    candidates: list[FrontierCandidate],
+    *,
+    score_margin: float,
+    min_alignment: float,
+) -> tuple[FrontierCandidate, bool]:
+    """Avoid an unnecessary U-turn when a useful forward option is close."""
+    best = max(candidates, key=lambda item: item.score)
+    forward = [
+        item for item in candidates
+        if item.heading_alignment >= min_alignment and item.information_gain > 0.0
+    ]
+    if best.heading_alignment < 0.0 and forward:
+        best_forward = max(forward, key=lambda item: item.score)
+        if best_forward.score >= best.score - score_margin:
+            return best_forward, True
+    return best, False
 
 
 class BaseExplorationPlanner:
     name = "Base"
+    uses_frontier_clustering = False
 
     def select_goal(self, **kwargs) -> ExplorationPlannerResult:
         raise NotImplementedError
@@ -967,6 +1023,7 @@ class Nav2DNearestFrontierPlanner(BaseExplorationPlanner):
         checked = 0
         rejected = 0
         candidates: list[FrontierCandidate] = []
+        probe_candidate: FrontierCandidate | None = None
 
         while queue:
             row, col = queue.popleft()
@@ -1009,6 +1066,8 @@ class Nav2DNearestFrontierPlanner(BaseExplorationPlanner):
                     reason=f"wavefront_distance={path_distance:.2f} m",
                 )
                 candidates.append(candidate)
+                if not blocked and probe_candidate is None:
+                    probe_candidate = candidate
                 if not blocked and reachable:
                     return ExplorationPlannerResult(
                         True,
@@ -1033,6 +1092,18 @@ class Nav2DNearestFrontierPlanner(BaseExplorationPlanner):
                 distance_steps[neighbor] = distance_steps[cell] + 1
                 queue.append(neighbor)
 
+        if probe_candidate is not None:
+            return ExplorationPlannerResult(
+                True,
+                probe_candidate.target,
+                (
+                    f"{self.name}: all frontier cells failed the navigation reachability "
+                    f"precheck; probing first wavefront candidate; checked={checked}, "
+                    f"rejected={rejected}"
+                ),
+                tuple(candidates),
+            )
+
         return ExplorationPlannerResult(
             False,
             None,
@@ -1046,6 +1117,15 @@ class Nav2DNearestFrontierPlanner(BaseExplorationPlanner):
 
 class FrontierExplorationPlanner(BaseExplorationPlanner):
     name = "Frontier"
+    uses_frontier_clustering = True
+
+    def cluster_frontiers(self, belief: BeliefMap) -> list[list[tuple[int, int]]]:
+        """Build this planner's groups from the shared frontier-cell detector.
+
+        Subclasses can override this independently.  Eight-connected
+        components remain the default to preserve existing planner results.
+        """
+        return _cluster_frontiers(_frontier_cells(belief))
 
     def frontier_candidates(self, **kwargs) -> list[FrontierCandidate]:
         belief = _belief_from_kwargs(kwargs)
@@ -1072,6 +1152,7 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
             target_exclusion_radius=target_exclusion_radius,
             robot_radius=robot_radius,
             dynamic_obstacle_margin=dynamic_obstacle_margin,
+            clusters=self.cluster_frontiers(belief),
         )
 
         candidates: list[FrontierCandidate] = []
@@ -1099,9 +1180,12 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
                     score=score,
                     reason=(
                         f"frontier size={item.size}, info_gain={info:.1f}, "
-                        f"distance={distance_from_robot:.2f}, score={score:.2f}"
+                        f"distance={distance_from_robot:.2f}, "
+                        f"goal_distance={distance_to_goal:.2f}, score={score:.2f}"
                     ),
                     information_gain=info,
+                    cluster_points=tuple(belief.cell_to_world(cell) for cell in item.cluster_cells),
+                    cluster_resolution=float(belief.resolution),
                 )
             )
 
@@ -1159,27 +1243,45 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
 
         if callable(is_candidate_reachable):
             reachable_candidates: list[FrontierCandidate] = []
+            annotated_candidates: list[FrontierCandidate] = []
             for item in candidates:
                 try:
-                    reachable = bool(is_candidate_reachable(item.target))
+                    reachability = is_candidate_reachable(item.target)
+                    reachable = bool(reachability)
+                    reachability_reason = str(getattr(reachability, "reason", ""))
                 except Exception:
                     # A broken reachability callback must not take down
                     # exploration -- treat it as "unknown, assume reachable".
                     reachable = True
+                    reachability_reason = "reachability callback failed; assumed reachable"
+                annotated = replace(
+                    item,
+                    reason=(
+                        f"{item.reason}, reachability={'reachable' if reachable else 'rejected'}, "
+                        f"reachability_reason={reachability_reason or 'not reported'}"
+                    ),
+                )
+                annotated_candidates.append(annotated)
                 if reachable:
-                    reachable_candidates.append(item)
+                    reachable_candidates.append(annotated)
                 else:
                     filtered_unreachable += 1
+            candidates_public = tuple(annotated_candidates)
         else:
             reachable_candidates = candidates
 
         if not reachable_candidates:
+            # A precheck is advisory, not authority over exploration.  Return
+            # the planner's own best candidate so the normal route pipeline
+            # performs one explicit attempt; a real failure then blacklists
+            # this target and the next ranked candidate is tried.
+            chosen = self.choose_candidate(candidates)
             return ExplorationPlannerResult(
-                False,
-                None,
+                True,
+                chosen.target,
                 (
-                    f"{self.name}: no reachable frontier candidates: all {len(candidates)} "
-                    f"candidate(s) were rejected by the navigation reachability check; "
+                    f"{self.name}: all {len(candidates)} candidates failed the navigation "
+                    f"reachability precheck; probing planner-ranked candidate {chosen.target}; "
                     f"generated={len(candidates)}, filtered_unreachable={filtered_unreachable}"
                 ),
                 candidates_public,
@@ -1249,6 +1351,11 @@ class InformativeFrontierPlanner(FrontierExplorationPlanner):
 
 class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
     name = "FoV-aware directional frontier"
+    uses_frontier_clustering = True
+
+    def cluster_frontiers(self, belief: BeliefMap) -> list[list[tuple[int, int]]]:
+        """Keep diagonally touching doorway/wall faces as separate options."""
+        return _cluster_frontiers4(_frontier_cells(belief))
 
     def select_goal(self, **kwargs) -> ExplorationPlannerResult:
         belief = _belief_from_kwargs(kwargs)
@@ -1290,6 +1397,8 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         }
 
         hysteresis_margin = float(kwargs.get("hysteresis_margin", 0.15))
+        forward_continuation_margin = float(kwargs.get("forward_continuation_margin", 1.5))
+        min_forward_alignment = float(kwargs.get("min_forward_alignment", 0.5))
         min_current_information_gain = float(kwargs.get("min_current_information_gain", 1.0))
         max_candidates = max(1, int(kwargs.get("max_fov_candidates", 32)))
         viewpoints_per_cluster = max(1, int(kwargs.get("max_frontier_viewpoints_per_cluster", 5)))
@@ -1305,6 +1414,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             viewpoints_per_cluster=viewpoints_per_cluster,
             robot_xy=robot_xy,
             robot_heading=robot_heading,
+            clusters=self.cluster_frontiers(belief),
         )
 
         forward = _forward_candidate(
@@ -1412,17 +1522,30 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
 
         if callable(is_candidate_reachable):
             reachable_scored: list[FrontierCandidate] = []
+            annotated_scored: list[FrontierCandidate] = []
             for item in scored:
                 try:
-                    reachable = bool(is_candidate_reachable(item.target))
+                    reachability = is_candidate_reachable(item.target)
+                    reachable = bool(reachability)
+                    reachability_reason = str(getattr(reachability, "reason", ""))
                 except Exception:
                     # A broken reachability callback must not take down
                     # exploration -- treat it as "unknown, assume reachable".
                     reachable = True
+                    reachability_reason = "reachability callback failed; assumed reachable"
+                annotated = replace(
+                    item,
+                    reason=(
+                        f"{item.reason}, reachability={'reachable' if reachable else 'rejected'}, "
+                        f"reachability_reason={reachability_reason or 'not reported'}"
+                    ),
+                )
+                annotated_scored.append(annotated)
                 if reachable:
-                    reachable_scored.append(item)
+                    reachable_scored.append(annotated)
                 else:
                     filtered_unreachable += 1
+            candidates_public = tuple(sorted(annotated_scored, key=lambda item: item.score, reverse=True))
         else:
             reachable_scored = scored
 
@@ -1432,18 +1555,28 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         )
 
         if not reachable_scored:
+            chosen, directional_probe = _prefer_forward_continuation(
+                scored,
+                score_margin=forward_continuation_margin,
+                min_alignment=min_forward_alignment,
+            )
             return ExplorationPlannerResult(
-                False,
-                None,
+                True,
+                chosen.target,
                 (
-                    f"{self.name}: no reachable frontier candidates: all {len(scored)} "
-                    f"scored candidate(s) were rejected by the navigation reachability "
-                    f"check; {debug_counts}"
+                    f"{self.name}: all {len(scored)} candidates failed the navigation "
+                    f"reachability precheck; probing "
+                    f"{'forward-continuation' if directional_probe else 'best FoV-ranked'} candidate; "
+                    f"{chosen.reason}; {debug_counts}, selected={chosen.target}"
                 ),
                 candidates_public,
             )
 
-        best = max(reachable_scored, key=lambda item: item.score)
+        best, directional_override = _prefer_forward_continuation(
+            reachable_scored,
+            score_margin=forward_continuation_margin,
+            min_alignment=min_forward_alignment,
+        )
         current_scored = None
 
         for item in reachable_scored:
@@ -1460,7 +1593,10 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             prefix = "kept current target by hysteresis"
         else:
             chosen = best
-            prefix = "selected best FoV-aware target"
+            prefix = (
+                "selected forward-continuation target instead of avoidable backtrack"
+                if directional_override else "selected best FoV-aware target"
+            )
 
         return ExplorationPlannerResult(
             True,

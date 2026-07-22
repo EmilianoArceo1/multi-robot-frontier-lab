@@ -226,9 +226,11 @@ class RobotAgent:
     # letting ExplorationBehavior keep retrying frontier selection every
     # cooldown cycle forever.
     consecutive_exploration_failures: int = 0
+    exploration_failure_budget_hint: int = 3
     # Map signature (e.g. mapped-obstacle-point count) recorded at the
     # moment exploration became exhausted. None means "not exhausted".
     exploration_exhausted_map_signature: int | None = None
+    exploration_exhaustion_confirmed_empty: bool = False
 
     # Diagnostics only -- read by engine.py to log an [EXHAUSTION_DIAG]
     # line at the moment exploration_exhausted() actually fires, without
@@ -236,6 +238,9 @@ class RobotAgent:
     # needing new fields. Never used for any decision logic.
     last_frontier_selection_reason: str = ""
     last_frontier_candidate_count: int = 0
+    last_frontier_candidates: tuple[object, ...] = ()
+    last_frontier_selected_target: tuple[float, float] | None = None
+    last_frontier_planner: str = ""
     last_map_wide_fallback_attempted: bool = False
 
     _FAILED_TARGET_RETENTION_S: ClassVar[float] = 60.0
@@ -511,7 +516,8 @@ class RobotAgent:
         Returns the updated consecutive-failure count.
         """
         self.consecutive_exploration_failures += 1
-        if self.consecutive_exploration_failures >= self._EXPLORATION_FAILURE_BUDGET:
+        budget = max(self._EXPLORATION_FAILURE_BUDGET, int(self.exploration_failure_budget_hint))
+        if self.consecutive_exploration_failures >= budget:
             self.exploration_exhausted_map_signature = int(map_signature)
         return self.consecutive_exploration_failures
 
@@ -714,7 +720,9 @@ class RobotAgent:
         # again, so the consecutive-failure/exhaustion state no longer
         # applies.
         self.consecutive_exploration_failures = 0
+        self.exploration_failure_budget_hint = self._EXPLORATION_FAILURE_BUDGET
         self.exploration_exhausted_map_signature = None
+        self.exploration_exhaustion_confirmed_empty = False
 
     def clear_if_planning_failed(self, reason: str) -> None:
         self.last_plan_reason = reason
@@ -825,7 +833,9 @@ class RobotAgent:
         self.status = "moving"
         self.prefetch_success_count += 1
         self.consecutive_exploration_failures = 0
+        self.exploration_failure_budget_hint = self._EXPLORATION_FAILURE_BUDGET
         self.exploration_exhausted_map_signature = None
+        self.exploration_exhaustion_confirmed_empty = False
         return waypoints
 
     def reject_pending_path(self, reason: str = "") -> None:

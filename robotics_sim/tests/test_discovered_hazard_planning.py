@@ -265,7 +265,7 @@ def test_repeating_identical_observation_does_not_request_replan():
     fake.robot.set_waypoints([(9.5, 9.5)])  # crosses (5.5, 5.5)
     polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
     fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
-    assert len(fake.replan_calls) == 1  # sanity: the first observation does trigger
+    assert fake.replan_calls == []
     fake.replan_calls.clear()
 
     fake.update_explored_free_points_from_polygon(polygon, robot_index=0)  # identical repeat
@@ -280,7 +280,7 @@ def test_second_robot_attributing_an_already_blocked_cell_does_not_request_secon
     fake.robot.set_waypoints([(9.5, 9.5)])
     polygon = _square_polygon(4.0, 4.0, 7.0, 7.0)
     fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
-    assert len(fake.replan_calls) == 1
+    assert fake.replan_calls == []
     fake.replan_calls.clear()
 
     fake.update_explored_free_points_from_polygon(polygon, robot_index=1)  # same cells, robot 1
@@ -294,7 +294,7 @@ def test_second_robot_attributing_an_already_blocked_cell_does_not_request_secon
 # ---------------------------------------------------------------------------
 
 
-def test_first_observation_crossing_threshold_triggers_route_review():
+def test_first_observation_crossing_threshold_does_not_replan_aerial_route():
     fake = _build_fake_engine()
     fake.hazard_service.add_fire((5.5, 5.5))
     fake.robot.set_waypoints([(9.5, 9.5)])  # diagonal route passes through (5.5, 5.5)
@@ -302,7 +302,7 @@ def test_first_observation_crossing_threshold_triggers_route_review():
 
     fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
 
-    assert fake.replan_calls == ["Dynamic fire hazard affects current route."]
+    assert fake.replan_calls == []
 
 
 def test_route_not_crossing_observed_hazard_is_not_modified():
@@ -316,10 +316,7 @@ def test_route_not_crossing_observed_hazard_is_not_modified():
     assert fake.replan_calls == []
 
 
-def test_route_crossing_observed_hazard_enters_existing_repair_flow():
-    """The existing repair algorithm (invalidate_pending_path() + replan_
-    after_new_information()) actually runs, driven by observed_blocked_
-    world_points() -- not a reimplementation."""
+def test_route_crossing_observed_hazard_keeps_existing_route_and_prefetch():
     fake = _build_fake_engine()
     fake.hazard_service.add_fire((5.5, 5.5))
     fake.agent.mark_pending_path_requested((3.0, 3.0))
@@ -329,8 +326,8 @@ def test_route_crossing_observed_hazard_enters_existing_repair_flow():
 
     fake.update_explored_free_points_from_polygon(polygon, robot_index=0)
 
-    assert fake.agent.pending_path is None  # existing repair flow discarded the stale prefetch
-    assert fake.replan_calls == ["Dynamic fire hazard affects current route."]
+    assert fake.agent.pending_path == [(2.0, 2.0), (3.0, 3.0)]
+    assert fake.replan_calls == []
 
 
 # ---------------------------------------------------------------------------

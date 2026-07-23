@@ -24,6 +24,16 @@ from robotics_sim.learning.observation_batch import (
     ActorObservationBatchAssembler,
     build_candidate_id,
 )
+from robotics_sim.learning.action_catalog import (
+    ActionCatalogAssembler,
+    ActionCatalogBatch,
+    ActionOption,
+    RobotActionCatalog,
+)
+from robotics_sim.learning.decision_batch import (
+    DecisionCaptureAssembler,
+    DecisionCaptureBatch,
+)
 from robotics_sim.learning.builders import (
     ActorObservationBuilder,
     BuilderError,
@@ -63,6 +73,9 @@ from robotics_sim.learning.recorder import (
 )
 
 __all__ = [
+    "ActionCatalogAssembler",
+    "ActionCatalogBatch",
+    "ActionOption",
     "ActorObservationBatch",
     "ActorObservationBatchAssembler",
     "ActorObservationBuildInput",
@@ -76,6 +89,8 @@ __all__ = [
     "ContractBundleHashMismatchError",
     "CriticStateBuildInput",
     "CriticStateBuilder",
+    "DecisionCaptureAssembler",
+    "DecisionCaptureBatch",
     "DuplicateCandidateIdError",
     "EpisodeIdMismatchError",
     "EpisodeRecord",
@@ -90,6 +105,7 @@ __all__ = [
     "RecorderError",
     "RecorderStateError",
     "ROBOT_FEATURE_NAMES_V0",
+    "RobotActionCatalog",
     "RobotActorCaptureInput",
     "RobotFeatureExtractionInput",
     "RobotFeatureExtractor",

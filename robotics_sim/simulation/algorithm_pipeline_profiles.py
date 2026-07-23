@@ -15,6 +15,7 @@ CQLITE_TASK_ASSIGNMENT = (
     "Travel-time Voronoi + CQLite distributed Q-learning"
 )
 HUNGARIAN_TASK_ASSIGNMENT = "Frontier cluster Hungarian coordinator"
+MARVEL_TASK_ASSIGNMENT = "MARVEL CTDE graph-attention policy"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,17 @@ _PROFILES = {
         explanation=(
             "The Hungarian task allocator consumes the cited two-stage "
             "GriT-DBSCAN frontier clusters."
+        ),
+    ),
+    MARVEL_TASK_ASSIGNMENT: TaskAssignmentPipelineProfile(
+        clustering_algorithm=NO_CLUSTERING_ALGORITHM,
+        lock_clustering=True,
+        frontier_detector=None,
+        lock_frontier_detector=True,
+        explanation=(
+            "MARVEL generates a sampled viewpoint graph and encodes frontier "
+            "distributions internally; it does not use a separate clustering "
+            "or host frontier-detector stage."
         ),
     ),
 }

@@ -121,6 +121,7 @@ TASK_ASSIGN_ALGORITHM_OPTIONS = tuple(
     if option in {
         "Frontier cluster Hungarian coordinator",
         "Travel-time Voronoi + CQLite distributed Q-learning",
+        "MARVEL CTDE graph-attention policy",
     }
 )
 from robotics_sim.simulation.algorithm_pipeline_profiles import (

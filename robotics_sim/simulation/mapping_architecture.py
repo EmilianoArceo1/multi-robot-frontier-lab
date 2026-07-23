@@ -27,6 +27,16 @@ _DECENTRALIZED_TASK_ASSIGNERS = frozenset(
 
 
 def architecture_for_task_assignment(name: str) -> MappingArchitecture:
+    # Import locally to keep the low-level map store independent during module
+    # initialization while allowing UI/runtime taxonomy to be extended by
+    # adding a paper profile.
+    from robotics_sim.simulation.approach_profiles import (
+        approach_profile_for_task_assignment,
+    )
+
+    profile = approach_profile_for_task_assignment(name)
+    if profile is not None:
+        return profile.mapping_architecture
     if str(name) in _DECENTRALIZED_TASK_ASSIGNERS:
         return MappingArchitecture.DECENTRALIZED_SLAM
     return MappingArchitecture.CENTRALIZED

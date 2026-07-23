@@ -470,16 +470,31 @@ class HeroHeader(QWidget):
 
     def __init__(self, image_path: str | None = None):
         super().__init__()
-        self.setFixedHeight(142)
+        self.setFixedHeight(184)
 
         self.image_path = image_path
         self.pixmap = QPixmap(image_path) if image_path else QPixmap()
         self._architecture_label = ""
         self._architecture_color = QColor("#2563A6")
+        self._approach_badges: tuple[tuple[str, str, QColor], ...] = ()
 
     def set_architecture_badge(self, label: str, *, decentralized: bool) -> None:
         self._architecture_label = str(label)
         self._architecture_color = QColor("#6D3AA8" if decentralized else "#2563A6")
+        self.update()
+
+    def set_approach_profile(
+        self,
+        architecture_label: str,
+        architecture_color: str,
+        badges,
+    ) -> None:
+        self._architecture_label = str(architecture_label)
+        self._architecture_color = QColor(str(architecture_color))
+        self._approach_badges = tuple(
+            (str(badge.category), str(badge.label), QColor(str(badge.color)))
+            for badge in badges
+        )
         self.update()
 
 
@@ -635,6 +650,38 @@ class HeroHeader(QWidget):
                 Qt.AlignVCenter | Qt.AlignLeft,
                 self._architecture_label,
             )
+
+        if self._approach_badges:
+            gap = 6.0
+            left = 22.0
+            total_width = self.width() - 44.0
+            badge_width = (total_width - gap * 2.0) / 3.0
+            for index, (category, label, color) in enumerate(
+                self._approach_badges
+            ):
+                approach_rect = QRectF(
+                    left + index * (badge_width + gap),
+                    140,
+                    badge_width,
+                    34,
+                )
+                approach_path = QPainterPath()
+                approach_path.addRoundedRect(approach_rect, 12, 12)
+                painter.fillPath(approach_path, color)
+                painter.setFont(QFont("Segoe UI", 6, QFont.Bold))
+                painter.setPen(QPen(QColor(255, 255, 255, 190)))
+                painter.drawText(
+                    approach_rect.adjusted(8, 2, -6, -17),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    category.upper(),
+                )
+                painter.setFont(badge_font)
+                painter.setPen(QPen(QColor("white")))
+                painter.drawText(
+                    approach_rect.adjusted(8, 14, -6, -2),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    label,
+                )
 
         painter.restore()
 

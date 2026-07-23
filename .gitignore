@@ -40,6 +40,7 @@ temp/
 # Local secrets/config
 .env
 .env.*
+!.env.example
 secrets/
 *.secret
 
@@ -48,6 +49,10 @@ secrets/
 *.avi
 *.mov
 *.gif
+
+# Paper model checkpoints (keep only the documented placeholder)
+algorithms/marvel/weights/*
+!algorithms/marvel/weights/.gitkeep
 
 # Temporary scripts
 tmp_*.py

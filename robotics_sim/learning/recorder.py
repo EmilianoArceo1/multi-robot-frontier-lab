@@ -3,6 +3,16 @@
 Memory only: no filesystem, no NPZ/Parquet/JSON, no numpy/pandas.  Actual
 export is a future, separate concern configured by TrajectoryExportSpec.
 
+decision_step is an episode-global identifier (see
+robotics_sim.learning.decision_steps.EpisodeDecisionStepAllocator), not an
+arrival-order counter: append() accepts transitions in any order, as long
+as each decision_step is used at most once per episode.  The real
+multi-robot runtime is asynchronous, so a decision assigned a later step
+can close before one assigned an earlier step -- this recorder no longer
+assumes otherwise.  finish_episode() is what imposes a deterministic order:
+its output is always sorted ascending by decision_step, regardless of the
+order append() was called in.
+
 Ground truth is stored *next to* -- never inside -- the transitions, in a
 separate per-step block, preserving the privileged-information boundary.
 """
@@ -34,8 +44,14 @@ class EpisodeIdMismatchError(RecorderError):
     """A transition's episode_id does not match the active episode."""
 
 
-class NonMonotonicDecisionStepError(RecorderError):
-    """decision_step is not strictly increasing within the episode."""
+class DuplicateDecisionStepError(RecorderError):
+    """A second transition arrived for a decision_step already recorded in
+    this episode.
+
+    decision_step values must be unique per episode; unlike the retired
+    monotonic rule, arrival order is unconstrained -- a smaller step
+    arriving after a larger one is valid, only a repeated step is not.
+    """
 
 
 class ContractBundleHashMismatchError(RecorderError):
@@ -73,8 +89,10 @@ def _assert_no_ground_truth_inside(transition: LearningTransition) -> None:
 class EpisodeRecord:
     """Immutable result of one recorded episode.
 
-    ``ground_truth_by_step`` is a separate block keyed by decision_step; it
-    is never embedded in the transitions.
+    ``transitions`` and ``ground_truth_by_step`` are both sorted ascending
+    by decision_step -- deterministic regardless of the order append() was
+    called in.  ``ground_truth_by_step`` is a separate block keyed by
+    decision_step; it is never embedded in the transitions.
     """
 
     metadata: EpisodeMetadata
@@ -92,6 +110,11 @@ class EpisodeRecord:
 class InMemoryTrajectoryRecorder:
     """Records exactly one episode at a time, entirely in memory.
 
+    append() accepts decision_step values in any order; only a repeated
+    step within the same episode is rejected (DuplicateDecisionStepError).
+    finish_episode() is the single point that imposes order, sorting its
+    output ascending by decision_step regardless of arrival order.
+
     The recorder never mutates the frozen objects it receives and exposes
     no filesystem paths anywhere in its API.
     """
@@ -99,6 +122,7 @@ class InMemoryTrajectoryRecorder:
     def __init__(self) -> None:
         self._metadata: EpisodeMetadata | None = None
         self._transitions: list[LearningTransition] = []
+        self._used_steps: set[int] = set()
         self._ground_truth_by_step: dict[int, GroundTruthSnapshot] = {}
         self._fire_metrics: EpisodeFireMetrics | None = None
 
@@ -139,13 +163,12 @@ class InMemoryTrajectoryRecorder:
                 f"transition.episode_id {transition.episode_id!r} does not match active "
                 f"episode {self._metadata.episode_id!r}"
             )
-        if self._transitions:
-            last_step = self._transitions[-1].decision_step
-            if transition.decision_step <= last_step:
-                raise NonMonotonicDecisionStepError(
-                    f"decision_step must be strictly increasing: got "
-                    f"{transition.decision_step} after {last_step}"
-                )
+        if transition.decision_step in self._used_steps:
+            raise DuplicateDecisionStepError(
+                f"decision_step {transition.decision_step} was already recorded for this "
+                f"episode; each decision_step must be unique, but arrival order is "
+                f"unconstrained"
+            )
         _assert_no_ground_truth_inside(transition)
         if ground_truth is not None:
             if not isinstance(ground_truth, GroundTruthSnapshot):
@@ -153,9 +176,10 @@ class InMemoryTrajectoryRecorder:
                     f"ground_truth must be a GroundTruthSnapshot, got "
                     f"{type(ground_truth).__name__}"
                 )
-            # A duplicate step is impossible here: decision_step is strictly
-            # increasing, so each append targets a fresh step.
+            # The uniqueness check above guarantees this can never silently
+            # overwrite an existing ground-truth entry for this step.
             self._ground_truth_by_step[transition.decision_step] = ground_truth
+        self._used_steps.add(transition.decision_step)
         self._transitions.append(transition)
 
     def set_fire_metrics(self, metrics: EpisodeFireMetrics) -> None:
@@ -177,20 +201,26 @@ class InMemoryTrajectoryRecorder:
             raise RecorderStateError("abort_episode() called with no active episode")
         self._metadata = None
         self._transitions = []
+        self._used_steps = set()
         self._ground_truth_by_step = {}
         self._fire_metrics = None
 
     def finish_episode(self) -> EpisodeRecord:
         if self._metadata is None:
             raise RecorderStateError("finish_episode() called with no active episode")
+        # Sorted here, once, at the boundary -- append() never sorts or
+        # mutates anything, and this does not depend on dict iteration
+        # order (self._transitions is a plain list; the key= sort is
+        # explicit).
         record = EpisodeRecord(
             metadata=self._metadata,
-            transitions=tuple(self._transitions),
+            transitions=tuple(sorted(self._transitions, key=lambda t: t.decision_step)),
             ground_truth_by_step=tuple(sorted(self._ground_truth_by_step.items())),
             fire_metrics=self._fire_metrics,
         )
         self._metadata = None
         self._transitions = []
+        self._used_steps = set()
         self._ground_truth_by_step = {}
         self._fire_metrics = None
         return record

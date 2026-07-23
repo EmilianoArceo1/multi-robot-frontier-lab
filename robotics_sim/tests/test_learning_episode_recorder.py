@@ -31,12 +31,12 @@ from robotics_sim.learning import (
     ContractBundleHashMismatchError,
     CriticStateBuildInput,
     CriticStateBuilder,
+    DuplicateDecisionStepError,
     EpisodeIdMismatchError,
     FeatureSchema,
     GroundTruthBuildInput,
     GroundTruthSnapshotBuilder,
     InMemoryTrajectoryRecorder,
-    NonMonotonicDecisionStepError,
     RecorderStateError,
     TeammateFeatureSource,
 )
@@ -201,19 +201,25 @@ class TestRecorderRejections:
         with pytest.raises(EpisodeIdMismatchError):
             recorder.append(make_transition(0, episode_id="ep-other"))
 
-    def test_duplicate_step(self):
+    def test_duplicate_step_fails(self):
+        # step equal to one already recorded: rejected as a duplicate.
         recorder = InMemoryTrajectoryRecorder()
         recorder.start_episode(make_metadata())
         recorder.append(make_transition(3))
-        with pytest.raises(NonMonotonicDecisionStepError):
+        with pytest.raises(DuplicateDecisionStepError):
             recorder.append(make_transition(3))
 
-    def test_decreasing_step(self):
+    def test_smaller_step_after_larger_one_is_now_valid(self):
+        # decision_step is episode-global, assigned when a decision opens --
+        # arrival order at the recorder is unconstrained, only uniqueness is
+        # enforced. A smaller step arriving after a larger one (the real
+        # multi-robot runtime is asynchronous) must not raise.
         recorder = InMemoryTrajectoryRecorder()
         recorder.start_episode(make_metadata())
         recorder.append(make_transition(3))
-        with pytest.raises(NonMonotonicDecisionStepError):
-            recorder.append(make_transition(2))
+        recorder.append(make_transition(2))  # must not raise
+        record = recorder.finish_episode()
+        assert [t.decision_step for t in record.transitions] == [2, 3]
 
     def test_append_without_active_episode(self):
         with pytest.raises(RecorderStateError):
@@ -243,13 +249,14 @@ class TestRecorderRejections:
         recorder.start_episode(make_metadata(contract_bundle_hash=VALID_HASH))
         assert recorder.is_recording is True
 
-    def test_duplicate_ground_truth_step_impossible_via_monotonic_steps(self):
-        # decision_step is strictly increasing, so a second ground-truth
-        # snapshot for an already-recorded step is rejected by monotonicity.
+    def test_duplicate_step_rejected_even_with_ground_truth_attached(self):
+        # decision_step uniqueness is enforced on the transition itself, so
+        # a second ground-truth snapshot for an already-recorded step is
+        # rejected as a duplicate step -- not as a special ground-truth rule.
         recorder = InMemoryTrajectoryRecorder()
         recorder.start_episode(make_metadata())
         recorder.append(make_transition(3), make_ground_truth(3))
-        with pytest.raises(NonMonotonicDecisionStepError):
+        with pytest.raises(DuplicateDecisionStepError):
             recorder.append(make_transition(3), make_ground_truth(3))
 
     def test_ground_truth_inside_transition_rejected_defensively(self):

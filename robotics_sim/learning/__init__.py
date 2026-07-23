@@ -94,12 +94,17 @@ from robotics_sim.learning.feature_extractors import (
 )
 from robotics_sim.learning.recorder import (
     ContractBundleHashMismatchError,
+    DuplicateDecisionStepError,
     EpisodeIdMismatchError,
     EpisodeRecord,
     InMemoryTrajectoryRecorder,
-    NonMonotonicDecisionStepError,
     RecorderError,
     RecorderStateError,
+)
+from robotics_sim.learning.decision_steps import (
+    DecisionStepAllocatorError,
+    DecisionStepAllocatorStateError,
+    EpisodeDecisionStepAllocator,
 )
 
 __all__ = [
@@ -122,7 +127,11 @@ __all__ = [
     "DecisionCaptureAssembler",
     "DecisionCaptureBatch",
     "DecisionSelectionBatch",
+    "DecisionStepAllocatorError",
+    "DecisionStepAllocatorStateError",
     "DuplicateCandidateIdError",
+    "DuplicateDecisionStepError",
+    "EpisodeDecisionStepAllocator",
     "EpisodeIdMismatchError",
     "EpisodeRecord",
     "ExplicitCandidatePool",
@@ -138,7 +147,6 @@ __all__ = [
     "LearningCoordinatorCompatibility",
     "LearningCoordinatorCompatibilityError",
     "LearningTransitionAssembler",
-    "NonMonotonicDecisionStepError",
     "OpenedLearningDecision",
     "OpenedRobotLearningDecision",
     "PreparedLearningCoordinationDecision",

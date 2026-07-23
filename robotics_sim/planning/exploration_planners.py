@@ -6,8 +6,8 @@ Responsibility split:
     path planner        -> computes how to get there
     controller          -> follows waypoints
 
-Main planner:
-    FoV-aware directional frontier
+Default frontier detector:
+    Ryu frontier-graph BFS exploration
 
 This file now receives BeliefMap directly when available. That avoids rebuilding
 a separate grid convention from explored_points and mapped_obstacle_points.
@@ -35,13 +35,19 @@ from robotics_sim.environment.belief_map import (
 )
 from robotics_sim.environment.grid_geometry import GridCell
 from robotics_sim.planning.grid_planners import AStarPlanner
+from robotics_sim.planning.ryu_frontier_graph_bfs import (
+    RYU_FRONTIER_GRAPH_BFS,
+    RYU_FRONTIER_GRAPH_BFS_CITATION,
+    bfs_frontier_nodes,
+)
 
 
-DEFAULT_EXPLORATION_PLANNER = "FoV-aware directional frontier"
+DEFAULT_EXPLORATION_PLANNER = RYU_FRONTIER_GRAPH_BFS
 NAV2D_NEAREST_FRONTIER_PLANNER = "Nav2D nearest-frontier wavefront"
 
 EXPLORATION_PLANNER_OPTIONS = [
     "Goal seeking",
+    RYU_FRONTIER_GRAPH_BFS,
     NAV2D_NEAREST_FRONTIER_PLANNER,
     "Nearest frontier",
     "Largest frontier",
@@ -1332,6 +1338,89 @@ class NearestFrontierPlanner(FrontierExplorationPlanner):
         return min(candidates, key=lambda item: (item.distance_from_robot, -item.size))
 
 
+class RyuFrontierGraphBFSPlanner(BaseExplorationPlanner):
+    """Paper-cited BFS frontier detector/selector with DBSCAN input or CCL fallback."""
+
+    name = RYU_FRONTIER_GRAPH_BFS
+    uses_frontier_clustering = True
+    citation = RYU_FRONTIER_GRAPH_BFS_CITATION
+
+    def select_goal(self, **kwargs) -> ExplorationPlannerResult:
+        belief = _belief_from_kwargs(kwargs)
+        robot_xy = _as_point(kwargs["robot_xy"])
+        supplied_clusters = kwargs.get("frontier_clusters")
+        nodes = bfs_frontier_nodes(
+            belief,
+            robot_xy,
+            dbscan_clusters=supplied_clusters,
+        )
+        if not nodes:
+            return ExplorationPlannerResult(
+                False,
+                None,
+                f"{self.name}: no reachable frontier nodes; citation={self.citation}",
+                (),
+            )
+
+        excluded = _normalize_targets(kwargs.get("excluded_targets"))
+        exclusion_radius = float(kwargs.get("target_exclusion_radius", 0.0))
+        dynamic = _normalize_dynamic_obstacles(kwargs.get("dynamic_obstacles"))
+        robot_radius = float(kwargs.get("robot_radius", 0.0))
+        dynamic_margin = float(kwargs.get("dynamic_obstacle_margin", 0.25))
+        candidates: list[FrontierCandidate] = []
+        selected: FrontierCandidate | None = None
+        for node in nodes:
+            target = belief.cell_to_world(node.representative)
+            rejected = _target_near_reserved(target, excluded, exclusion_radius) or (
+                _target_near_dynamic_obstacle(
+                    target,
+                    dynamic,
+                    robot_radius=robot_radius,
+                    margin=dynamic_margin,
+                )
+            )
+            candidate = FrontierCandidate(
+                target=target,
+                size=len(node.cells),
+                distance_from_robot=node.bfs_depth * float(belief.resolution),
+                score=-float(node.bfs_depth),
+                reason=(
+                    f"BFS depth={node.bfs_depth}, frontier_size={len(node.cells)}, "
+                    f"rejected={rejected}"
+                ),
+                cluster_points=tuple(belief.cell_to_world(cell) for cell in node.cells),
+                cluster_resolution=float(belief.resolution),
+            )
+            candidates.append(candidate)
+            if selected is None and not rejected:
+                selected = candidate
+
+        if selected is None:
+            return ExplorationPlannerResult(
+                False,
+                None,
+                f"{self.name}: all reachable BFS frontier nodes were excluded",
+                tuple(candidates),
+            )
+
+        fallback_reason = str(kwargs.get("clustering_fallback_reason", "")).strip()
+        stage = (
+            f"8-connected CCL fallback ({fallback_reason})"
+            if fallback_reason
+            else "selected DBSCAN frontier nodes"
+        )
+        return ExplorationPlannerResult(
+            True,
+            selected.target,
+            (
+                f"{self.name}: first eligible node at BFS depth "
+                f"{selected.distance_from_robot / float(belief.resolution):.0f}; "
+                f"source={stage}; citation={self.citation}"
+            ),
+            tuple(candidates),
+        )
+
+
 class LargestFrontierPlanner(FrontierExplorationPlanner):
     name = "Largest frontier"
 
@@ -1721,6 +1810,7 @@ class ExplorationPlannerRegistry:
     def __init__(self):
         self._planners: dict[str, BaseExplorationPlanner] = {
             GoalSeekingPlanner.name: GoalSeekingPlanner(),
+            RyuFrontierGraphBFSPlanner.name: RyuFrontierGraphBFSPlanner(),
             Nav2DNearestFrontierPlanner.name: Nav2DNearestFrontierPlanner(),
             NearestFrontierPlanner.name: NearestFrontierPlanner(),
             LargestFrontierPlanner.name: LargestFrontierPlanner(),

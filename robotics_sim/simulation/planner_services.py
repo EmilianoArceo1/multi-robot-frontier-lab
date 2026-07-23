@@ -54,6 +54,11 @@ try:
 except ImportError:
     _cluster_frontier_cells = None  # type: ignore[assignment]
 
+try:
+    from robotics_sim.planning.ryu_frontier_graph_bfs import RYU_FRONTIER_GRAPH_BFS
+except ImportError:
+    RYU_FRONTIER_GRAPH_BFS = "Ryu frontier-graph BFS exploration"
+
 
 Point2D = tuple[float, float]
 
@@ -378,9 +383,18 @@ class PlannerServices:
                 belief_map=request.belief_map,
                 frontier_cells=_detect_frontier_cells(request.belief_map),
             )
-            if not clustering.success:
+            bfs_fallback = request.planner_name == RYU_FRONTIER_GRAPH_BFS
+            if not clustering.success and not bfs_fallback:
                 return _FailedResult(f"clustering stage rejected selection: {clustering.reason}")
-            frontier_clusters = clustering.clusters
+            if clustering.success and clustering.clusters:
+                frontier_clusters = clustering.clusters
+            elif bfs_fallback:
+                frontier_clusters = None
+                clustering_fallback_reason = (
+                    clustering.reason
+                    if not clustering.success
+                    else f"{request.clustering_algorithm} produced no frontier clusters"
+                )
 
         kwargs = dict(
             belief_map=request.belief_map,
@@ -398,9 +412,11 @@ class PlannerServices:
             is_candidate_reachable=request.is_candidate_reachable,
             planning_grid_provider=request.planning_grid_provider,
         )
-        if has_explicit_clustering_stage:
+        if has_explicit_clustering_stage and frontier_clusters is not None:
             kwargs["clustering_algorithm"] = request.clustering_algorithm
             kwargs["frontier_clusters"] = frontier_clusters
+        elif has_explicit_clustering_stage and request.planner_name == RYU_FRONTIER_GRAPH_BFS:
+            kwargs["clustering_fallback_reason"] = clustering_fallback_reason
 
         return _seg(
             request.planner_name,

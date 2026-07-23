@@ -47,6 +47,15 @@ from robotics_sim.learning.episode_session import (
     SessionState,
     SessionStateError,
 )
+from robotics_sim.learning.coordination_decision_source import (
+    ExplicitCandidatePool,
+    LearningCoordinationDecisionSource,
+    LearningCoordinatorCompatibility,
+    LearningCoordinatorCompatibilityError,
+    PreparedLearningCoordinationDecision,
+    inspect_learning_compatibility,
+    resolve_selected_candidate_index,
+)
 from robotics_sim.learning.builders import (
     ActorObservationBuilder,
     BuilderError,
@@ -108,6 +117,7 @@ __all__ = [
     "DuplicateCandidateIdError",
     "EpisodeIdMismatchError",
     "EpisodeRecord",
+    "ExplicitCandidatePool",
     "FeatureNormalizationConfig",
     "FeatureSchema",
     "FeatureSchemaMismatchError",
@@ -116,8 +126,12 @@ __all__ = [
     "InMemoryLearningEpisodeSession",
     "InMemoryTrajectoryRecorder",
     "InvalidFeatureValueError",
+    "LearningCoordinationDecisionSource",
+    "LearningCoordinatorCompatibility",
+    "LearningCoordinatorCompatibilityError",
     "LearningTransitionAssembler",
     "NonMonotonicDecisionStepError",
+    "PreparedLearningCoordinationDecision",
     "RecorderError",
     "RecorderStateError",
     "ROBOT_FEATURE_NAMES_V0",
@@ -138,6 +152,8 @@ __all__ = [
     "TransitionOutcomeBatch",
     "build_candidate_id",
     "build_feature_schema_v0",
+    "inspect_learning_compatibility",
     "normalize_by_scale",
     "require_number",
+    "resolve_selected_candidate_index",
 ]

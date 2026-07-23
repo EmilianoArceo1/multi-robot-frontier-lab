@@ -8462,18 +8462,11 @@ class SimulationControllerMixin:
                         ):
                             self.exploration_replan_count += 1
 
-            while len(self.multi_path_points) <= index:
-                self.multi_path_points.append([])
-            path = self.multi_path_points[index]
-            new_path_point = (float(robot.x), float(robot.y))
-            if path:
-                self.total_distance_traveled += math.hypot(
-                    new_path_point[0] - float(path[-1][0]),
-                    new_path_point[1] - float(path[-1][1]),
-                )
-            path.append(new_path_point)
-            if len(path) > 900:
-                self.multi_path_points[index] = path[-900:]
+            SimulationControllerMixin._append_multi_executed_path_point(
+                self,
+                index,
+                (float(robot.x), float(robot.y)),
+            )
 
         selected = max(0, min(int(self.selected_robot_index), len(self.robots) - 1))
         self.robot = self.robots[selected]
@@ -8493,26 +8486,12 @@ class SimulationControllerMixin:
         self.update_path_reasoning_live_pose()
 
     def _append_executed_path_point(self, new_path_point: tuple[float, float]) -> None:
-        """Append one point to the single-robot executed trail
-        (self.path_points), trimming back to EXECUTED_TRAIL_MAX_POINTS
-        only once EXECUTED_TRAIL_TRIM_MARGIN extra points have
-        accumulated past the cap -- not on the very next tick after the
-        cap is first reached.
+        """Append one point to the full single-robot trajectory.
 
-        Trimming replaces self.path_points with a NEW list object (see
-        SimulationCanvas.draw_executed_path()'s docstring: its executed-
-        trail pixmap cache uses object identity to detect exactly this,
-        forcing a full pixmap rebuild whenever it happens). One point is
-        appended every tick, so a naive "> EXECUTED_TRAIL_MAX_POINTS: trim
-        to EXECUTED_TRAIL_MAX_POINTS" would replace the list object on
-        EVERY tick forever after the cap is first reached -- permanently
-        defeating that cache (real Office.sim evidence:
-        executed_trail_build_ms climbing to 5-10ms+ per frame once
-        executed_trail_points hit 1200, with route_path_ms spikes over
-        100ms). The margin means that identity change -- and the rebuild
-        it forces -- happens once every EXECUTED_TRAIL_TRIM_MARGIN ticks
-        instead of every tick, matching the "grew in place" case the
-        pixmap cache is actually optimized for.
+        The list intentionally grows in place until the simulation is
+        restarted.  SimulationCanvas paints only the new segments into a
+        persistent pixmap, so preserving the complete history does not make
+        every rendered frame proportional to the duration of the run.
         """
         if self.path_points:
             self.total_distance_traveled += math.hypot(
@@ -8521,8 +8500,21 @@ class SimulationControllerMixin:
             )
         self.path_points.append(new_path_point)
 
-        if len(self.path_points) > EXECUTED_TRAIL_MAX_POINTS + EXECUTED_TRAIL_TRIM_MARGIN:
-            self.path_points = self.path_points[-EXECUTED_TRAIL_MAX_POINTS:]
+    def _append_multi_executed_path_point(
+        self,
+        robot_index: int,
+        new_path_point: tuple[float, float],
+    ) -> None:
+        """Append one point to a robot's full multi-agent trajectory."""
+        while len(self.multi_path_points) <= robot_index:
+            self.multi_path_points.append([])
+        path = self.multi_path_points[robot_index]
+        if path:
+            self.total_distance_traveled += math.hypot(
+                new_path_point[0] - float(path[-1][0]),
+                new_path_point[1] - float(path[-1][1]),
+            )
+        path.append(new_path_point)
 
     def simulation_step(self):
         now = time.perf_counter()

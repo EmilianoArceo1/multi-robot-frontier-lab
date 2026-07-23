@@ -642,6 +642,17 @@ class SimulationCanvas(QWidget):
         self._executed_trail_style: tuple | None = None
         self._executed_trail_last_screen_point: tuple | None = None
         self._executed_trail_segments_painted_last_frame = 0
+        # Multiple mode uses the same incremental raster strategy, with one
+        # count/last-point cursor per robot.  Keeping the inner path-list
+        # identities lets runtime updates append cheaply while a restart (new
+        # lists) still invalidates and clears the cache deterministically.
+        self._multi_executed_trail_pixmap: QPixmap | None = None
+        self._multi_executed_trail_counts: list[int] = []
+        self._multi_executed_trail_view_signature: tuple | None = None
+        self._multi_executed_trail_sources: tuple = ()
+        self._multi_executed_trail_style: tuple | None = None
+        self._multi_executed_trail_last_screen_points: list[tuple | None] = []
+        self._multi_executed_trail_segments_painted_last_frame = 0
         self._planned_route_cache: QPainterPath | None = None
         self._planned_route_cache_signature: tuple | None = None
         # Fine-grained route/trail timings, reported via the optional
@@ -1052,7 +1063,9 @@ class SimulationCanvas(QWidget):
         self.robots = list(robots or [])
         self.robot = self.robots[0] if self.robots else None
         if path_points is not None:
-            self.multi_path_points = [list(path) for path in path_points]
+            # Preserve each inner list identity so the persistent trail cache
+            # can distinguish normal in-place growth from a reset/new run.
+            self.multi_path_points = list(path_points)
         if planned_path_points is not None:
             self.multi_planned_path_points = [list(path) for path in planned_path_points]
         if last_controls is not None:
@@ -1229,7 +1242,10 @@ class SimulationCanvas(QWidget):
             self.robots = list(robots)
             self.robot = self.robots[0] if self.robots else None
         if path_points is not None:
-            self.multi_path_points = [list(path) for path in path_points]
+            # The engine owns and appends to these inner lists.  A shallow
+            # outer copy keeps canvas access isolated without defeating the
+            # incremental trail cache on every physics tick.
+            self.multi_path_points = list(path_points)
         if planned_path_points is not None:
             self.multi_planned_path_points = [list(path) for path in planned_path_points]
         if last_controls is not None:
@@ -5570,26 +5586,133 @@ class SimulationCanvas(QWidget):
         painter.restore()
 
     def draw_multi_executed_paths(self, painter: QPainter) -> None:
-        """Draw each robot's accumulated trajectory using its identity color.
-
-        Multi-robot histories are bounded by the engine, so rebuilding these
-        short screen-space polylines is deterministic and does not mutate the
-        recorded path used by metrics or snapshot export.
-        """
+        """Draw each robot's complete trajectory using incremental rastering."""
         if not self.config.show_traveled_path or not self.multi_path_points:
             return
 
+        _build_start = time.perf_counter()
+        view_signature = self._view_transform_signature()
+        style_signature = self._multi_executed_trail_style_signature()
+        sources = tuple(self.multi_path_points)
+        same_sources = (
+            len(sources) == len(self._multi_executed_trail_sources)
+            and all(
+                current is cached
+                for current, cached in zip(sources, self._multi_executed_trail_sources)
+            )
+        )
+        truncated = (
+            len(self._multi_executed_trail_counts) != len(sources)
+            or any(
+                len(points) < cached_count
+                for points, cached_count in zip(
+                    self.multi_path_points,
+                    self._multi_executed_trail_counts,
+                )
+            )
+        )
+
+        if (
+            self._multi_executed_trail_pixmap is None
+            or not same_sources
+            or self._multi_executed_trail_view_signature != view_signature
+            or self._multi_executed_trail_style != style_signature
+            or truncated
+        ):
+            self._rebuild_multi_executed_trail_cache(view_signature, style_signature)
+            self._route_detail["executed_trail_cache_hit"] = False
+        elif any(
+            len(points) > cached_count
+            for points, cached_count in zip(
+                self.multi_path_points,
+                self._multi_executed_trail_counts,
+            )
+        ):
+            self._append_multi_executed_trail_segments()
+            self._route_detail["executed_trail_cache_hit"] = True
+        else:
+            self._multi_executed_trail_segments_painted_last_frame = 0
+            self._route_detail["executed_trail_cache_hit"] = True
+
+        self._route_detail["executed_trail_build_ms"] = (
+            time.perf_counter() - _build_start
+        ) * 1000.0
+        self._route_detail["executed_trail_points"] = sum(
+            len(points) for points in self.multi_path_points
+        )
+        self._route_detail["executed_trail_segments_painted"] = (
+            self._multi_executed_trail_segments_painted_last_frame
+        )
+
+        _paint_start = time.perf_counter()
         painter.save()
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(Qt.NoBrush)
-        for robot_index, points in enumerate(self.multi_path_points):
-            if len(points) < 2:
-                continue
-            color = QColor(robot_color(robot_index))
-            color.setAlpha(205)
-            painter.setPen(QPen(color, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawPath(self._rebuild_route_path(list(points)))
+        painter.drawPixmap(0, 0, self._multi_executed_trail_pixmap)
         painter.restore()
+        self._route_detail["executed_trail_paint_ms"] = (
+            time.perf_counter() - _paint_start
+        ) * 1000.0
+
+    def _multi_executed_trail_style_signature(self) -> tuple:
+        return (
+            1.7,
+            205,
+            tuple(robot_color(index).name() for index in range(len(self.multi_path_points))),
+        )
+
+    def _multi_executed_trail_pen(self, robot_index: int) -> QPen:
+        color = QColor(robot_color(robot_index))
+        color.setAlpha(205)
+        return QPen(color, 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+
+    def _rebuild_multi_executed_trail_cache(
+        self,
+        view_signature: tuple,
+        style_signature: tuple,
+    ) -> None:
+        pixmap = QPixmap(self.size())
+        pixmap.fill(Qt.transparent)
+        cache_painter = QPainter(pixmap)
+        cache_painter.setRenderHint(QPainter.Antialiasing)
+        total_segments = 0
+        last_points: list[tuple | None] = []
+        for robot_index, points in enumerate(self.multi_path_points):
+            cache_painter.setPen(self._multi_executed_trail_pen(robot_index))
+            segments, last_point = self._paint_executed_trail_segments(
+                cache_painter,
+                points,
+                None,
+            )
+            total_segments += segments
+            last_points.append(last_point)
+        cache_painter.end()
+
+        self._multi_executed_trail_pixmap = pixmap
+        self._multi_executed_trail_counts = [
+            len(points) for points in self.multi_path_points
+        ]
+        self._multi_executed_trail_view_signature = view_signature
+        self._multi_executed_trail_sources = tuple(self.multi_path_points)
+        self._multi_executed_trail_style = style_signature
+        self._multi_executed_trail_last_screen_points = last_points
+        self._multi_executed_trail_segments_painted_last_frame = total_segments
+
+    def _append_multi_executed_trail_segments(self) -> None:
+        cache_painter = QPainter(self._multi_executed_trail_pixmap)
+        cache_painter.setRenderHint(QPainter.Antialiasing)
+        total_segments = 0
+        for robot_index, points in enumerate(self.multi_path_points):
+            cache_painter.setPen(self._multi_executed_trail_pen(robot_index))
+            new_points = points[self._multi_executed_trail_counts[robot_index]:]
+            segments, last_point = self._paint_executed_trail_segments(
+                cache_painter,
+                new_points,
+                self._multi_executed_trail_last_screen_points[robot_index],
+            )
+            total_segments += segments
+            self._multi_executed_trail_counts[robot_index] = len(points)
+            self._multi_executed_trail_last_screen_points[robot_index] = last_point
+        cache_painter.end()
+        self._multi_executed_trail_segments_painted_last_frame = total_segments
 
     def _executed_trail_style_signature(self) -> tuple:
         """Color/width the trail is stroked with. Currently fixed
@@ -5671,10 +5794,9 @@ class SimulationCanvas(QWidget):
         frame just blits the pixmap -- drawPixmap() cost depends on screen
         area, not on how many points were ever painted into it. Rebuilt
         (not incrementally appended to) when: the view transform changes,
-        path_points is truncated/reset (a new list object -- see the `is`
-        check below, since a length-only comparison would miss an
-        in-place truncation that keeps the same length forever after), or
-        the trail's stroke style changes."""
+        a reset replaces path_points (a new list object -- see the `is`
+        check below), the list is explicitly truncated by an external
+        caller, or the trail's stroke style changes."""
         if not self.config.show_traveled_path:
             return
         if len(self.path_points) < 2:

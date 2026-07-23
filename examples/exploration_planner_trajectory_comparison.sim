@@ -1,0 +1,188 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "experiment": {
+    "id": "single-robot-exploration-planner-trajectory-comparison-v1",
+    "kind": "single_robot_exploration_planner_trajectory_comparison",
+    "description": "Fixed asymmetric indoor world for visually comparing the complete route produced by each frontier exploration planner while sensing, dynamics, mapping, path planning, and the initial pose remain unchanged.",
+    "active_baseline": "Nearest frontier",
+    "exploration_planner_roster": [
+      "Nav2D nearest-frontier wavefront",
+      "Nearest frontier",
+      "Largest frontier",
+      "Utility frontier",
+      "Informative frontier / IPP-lite",
+      "FoV-aware directional frontier"
+    ],
+    "comparison_protocol": {
+      "independent_variable": "exploration.planner",
+      "change_only": "In Configuration, change only Exploration Planner to the next roster entry.",
+      "reset_between_runs": true,
+      "reload_file_before_each_run": true,
+      "recommended_trials_per_planner": 3,
+      "recommended_simulation_speed": "2.00x",
+      "evaluation_horizons_s": [60, 120, 240],
+      "stop_rule": "Stop at 95 percent free-space coverage or 240 simulated seconds, whichever happens first.",
+      "visual_protocol": [
+        "Keep Traveled route enabled to see the complete executed trajectory.",
+        "Keep Planned route enabled to see the current route and selected frontier.",
+        "Pause at the same evaluation horizons before capturing screenshots.",
+        "Use Frontier Reasoning to inspect why the active planner selected each frontier."
+      ],
+      "primary_metrics": [
+        "Free-space coverage",
+        "Total distance traveled",
+        "Time to 90 percent coverage",
+        "Revisit ratio",
+        "Exploration replans"
+      ],
+      "fairness_warning": "Do not change the path planner, simplifier, sensor, robot pose, map, dynamics, or simulation speed between planners. Report exhausted/HOLD and timeout runs instead of discarding them."
+    },
+    "fixed_conditions": {
+      "agent_mode": "Single Robot Mode",
+      "initial_pose": [-8.4, 0.2, 0.0],
+      "sensor": "Camera / FoV, range 3.0 m",
+      "grid_resolution_m": 0.25,
+      "path_planner": "A*",
+      "path_simplifier": "Line of sight grid-safe",
+      "trajectory_visualization": "complete executed route plus current planned route"
+    },
+    "scope_note": "Goal seeking is intentionally excluded from the frontier-planner roster because it follows the fixed goal instead of selecting exploration frontiers. It may be run separately as a non-exploration control."
+  },
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": -8.4,
+    "y": 0.2,
+    "theta": 0.0,
+    "v": 0.0,
+    "body_radius": 0.2,
+    "safety_radius": 0.35,
+    "max_speed": 1.0,
+    "max_acceleration": 1.5,
+    "max_angular_speed": 2.0,
+    "goal_tolerance": 0.25,
+    "acceleration_gain": 0.75
+  },
+  "goal": {
+    "x": 8.5,
+    "y": 4.8
+  },
+  "map": {
+    "grid_resolution": 0.25,
+    "obstacles": [
+      [-10.0, -8.0, 20.0, 0.2],
+      [-10.0, 7.8, 20.0, 0.2],
+      [-10.0, -7.8, 0.2, 15.6],
+      [9.8, -7.8, 0.2, 15.6],
+
+      [-5.7, -7.8, 0.18, 5.45],
+      [-5.7, -1.25, 0.18, 2.5],
+      [-5.7, 2.25, 0.18, 5.55],
+      [-9.8, -1.35, 2.7, 0.18],
+      [-6.1, -1.35, 4.3, 0.18],
+      [-9.8, 2.15, 1.9, 0.18],
+      [-6.9, 2.15, 4.0, 0.18],
+
+      [-2.0, -7.8, 0.18, 4.55],
+      [-2.0, -2.15, 0.18, 4.3],
+      [-2.0, 3.15, 0.18, 4.65],
+      [-5.52, 0.25, 2.2, 0.18],
+      [-2.32, 0.25, 4.8, 0.18],
+      [-1.82, -3.25, 1.4, 0.18],
+      [0.55, -3.25, 1.85, 0.18],
+
+      [2.4, -7.8, 0.18, 5.75],
+      [2.4, -0.95, 0.18, 2.2],
+      [2.4, 2.35, 0.18, 5.45],
+      [2.58, 1.15, 2.1, 0.18],
+      [5.75, 1.15, 4.05, 0.18],
+
+      [6.15, -7.8, 0.18, 4.15],
+      [6.15, -2.55, 0.18, 3.7],
+      [6.15, 2.25, 0.18, 5.55],
+      [6.33, -2.65, 1.3, 0.18],
+      [8.65, -2.65, 1.15, 0.18]
+    ]
+  },
+  "hazard": {
+    "default_fire_intensity": 1.0,
+    "default_fire_radius": 1.5,
+    "fire_selection_radius": 0.6,
+    "block_threshold": 0.55,
+    "cbf_enabled": false,
+    "cbf_margin": 0.2,
+    "cbf_activation_distance": 1.5,
+    "cbf_k1": 2.0,
+    "cbf_k2": 2.0,
+    "cbf_pyramid_levels": 1,
+    "cbf_sdf_smoothing_sigma_cells": 0.75,
+    "cbf_acceleration_weight": 1.0,
+    "cbf_angular_weight": 0.35
+  },
+  "camera": {
+    "center_x": 0.0,
+    "center_y": 0.0,
+    "width": 20.0,
+    "height": 16.0
+  },
+  "planner": {
+    "type": "A*",
+    "path_simplifier": "Line of sight grid-safe"
+  },
+  "exploration": {
+    "planner": "Nearest frontier",
+    "replan_cooldown": 1.0,
+    "ipp_distance_penalty": 0.2
+  },
+  "coordination": {
+    "strategy": "NOIC information coordinator"
+  },
+  "sensor": {
+    "type": "Camera / FoV",
+    "range": 3.0
+  },
+  "multi_robot": {
+    "robot_count": 1,
+    "selected_robot_index": 0,
+    "same_robot_configuration": true,
+    "robots": [
+      {
+        "x": -8.4,
+        "y": 0.2,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 3.0,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.0,
+        "max_acceleration": 1.5,
+        "max_angular_speed": 2.0,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      }
+    ]
+  },
+  "simulation": {
+    "agent_mode": "Single Robot Mode",
+    "map_visualization": "Custom Discovery",
+    "custom_unexplored_color": "#20252B",
+    "custom_explored_color": "#DCEAF4",
+    "custom_obstacle_color": "#626C76",
+    "custom_explored_opacity": 0.28,
+    "mapped_obstacle_line_width": 1.5,
+    "robot_icon": "Drone",
+    "show_goal_preview": false,
+    "show_path": true,
+    "show_traveled_path": true,
+    "show_vision": true,
+    "show_explored_area": true,
+    "show_obstacles": true,
+    "show_robot_orders": false,
+    "mapping_point_spacing": 0.1
+  }
+}

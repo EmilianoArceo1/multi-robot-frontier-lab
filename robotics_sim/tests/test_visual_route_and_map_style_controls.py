@@ -225,3 +225,46 @@ def test_multi_robot_traveled_routes_use_all_recorded_histories():
 
     assert _alpha_at_world(canvas, pixmap, 0.0, 0.0) > 0
     assert _alpha_at_world(canvas, pixmap, 0.0, 2.0) > 0
+
+
+def test_multi_robot_traveled_route_cache_paints_only_appended_segments():
+    canvas = SimulationCanvas()
+    canvas.resize(900, 700)
+    canvas.config.agent_mode = "Multiple Robot Mode"
+    canvas.config.show_traveled_path = True
+    paths = [
+        [(-2.0, 0.0), (-1.0, 0.0)],
+        [(-2.0, 2.0), (-1.0, 2.0)],
+    ]
+    canvas.set_multi_runtime_state(path_points=paths)
+
+    first_frame = _transparent_canvas_pixmap(canvas)
+    painter = QPainter(first_frame)
+    canvas.draw_multi_executed_paths(painter)
+    painter.end()
+    first_cache = canvas._multi_executed_trail_pixmap
+
+    paths[0].append((0.0, 0.0))
+    paths[1].append((0.0, 2.0))
+    canvas.set_multi_runtime_state(path_points=paths)
+    second_frame = _transparent_canvas_pixmap(canvas)
+    painter = QPainter(second_frame)
+    canvas.draw_multi_executed_paths(painter)
+    painter.end()
+
+    assert canvas._multi_executed_trail_pixmap is first_cache
+    assert canvas._route_detail["executed_trail_segments_painted"] == 2
+    assert canvas._route_detail["executed_trail_cache_hit"] is True
+    assert _alpha_at_world(canvas, second_frame, -1.5, 0.0) > 0
+    assert _alpha_at_world(canvas, second_frame, -1.5, 2.0) > 0
+
+
+def test_multi_runtime_state_preserves_inner_path_identity_for_incremental_cache():
+    canvas = SimulationCanvas()
+    paths = [[(0.0, 0.0)], [(1.0, 1.0)]]
+
+    canvas.set_multi_runtime_state(path_points=paths)
+
+    assert canvas.multi_path_points is not paths
+    assert canvas.multi_path_points[0] is paths[0]
+    assert canvas.multi_path_points[1] is paths[1]

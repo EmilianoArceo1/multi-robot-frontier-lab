@@ -249,20 +249,11 @@ EXPLORED_RAYS_CAMERA = 45
 # Obstacle opacity is feedback only; it is not used by collision or planning.
 OBSTACLE_VISUAL_REFRESH_POINT_STEP = 80
 
-# The executed-path trail (self.path_points) is capped to bound memory and
-# render cost, but trimming it back to EXECUTED_TRAIL_MAX_POINTS on EVERY
-# tick once the cap is first reached would replace self.path_points (a new
-# list object) on every tick forever after. SimulationCanvas's executed-
-# trail pixmap cache uses object identity to tell "grew in place" (cheap,
-# incremental) apart from "replaced/truncated" (a full rebuild) -- trimming
-# every tick would defeat that cache permanently once the trail hit the
-# cap (measured: executed_trail_build_ms climbing to 5-10ms+ per frame,
-# with route_path_ms spikes over 100ms). Letting the trail grow
-# EXECUTED_TRAIL_TRIM_MARGIN points past the cap before trimming back down
-# to the cap means the identity change -- and the rebuild it forces --
-# happens once every EXECUTED_TRAIL_TRIM_MARGIN ticks instead of every one.
-EXECUTED_TRAIL_MAX_POINTS = 1200
-EXECUTED_TRAIL_TRIM_MARGIN = 200
+# Executed robot trajectories are retained for the complete simulation run.
+# SimulationCanvas rasterizes only newly appended segments into persistent
+# pixmaps, so render cost remains effectively constant as the history grows.
+# Restarting the simulation replaces these lists and therefore clears the
+# visual trail together with the rest of the runtime state.
 
 # Keep only a short world-space history for explored polygons. The real explored
 # area is already rasterized into a homogeneous pixmap cache.

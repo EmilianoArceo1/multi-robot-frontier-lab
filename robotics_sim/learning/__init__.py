@@ -47,6 +47,12 @@ from robotics_sim.learning.episode_session import (
     SessionState,
     SessionStateError,
 )
+from robotics_sim.learning.asynchronous_episode import (
+    AsynchronousEpisodeSessionError,
+    AsynchronousEpisodeSessionStateError,
+    InMemoryAsynchronousLearningEpisodeSession,
+    PendingRobotDecisionError,
+)
 from robotics_sim.learning.coordination_decision_source import (
     ExplicitCandidatePool,
     LearningCoordinationDecisionSource,
@@ -109,6 +115,8 @@ from robotics_sim.learning.decision_steps import (
 
 __all__ = [
     "ActionCatalogAssembler",
+    "AsynchronousEpisodeSessionError",
+    "AsynchronousEpisodeSessionStateError",
     "ActionCatalogBatch",
     "ActionOption",
     "ActorObservationBatch",
@@ -140,6 +148,7 @@ __all__ = [
     "FeatureSchemaMismatchError",
     "GroundTruthBuildInput",
     "GroundTruthSnapshotBuilder",
+    "InMemoryAsynchronousLearningEpisodeSession",
     "InMemoryLearningEpisodeSession",
     "InMemoryTrajectoryRecorder",
     "InvalidFeatureValueError",
@@ -149,6 +158,7 @@ __all__ = [
     "LearningTransitionAssembler",
     "OpenedLearningDecision",
     "OpenedRobotLearningDecision",
+    "PendingRobotDecisionError",
     "PreparedLearningCoordinationDecision",
     "RecorderError",
     "RecorderStateError",

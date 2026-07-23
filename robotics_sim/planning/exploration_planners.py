@@ -239,6 +239,11 @@ def _frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
     return frontiers
 
 
+def detect_frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
+    """Public detector-stage API used before explicit clustering."""
+    return _frontier_cells(belief)
+
+
 def _cluster_frontiers(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
     remaining = set(cells)
     clusters: list[list[tuple[int, int]]] = []
@@ -346,9 +351,12 @@ def _frontier_candidates(
 ) -> list[_InternalCandidate]:
     candidates: list[_InternalCandidate] = []
 
+    if clusters is None:
+        raise ValueError(
+            "frontier candidates require explicit clusters; no default clustering "
+            "algorithm is available"
+        )
     frontier_clusters = clusters
-    if frontier_clusters is None:
-        frontier_clusters = _cluster_frontiers(_frontier_cells(belief))
 
     for cluster in frontier_clusters:
         candidate = _candidate_from_cluster(belief, cluster)
@@ -1120,12 +1128,27 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
     uses_frontier_clustering = True
 
     def cluster_frontiers(self, belief: BeliefMap) -> list[list[tuple[int, int]]]:
-        """Build this planner's groups from the shared frontier-cell detector.
+        """Legacy direct-call compatibility for archived planner tests.
 
-        Subclasses can override this independently.  Eight-connected
-        components remain the default to preserve existing planner results.
+        The interactive runtime never calls this method: it supplies
+        ``frontier_clusters`` from the explicitly selected clustering stage.
         """
         return _cluster_frontiers(_frontier_cells(belief))
+
+    def _clusters_for_call(
+        self,
+        belief: BeliefMap,
+        kwargs: Mapping[str, Any],
+    ) -> list[list[tuple[int, int]]]:
+        if "clustering_algorithm" in kwargs:
+            supplied = kwargs.get("frontier_clusters")
+            if supplied is None:
+                raise ValueError(
+                    "frontier detector requires clusters from the selected "
+                    "Clustering Algorithm"
+                )
+            return [list(cluster) for cluster in supplied]
+        return self.cluster_frontiers(belief)
 
     def frontier_candidates(self, **kwargs) -> list[FrontierCandidate]:
         belief = _belief_from_kwargs(kwargs)
@@ -1152,7 +1175,7 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
             target_exclusion_radius=target_exclusion_radius,
             robot_radius=robot_radius,
             dynamic_obstacle_margin=dynamic_obstacle_margin,
-            clusters=self.cluster_frontiers(belief),
+            clusters=self._clusters_for_call(belief, kwargs),
         )
 
         candidates: list[FrontierCandidate] = []
@@ -1223,7 +1246,10 @@ class FrontierExplorationPlanner(BaseExplorationPlanner):
         raise NotImplementedError
 
     def select_goal(self, **kwargs) -> ExplorationPlannerResult:
-        candidates = self.frontier_candidates(**kwargs)
+        try:
+            candidates = self.frontier_candidates(**kwargs)
+        except ValueError as exc:
+            return ExplorationPlannerResult(False, None, str(exc), ())
 
         if not candidates:
             return ExplorationPlannerResult(False, None, "no valid frontier candidates found", ())
@@ -1354,8 +1380,23 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
     uses_frontier_clustering = True
 
     def cluster_frontiers(self, belief: BeliefMap) -> list[list[tuple[int, int]]]:
-        """Keep diagonally touching doorway/wall faces as separate options."""
+        """Legacy direct-call compatibility for archived FoV tests only."""
         return _cluster_frontiers4(_frontier_cells(belief))
+
+    def _clusters_for_call(
+        self,
+        belief: BeliefMap,
+        kwargs: Mapping[str, Any],
+    ) -> list[list[tuple[int, int]]]:
+        if "clustering_algorithm" in kwargs:
+            supplied = kwargs.get("frontier_clusters")
+            if supplied is None:
+                raise ValueError(
+                    "FoV-aware directional frontier requires clusters from the "
+                    "selected Clustering Algorithm"
+                )
+            return [list(cluster) for cluster in supplied]
+        return self.cluster_frontiers(belief)
 
     def select_goal(self, **kwargs) -> ExplorationPlannerResult:
         belief = _belief_from_kwargs(kwargs)
@@ -1404,6 +1445,11 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         viewpoints_per_cluster = max(1, int(kwargs.get("max_frontier_viewpoints_per_cluster", 5)))
         max_forward_distance = float(kwargs.get("max_forward_distance", max(sensor_range, 4.0 * belief.resolution)))
 
+        try:
+            frontier_clusters = self._clusters_for_call(belief, kwargs)
+        except ValueError as exc:
+            return ExplorationPlannerResult(False, None, str(exc), ())
+
         candidates = _frontier_candidates(
             belief=belief,
             reserved_targets=reserved,
@@ -1414,7 +1460,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             viewpoints_per_cluster=viewpoints_per_cluster,
             robot_xy=robot_xy,
             robot_heading=robot_heading,
-            clusters=self.cluster_frontiers(belief),
+            clusters=frontier_clusters,
         )
 
         forward = _forward_candidate(
@@ -1698,3 +1744,8 @@ _REGISTRY = ExplorationPlannerRegistry()
 
 def select_exploration_goal(planner_name: str, **kwargs) -> ExplorationPlannerResult:
     return _REGISTRY.select_goal(planner_name, **kwargs)
+
+
+def exploration_planner_requires_clustering(planner_name: str) -> bool:
+    """Whether the detector consumes clusters before ranking candidates."""
+    return bool(_REGISTRY.get(str(planner_name)).uses_frontier_clustering)

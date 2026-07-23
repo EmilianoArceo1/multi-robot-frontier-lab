@@ -1,0 +1,252 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": 0.0,
+    "y": 0.0,
+    "theta": 0.0,
+    "v": 0.0,
+    "body_radius": 0.2,
+    "safety_radius": 0.35,
+    "max_speed": 1.2,
+    "max_acceleration": 2.0,
+    "max_angular_speed": 2.5,
+    "goal_tolerance": 0.25,
+    "acceleration_gain": 0.75
+  },
+  "goal": {
+    "x": 8.0,
+    "y": 6.0
+  },
+  "map": {
+    "obstacles": [
+      [
+        -9.78066123568769,
+        -5.901654159606229,
+        0.2,
+        11.038489469862018
+      ],
+      [
+        -9.72067251356745,
+        -5.923171682939294,
+        18.856454986462545,
+        0.30124532666290094
+      ],
+      [
+        8.95581630653437,
+        -5.794066542940909,
+        0.2,
+        10.780279189865245
+      ],
+      [
+        -9.680680032153957,
+        4.814072460259823,
+        18.73647754222206,
+        0.21517523333064226
+      ],
+      [
+        -7.88872131216983,
+        0.9065087408903691,
+        0.2,
+        2.41026830586883
+      ],
+      [
+        -7.752144297575559,
+        1.8764947664229479,
+        2.280836143724314,
+        0.2
+      ],
+      [
+        -8.516975579303473,
+        -0.8130119407355638,
+        4.56167228744863,
+        0.24984488536445182
+      ],
+      [
+        -7.5063056713058725,
+        -5.7511226161741416,
+        0.2048655218914046,
+        2.1751201784669925
+      ],
+      [
+        -5.403019646554109,
+        -2.2679909790344306,
+        0.27315402918854037,
+        1.6313401338502445
+      ],
+      [
+        -2.7534255634252647,
+        -2.7382872338381046,
+        0.2,
+        5.393710172279637
+      ],
+      [
+        -4.20114191812453,
+        3.140415951207822,
+        0.2,
+        1.807701229401622
+      ],
+      [
+        -2.7397678619658374,
+        1.7883142186472585,
+        1.9393936072386389,
+        0.2
+      ],
+      [
+        1.8082467240233648,
+        -5.721729100248912,
+        0.35510023794510337,
+        2.9540483504855777
+      ],
+      [
+        -1.6061786408333938,
+        -4.531291705277112,
+        3.3871099619379046,
+        0.3233286751775255
+      ],
+      [
+        1.6306966050508134,
+        2.1557331677126292,
+        2.6086209787505634,
+        0.23514812740183677
+      ],
+      [
+        1.453146486078262,
+        1.3915017536566585,
+        0.2594963277291138,
+        2.0575461147660743
+      ],
+      [
+        4.4305254042333555,
+        -2.8411645395764085,
+        0.2048655218914055,
+        2.8658678027098894
+      ],
+      [
+        3.11938606412836,
+        -1.1804308898009341,
+        2.9637212166956672,
+        0.33802543314014066
+      ],
+      [
+        6.260657399796578,
+        0.6566638555259178,
+        0.2594963277291136,
+        2.4837520956819037
+      ],
+      [
+        5.8918994603920485,
+        -3.781757049183757,
+        3.0593251269116557,
+        0.2
+      ]
+    ],
+    "grid_resolution": 0.5
+  },
+  "hazard": {
+    "default_fire_intensity": 1.0,
+    "default_fire_radius": 2.0,
+    "fire_selection_radius": 0.6,
+    "block_threshold": 0.55
+  },
+  "camera": {
+    "center_x": -0.49,
+    "center_y": -0.3,
+    "width": 20.36,
+    "height": 15.45
+  },
+  "planner": {
+    "type": "A*",
+    "path_simplifier": "Line of sight grid-safe"
+  },
+  "exploration": {
+    "planner": "FoV-aware directional frontier",
+    "clustering_algorithm": "GriT-DBSCAN two-stage frontier clustering",
+    "replan_cooldown": 1.0,
+    "ipp_distance_penalty": 0.2
+  },
+  "coordination": {
+    "strategy": "No task assign algorithm available",
+    "safety_algorithm": "Wang-Ames-Egerstedt decentralized barrier certificate",
+    "parameters": {},
+    "replan_interval_s": 0.0,
+    "strict_contracts": false
+  },
+  "sensor": {
+    "type": "Camera / FoV",
+    "range": 2.5
+  },
+  "multi_robot": {
+    "robot_count": 3,
+    "selected_robot_index": 1,
+    "same_robot_configuration": true,
+    "robots": [
+      {
+        "x": -8.894407894736842,
+        "y": 1.4837171052631575,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      },
+      {
+        "x": -8.673684210526314,
+        "y": 2.69358552631579,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      },
+      {
+        "x": -8.758881578947369,
+        "y": 4.191447368421053,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      }
+    ]
+  },
+  "simulation": {
+    "agent_mode": "Single Robot Mode",
+    "map_visualization": "Custom Discovery",
+    "custom_unexplored_color": "#363636",
+    "custom_explored_color": "#F0FFD7",
+    "custom_obstacle_color": "#000000",
+    "custom_explored_opacity": 0.5,
+    "mapped_obstacle_line_width": 1.5,
+    "robot_icon": "Drone",
+    "show_goal_preview": true,
+    "show_path": true,
+    "show_traveled_path": false,
+    "show_vision": true,
+    "show_explored_area": true,
+    "show_obstacles": true,
+    "show_robot_orders": false,
+    "mapping_point_spacing": 0.025
+  }
+}

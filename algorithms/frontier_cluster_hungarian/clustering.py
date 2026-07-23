@@ -1,22 +1,12 @@
-"""Second-stage, deterministic reduction over host-provided FrontierCluster
-components.
+"""Second-stage frontier clustering with exact DBSCAN semantics.
 
-The host (robotics_sim.planning.coordinated_frontier_planner via
-FrontierInformationService) already performs the first-stage clustering:
-raw frontier cells grouped into 8-connected FrontierCluster components. This
-module treats those components as fixed input and applies ONE more
-deterministic reduction pass on top: nearby components are merged into a
-single ReducedFrontierTask using a coarse secondary grid plus a centroid
-merge-radius check.
-
-This is a deterministic grid-density APPROXIMATION loosely inspired by the
-grid-based density clustering idea in Gao et al., "A Novel Frontier-Based
-Multi-Robot Cooperative Exploration Method" -- it is explicitly NOT an
-implementation of GriT-DBSCAN. There is no density/eps/minPts model, no
-core-point/border-point distinction, and no claim of matching the paper's
-algorithm beyond the general idea of "bucket by a coarse grid, then merge
-what's close." Every rule this module applies is documented in the
-functions below.
+The host supplies the first-stage, continuity-connected frontier components.
+Their centroids are the points consumed here, matching Algorithm 1 of Gao et
+al.  Radius queries are accelerated with the equal grid partition used by
+GriT-DBSCAN (cell side ``eps / sqrt(2)`` in 2-D).  Core, border and noise
+classification and density connectivity are exact DBSCAN semantics; the
+grid-tree/FastMerging accelerators from Huang et al. are deliberately not
+needed for the comparatively small first-stage frontier set.
 """
 from __future__ import annotations
 
@@ -29,16 +19,7 @@ from robotics_interfaces.frontiers import FrontierCluster
 from robotics_interfaces.observations import Point2D
 from robotics_interfaces.proposals import ExplorationCandidate
 
-CLUSTERING_METHOD = "deterministic_grid_density_approximation"
-
-# 8-connected secondary-grid neighborhood, including (0, 0) so two clusters
-# that land in the exact same secondary cell are always compared too.
-_NEIGHBOR_OFFSETS: tuple[tuple[int, int], ...] = (
-    (0, 0),
-    (1, 0), (-1, 0), (0, 1), (0, -1),
-    (1, 1), (1, -1), (-1, 1), (-1, -1),
-)
-
+CLUSTERING_METHOD = "grid_indexed_exact_dbscan"
 
 @dataclass(frozen=True)
 class ReducedFrontierTask:
@@ -82,20 +63,11 @@ def _validate_non_negative_finite(value: float, *, name: str) -> float:
 
 
 def _group_clusters(
-    ordered: Sequence[FrontierCluster], *, grid_size: float, merge_radius: float
-) -> list[list[str]]:
-    """8-connected-secondary-grid + merge_radius BFS grouping.
-
-    Rules (see module docstring): each cluster's centroid is bucketed into
-    a secondary grid cell (floor(x/grid_size), floor(y/grid_size)); two
-    clusters can share a group only when their secondary cells are
-    8-connected AND their centroids are within merge_radius of each other.
-    Seeds are taken from `ordered` (already sorted by cluster_id) in that
-    stable order -- never set.pop() -- and each group's members end up
-    sorted by cluster_id. Groups themselves are returned sorted by their
-    own smallest cluster_id.
-    """
+    ordered: Sequence[FrontierCluster], *, eps: float, min_points: int
+) -> tuple[list[list[str]], tuple[str, ...]]:
+    """Return DBSCAN clusters and noise ids using a deterministic grid index."""
     cluster_by_id = {cluster.cluster_id: cluster for cluster in ordered}
+    grid_size = eps / math.sqrt(2.0)
     grid_cell_by_id = {
         cluster.cluster_id: _grid_cell(cluster.centroid, grid_size) for cluster in ordered
     }
@@ -103,39 +75,63 @@ def _group_clusters(
     for cluster in ordered:
         by_grid_cell.setdefault(grid_cell_by_id[cluster.cluster_id], []).append(cluster.cluster_id)
 
-    def neighbor_ids(cluster_id: str) -> list[str]:
+    # With cell side eps/sqrt(2), an eps-neighbour can be at most two grid
+    # coordinates away in either dimension.  Exact Euclidean filtering below
+    # removes all false positives introduced by that conservative window.
+    grid_reach = math.ceil(eps / grid_size)
+
+    def neighbor_ids(cluster_id: str) -> tuple[str, ...]:
         gx, gy = grid_cell_by_id[cluster_id]
         centroid = cluster_by_id[cluster_id].centroid
         found: list[str] = []
-        for dx, dy in _NEIGHBOR_OFFSETS:
-            for other_id in by_grid_cell.get((gx + dx, gy + dy), ()):
-                if other_id == cluster_id:
-                    continue
-                if _distance(centroid, cluster_by_id[other_id].centroid) <= merge_radius:
-                    found.append(other_id)
-        return sorted(found)
+        for dx in range(-grid_reach, grid_reach + 1):
+            for dy in range(-grid_reach, grid_reach + 1):
+                for other_id in by_grid_cell.get((gx + dx, gy + dy), ()):
+                    if _distance(centroid, cluster_by_id[other_id].centroid) <= eps:
+                        found.append(other_id)
+        return tuple(sorted(set(found)))
 
-    visited: set[str] = set()
+    neighbors = {cluster.cluster_id: neighbor_ids(cluster.cluster_id) for cluster in ordered}
+    core_ids = {cluster_id for cluster_id, ids in neighbors.items() if len(ids) >= min_points}
+    visited_core: set[str] = set()
     groups: list[list[str]] = []
     for cluster in ordered:
         seed_id = cluster.cluster_id
-        if seed_id in visited:
+        if seed_id not in core_ids or seed_id in visited_core:
             continue
-        visited.add(seed_id)
+        visited_core.add(seed_id)
         group = [seed_id]
         queue: deque[str] = deque([seed_id])
         while queue:
             current_id = queue.popleft()
             for neighbor_id in neighbor_ids(current_id):
-                if neighbor_id in visited:
+                if neighbor_id not in core_ids or neighbor_id in visited_core:
                     continue
-                visited.add(neighbor_id)
+                visited_core.add(neighbor_id)
                 group.append(neighbor_id)
                 queue.append(neighbor_id)
         groups.append(sorted(group))
 
+    # Assign each border point to the lexicographically first adjacent core
+    # component.  This makes DBSCAN's otherwise order-dependent border ties
+    # reproducible.  Points without an adjacent core are noise.
+    core_group_index = {
+        cluster_id: index for index, group in enumerate(groups) for cluster_id in group
+    }
+    noise: list[str] = []
+    for cluster in ordered:
+        cluster_id = cluster.cluster_id
+        if cluster_id in core_ids:
+            continue
+        adjacent = sorted({core_group_index[n] for n in neighbors[cluster_id] if n in core_ids})
+        if adjacent:
+            groups[adjacent[0]].append(cluster_id)
+        else:
+            noise.append(cluster_id)
+
+    groups = [sorted(group) for group in groups]
     groups.sort(key=lambda group: group[0])
-    return groups
+    return groups, tuple(sorted(noise))
 
 
 def _select_representative(clusters: Sequence[FrontierCluster]) -> FrontierCluster:
@@ -253,6 +249,7 @@ def reduce_frontier_clusters_with_diagnostics(
     grid_size: float,
     merge_radius: float,
     duplicate_tolerance: float,
+    min_points: int = 1,
 ) -> tuple[tuple[ReducedFrontierTask, ...], tuple[str, ...]]:
     """Full second-stage pipeline: group -> build tasks -> deduplicate by
     target. Returns (surviving_tasks, removed_duplicate_task_ids), both
@@ -265,14 +262,21 @@ def reduce_frontier_clusters_with_diagnostics(
     function does not re-validate.
     """
     grid_size = _validate_positive_finite(grid_size, name="grid_size")
-    merge_radius = _validate_non_negative_finite(merge_radius, name="merge_radius")
+    merge_radius = _validate_positive_finite(merge_radius, name="merge_radius")
     duplicate_tolerance = _validate_non_negative_finite(duplicate_tolerance, name="duplicate_tolerance")
+    try:
+        parsed_min_points = int(min_points)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"min_points must be a positive integer, got {min_points!r}") from exc
+    if isinstance(min_points, bool) or parsed_min_points != min_points or parsed_min_points < 1:
+        raise ValueError(f"min_points must be a positive integer, got {min_points!r}")
+    min_points = parsed_min_points
 
     ordered = sorted(clusters, key=lambda cluster: cluster.cluster_id)
     if not ordered:
         return (), ()
 
-    groups = _group_clusters(ordered, grid_size=grid_size, merge_radius=merge_radius)
+    groups, _noise_ids = _group_clusters(ordered, eps=merge_radius, min_points=min_points)
     cluster_by_id = {cluster.cluster_id: cluster for cluster in ordered}
 
     raw_tasks: list[ReducedFrontierTask] = []
@@ -290,8 +294,9 @@ def reduce_frontier_clusters(
     grid_size: float,
     merge_radius: float,
     duplicate_tolerance: float,
+    min_points: int = 1,
 ) -> tuple[ReducedFrontierTask, ...]:
-    """Deterministic grid-density approximation second-stage reduction over
+    """Deterministic, grid-indexed DBSCAN second-stage reduction over
     already-validated FrontierCluster objects (see this module's
     docstring). Returns only the tasks that survive target deduplication;
     use reduce_frontier_clusters_with_diagnostics() to also learn which
@@ -302,5 +307,6 @@ def reduce_frontier_clusters(
         grid_size=grid_size,
         merge_radius=merge_radius,
         duplicate_tolerance=duplicate_tolerance,
+        min_points=min_points,
     )
     return tasks

@@ -5,12 +5,11 @@ Exploration Method": this plugin treats the FrontierCluster objects the
 host already exposes through FrontierInformationService as the first
 clustering stage, applies one more deterministic reduction pass (see
 algorithms.frontier_cluster_hungarian.clustering -- a grid-density
-APPROXIMATION, not GriT-DBSCAN), builds a global robot-task utility matrix
+exact grid-indexed DBSCAN), builds a global robot-task utility matrix
 (information + distance + a five-parallel-line obstacle clearance factor),
 and solves a global assignment with a pure-Python Hungarian solver (no
 SciPy). This is a controlled, incomplete approximation of the paper's
-method -- it does not claim to reproduce GriT-DBSCAN or every detail of the
-utility formulation.
+method with the ranking equations from the paper.
 
 This plugin never detects frontiers itself (it only ever calls
 request.services.frontier_information_service.get_frontier_clusters(),
@@ -100,7 +99,20 @@ def _resolve_grid_size(request: CoordinationRequest, resolution: float) -> float
 def _resolve_merge_radius(request: CoordinationRequest, grid_size: float) -> float:
     default = 1.5 * grid_size
     candidate = request.parameters.get("secondary_cluster_merge_radius", default)
-    return _finite_non_negative(candidate, name="secondary_cluster_merge_radius")
+    return _finite_positive(candidate, name="secondary_cluster_merge_radius")
+
+
+def _resolve_min_points(request: CoordinationRequest) -> int:
+    candidate = request.parameters.get("secondary_cluster_min_points", 1)
+    try:
+        parsed = int(candidate)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"secondary_cluster_min_points must be a positive integer, got {candidate!r}"
+        ) from exc
+    if isinstance(candidate, bool) or parsed != candidate or parsed < 1:
+        raise ValueError(f"secondary_cluster_min_points must be a positive integer, got {candidate!r}")
+    return parsed
 
 
 def _resolve_weights(request: CoordinationRequest) -> UtilityWeights:
@@ -280,8 +292,8 @@ class FrontierClusterHungarianPlugin:
             "Two-stage frontier coordinator inspired by Gao et al.'s "
             "frontier-based multi-robot exploration method: consumes host-"
             "detected FrontierCluster components, applies a deterministic "
-            "grid-density approximation second-stage reduction (not "
-            "GriT-DBSCAN), builds a global robot-task utility matrix "
+            "grid-indexed exact DBSCAN second-stage reduction, builds a "
+            "global robot-task utility matrix "
             "(information + distance + five-line obstacle clearance), and "
             "solves task allocation with a pure-Python Hungarian solver."
         ),
@@ -344,6 +356,7 @@ class FrontierClusterHungarianPlugin:
         resolution = _resolve_resolution(request)
         grid_size = _resolve_grid_size(request, resolution)
         merge_radius = _resolve_merge_radius(request, grid_size)
+        min_points = _resolve_min_points(request)
         duplicate_tolerance = _resolve_duplicate_tolerance(request)
 
         tasks, removed_duplicate_task_ids = reduce_frontier_clusters_with_diagnostics(
@@ -351,6 +364,7 @@ class FrontierClusterHungarianPlugin:
             grid_size=grid_size,
             merge_radius=merge_radius,
             duplicate_tolerance=duplicate_tolerance,
+            min_points=min_points,
         )
 
         if not tasks:

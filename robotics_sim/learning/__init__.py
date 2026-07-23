@@ -14,6 +14,16 @@ from robotics_sim.learning.source_models import (
     GroundTruthBuildInput,
     TeammateFeatureSource,
 )
+from robotics_sim.learning.capture_inputs import (
+    CandidateCaptureInput,
+    RobotActorCaptureInput,
+    RuntimeActorFrame,
+)
+from robotics_sim.learning.observation_batch import (
+    ActorObservationBatch,
+    ActorObservationBatchAssembler,
+    build_candidate_id,
+)
 from robotics_sim.learning.builders import (
     ActorObservationBuilder,
     BuilderError,
@@ -53,10 +63,13 @@ from robotics_sim.learning.recorder import (
 )
 
 __all__ = [
+    "ActorObservationBatch",
+    "ActorObservationBatchAssembler",
     "ActorObservationBuildInput",
     "ActorObservationBuilder",
     "BuilderError",
     "CANDIDATE_FEATURE_NAMES_V0",
+    "CandidateCaptureInput",
     "CandidateFeatureExtractionInput",
     "CandidateFeatureExtractor",
     "CandidateFeatureSource",
@@ -77,12 +90,15 @@ __all__ = [
     "RecorderError",
     "RecorderStateError",
     "ROBOT_FEATURE_NAMES_V0",
+    "RobotActorCaptureInput",
     "RobotFeatureExtractionInput",
     "RobotFeatureExtractor",
+    "RuntimeActorFrame",
     "TEAMMATE_FEATURE_NAMES_V0",
     "TeammateFeatureExtractionInput",
     "TeammateFeatureExtractor",
     "TeammateFeatureSource",
+    "build_candidate_id",
     "build_feature_schema_v0",
     "normalize_by_scale",
     "require_number",

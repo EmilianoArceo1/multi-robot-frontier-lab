@@ -40,6 +40,11 @@ from robotics_sim.planning.ryu_frontier_graph_bfs import (
     RYU_FRONTIER_GRAPH_BFS_CITATION,
     bfs_frontier_nodes,
 )
+from robotics_sim.planning.keidar_kaminka_efd import (
+    KEIDAR_KAMINKA_EFD_CITATION,
+    KEIDAR_KAMINKA_WFD_INC,
+    detect_frontiers_wfd_inc,
+)
 
 
 DEFAULT_EXPLORATION_PLANNER = RYU_FRONTIER_GRAPH_BFS
@@ -48,6 +53,7 @@ NAV2D_NEAREST_FRONTIER_PLANNER = "Nav2D nearest-frontier wavefront"
 EXPLORATION_PLANNER_OPTIONS = [
     "Goal seeking",
     RYU_FRONTIER_GRAPH_BFS,
+    KEIDAR_KAMINKA_WFD_INC,
     NAV2D_NEAREST_FRONTIER_PLANNER,
     "Nearest frontier",
     "Largest frontier",
@@ -248,6 +254,17 @@ def _frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
 def detect_frontier_cells(belief: BeliefMap) -> set[tuple[int, int]]:
     """Public detector-stage API used before explicit clustering."""
     return _frontier_cells(belief)
+
+
+def detect_frontier_cells_for_planner(
+    planner_name: str,
+    *,
+    belief: BeliefMap,
+    robot_xy: tuple[float, float],
+) -> set[tuple[int, int]]:
+    if str(planner_name) == KEIDAR_KAMINKA_WFD_INC:
+        return set(detect_frontiers_wfd_inc(belief, robot_xy).frontier_cells)
+    return detect_frontier_cells(belief)
 
 
 def _cluster_frontiers(cells: set[tuple[int, int]]) -> list[list[tuple[int, int]]]:
@@ -1421,6 +1438,26 @@ class RyuFrontierGraphBFSPlanner(BaseExplorationPlanner):
         )
 
 
+class KeidarKaminkaWFDIncrementalPlanner(FrontierExplorationPlanner):
+    """Rank clusters produced from the paper's WFD-INC detector."""
+
+    name = KEIDAR_KAMINKA_WFD_INC
+    citation = KEIDAR_KAMINKA_EFD_CITATION
+
+    def choose_candidate(self, candidates: list[FrontierCandidate]) -> FrontierCandidate:
+        return min(
+            candidates,
+            key=lambda item: (item.distance_from_robot, -item.size, item.target),
+        )
+
+    def select_goal(self, **kwargs) -> ExplorationPlannerResult:
+        result = super().select_goal(**kwargs)
+        return replace(
+            result,
+            reason=f"{result.reason}; citation={self.citation}",
+        )
+
+
 class LargestFrontierPlanner(FrontierExplorationPlanner):
     name = "Largest frontier"
 
@@ -1811,6 +1848,7 @@ class ExplorationPlannerRegistry:
         self._planners: dict[str, BaseExplorationPlanner] = {
             GoalSeekingPlanner.name: GoalSeekingPlanner(),
             RyuFrontierGraphBFSPlanner.name: RyuFrontierGraphBFSPlanner(),
+            KeidarKaminkaWFDIncrementalPlanner.name: KeidarKaminkaWFDIncrementalPlanner(),
             Nav2DNearestFrontierPlanner.name: Nav2DNearestFrontierPlanner(),
             NearestFrontierPlanner.name: NearestFrontierPlanner(),
             LargestFrontierPlanner.name: LargestFrontierPlanner(),

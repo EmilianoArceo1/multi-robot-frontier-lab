@@ -26,7 +26,7 @@ FrontierCell = tuple[int, int]
 FrontierCluster = tuple[FrontierCell, ...]
 FrontierClusterer = Callable[..., Iterable[Iterable[FrontierCell]]]
 
-NO_CLUSTERING_ALGORITHM = "No clustering algorithm available"
+NO_CLUSTERING_ALGORITHM = "None"
 GRIT_DBSCAN_TWO_STAGE = "GriT-DBSCAN two-stage frontier clustering"
 GRIT_DBSCAN_CITATION = (
     "Gao et al., A Novel Frontier-Based Multi-Robot Cooperative Exploration Method; "

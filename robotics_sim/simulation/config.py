@@ -118,7 +118,13 @@ REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS = frozenset(
 TASK_ASSIGN_ALGORITHM_OPTIONS = tuple(
     option
     for option in COORDINATOR_OPTIONS
-    if option == "Frontier cluster Hungarian coordinator"
+    if option in {
+        "Frontier cluster Hungarian coordinator",
+        "Travel-time Voronoi + CQLite distributed Q-learning",
+    }
+)
+from robotics_sim.simulation.algorithm_pipeline_profiles import (
+    task_assignment_pipeline_profile,
 )
 NO_TASK_ASSIGN_ALGORITHM = "No task assign algorithm available"
 
@@ -837,8 +843,19 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
             ),
         )
     )
+    if coordinator_type == "CQLite distributed Q-learning":
+        coordinator_type = "Travel-time Voronoi + CQLite distributed Q-learning"
     if coordinator_type not in COORDINATOR_OPTIONS:
         coordinator_type = default.coordinator_type
+    pipeline_profile = (
+        task_assignment_pipeline_profile(coordinator_type)
+        if "Multiple" in str(simulation.get("agent_mode", default.agent_mode))
+        else None
+    )
+    if pipeline_profile is not None:
+        clustering_algorithm = pipeline_profile.clustering_algorithm
+        if pipeline_profile.frontier_detector is not None:
+            exploration_planner = pipeline_profile.frontier_detector
 
     safety_algorithm = str(coordination.get("safety_algorithm", default.safety_algorithm))
     if safety_algorithm not in SAFETY_ALGORITHM_OPTIONS:

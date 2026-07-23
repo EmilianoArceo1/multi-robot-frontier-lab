@@ -22,7 +22,7 @@
   "camera": {"center_x": 0.0, "center_y": 0.0, "width": 12.5, "height": 8.0},
   "planner": {"type": "A*", "path_simplifier": "Line of sight grid-safe"},
   "exploration": {"planner": "Informative frontier / IPP-lite", "replan_cooldown": 1.0, "ipp_distance_penalty": 0.0},
-  "coordination": {"strategy": "CQLite distributed Q-learning", "parameters": {"cqlite_alpha": 0.6, "cqlite_gamma": 0.95, "cqlite_step_cost": 2.0, "cqlite_overlap_radius": 1.0, "cqlite_communication_range": 50.0, "cqlite_nominal_speed": 0.5, "cqlite_rho": 2.0, "cqlite_sigma": 0.01, "cqlite_information_weight": 0.0, "cqlite_voronoi_fallback": true, "cqlite_use_path_service": false, "cqlite_path_planner": "A*", "cqlite_path_service_candidate_limit": 4}},
+  "coordination": {"strategy": "Travel-time Voronoi + CQLite distributed Q-learning", "parameters": {"cqlite_alpha": 0.6, "cqlite_gamma": 0.95, "cqlite_step_cost": 2.0, "cqlite_overlap_radius": 1.0, "cqlite_communication_range": 50.0, "cqlite_nominal_speed": 0.5, "cqlite_rho": 2.0, "cqlite_sigma": 0.01, "cqlite_information_weight": 0.0, "cqlite_voronoi_fallback": true, "cqlite_use_path_service": false, "cqlite_path_planner": "A*", "cqlite_path_service_candidate_limit": 4}},
   "sensor": {"type": "LiDAR", "range": 15.0},
   "multi_robot": {"robot_count": 6, "selected_robot_index": 0, "same_robot_configuration": true, "robots": [
     {"x": -5.4, "y": -3.1, "theta": 0.0, "v": 0.0, "vision": 15.0, "body_radius": 0.105, "safety_radius": 0.22, "max_speed": 0.5, "max_acceleration": 1.0, "max_angular_speed": 0.7853981633974483, "goal_tolerance": 0.2, "acceleration_gain": 0.75},

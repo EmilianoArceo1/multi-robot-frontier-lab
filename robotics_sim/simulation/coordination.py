@@ -193,6 +193,7 @@ class MultiRobotCoordinator:
         explored_points_by_robot: list[list[tuple[float, float]]] | None = None,
         goal_tolerance: float = 0.25,
         coordination_parameters: Mapping[str, Any] | None = None,
+        mapping_architecture: str = "centralized",
         time_s: float = 0.0,
     ) -> CoordinationResult:
         request = self._build_plugin_request(
@@ -213,6 +214,7 @@ class MultiRobotCoordinator:
             explored_points_by_robot=explored_points_by_robot,
             goal_tolerance=goal_tolerance,
             coordination_parameters=coordination_parameters,
+            mapping_architecture=mapping_architecture,
             time_s=time_s,
         )
         if self.runtime_profile.owns_target_generation:
@@ -259,6 +261,7 @@ class MultiRobotCoordinator:
         explored_points_by_robot: list[list[tuple[float, float]]] | None,
         goal_tolerance: float,
         coordination_parameters: Mapping[str, Any] | None = None,
+        mapping_architecture: str = "centralized",
         time_s: float = 0.0,
     ) -> PluginCoordinationRequest:
         normalized_existing_targets = tuple(
@@ -346,7 +349,10 @@ class MultiRobotCoordinator:
             bounds=normalized_bounds,  # type: ignore[arg-type]
             resolution=float(resolution),
             final_goal_xy=normalized_goal,
-            metadata={"planner_name": planner_name},
+            metadata={
+                "planner_name": planner_name,
+                "mapping_architecture": str(mapping_architecture),
+            },
         )
 
         other_robot_disks_by_id = {
@@ -405,6 +411,7 @@ class MultiRobotCoordinator:
             "target_exclusion_radius": float(target_exclusion_radius),
             "dynamic_obstacle_margin": float(dynamic_obstacle_margin),
             "explored_points_by_robot": normalized_explored_by_robot,
+            "mapping_architecture": str(mapping_architecture),
             # Legacy service injected by the simulator host. This keeps the
             # global_noic_legacy plugin outside robotics_sim while allowing it
             # to reuse the existing coordinated frontier planner during migration.

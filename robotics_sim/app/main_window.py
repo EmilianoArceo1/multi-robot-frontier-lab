@@ -90,13 +90,11 @@ from robotics_sim.planning.exploration_planners import (
 )
 from robotics_sim.simulation.plugin_loader import PluginLoadError
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
-from robotics_sim.simulation.mapping_architecture import (
-    MappingArchitecture,
-    architecture_for_task_assignment,
-    architecture_label,
-)
 from robotics_sim.simulation.algorithm_pipeline_profiles import (
     task_assignment_pipeline_profile,
+)
+from robotics_sim.simulation.approach_profiles import (
+    approach_profile_for_task_assignment,
 )
 
 try:
@@ -1770,14 +1768,15 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             return
         multiple = "Multiple" in self.top_bar.mode_selector.currentText()
         if not multiple:
-            header.set_architecture_badge("", decentralized=False)
+            header.set_approach_profile("", "#2563A6", ())
             return
-        architecture = architecture_for_task_assignment(
+        profile = approach_profile_for_task_assignment(
             self.coordinator_combo.currentText()
         )
-        header.set_architecture_badge(
-            architecture_label(architecture),
-            decentralized=architecture is MappingArchitecture.DECENTRALIZED_SLAM,
+        header.set_approach_profile(
+            profile.architecture_label,
+            profile.architecture_color,
+            profile.badges,
         )
 
     def apply_task_assignment_dependencies(self, *_args) -> None:

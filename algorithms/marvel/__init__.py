@@ -1,0 +1,2 @@
+"""MARVEL paper adapter package."""
+

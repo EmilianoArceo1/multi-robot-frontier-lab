@@ -174,6 +174,7 @@ def test_implemented_hungarian_task_assign_algorithm_is_selectable():
 
     assert TASK_ASSIGN_ALGORITHM_OPTIONS == (
         "Frontier cluster Hungarian coordinator",
+        "MARVEL CTDE graph-attention policy",
         "Travel-time Voronoi + CQLite distributed Q-learning",
     )
     assert items == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
@@ -206,6 +207,35 @@ def test_architecture_badge_tracks_task_assignment_only_in_multiple_mode():
             == "SLAM / decentralized architecture"
         )
         assert _window.hero_header._architecture_color.name().upper() == "#6D3AA8"
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
+
+
+def test_marvel_shows_ctde_and_three_colored_approach_badges():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "MARVEL CTDE graph-attention policy"
+        )
+        _window.update_relevant_parameter_visibility()
+
+        assert _window.hero_header._architecture_label == (
+            "Decentralized execution (CTDE)"
+        )
+        badges = _window.hero_header._approach_badges
+        assert tuple((category, label) for category, label, _ in badges) == (
+            ("Paradigm", "Learning-based"),
+            ("Decision", "Goal-level"),
+            ("Communication", "Unconstrained"),
+        )
+        assert len({color.name() for _, _, color in badges}) == 3
+        assert _window.clustering_algorithm_combo.currentText() == "None"
+        assert not _window.clustering_algorithm_field.isEnabled()
+        assert not _window.exploration_planner_field.isEnabled()
     finally:
         _window.coordinator_combo.setCurrentText(previous_coordinator)
         _window.top_bar.mode_selector.setCurrentText(previous_mode)

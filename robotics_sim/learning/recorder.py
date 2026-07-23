@@ -167,6 +167,19 @@ class InMemoryTrajectoryRecorder:
             )
         self._fire_metrics = metrics
 
+    def abort_episode(self) -> None:
+        """Discard the active episode's recorded state without producing an
+        EpisodeRecord.  Unlike finish_episode(), nothing is returned; the
+        transitions, ground truth and fire metrics collected so far are
+        simply dropped."""
+
+        if self._metadata is None:
+            raise RecorderStateError("abort_episode() called with no active episode")
+        self._metadata = None
+        self._transitions = []
+        self._ground_truth_by_step = {}
+        self._fire_metrics = None
+
     def finish_episode(self) -> EpisodeRecord:
         if self._metadata is None:
             raise RecorderStateError("finish_episode() called with no active episode")

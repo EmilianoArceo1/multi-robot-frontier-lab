@@ -75,6 +75,114 @@ def test_invalid_coordinator_target_is_blacklisted_and_reselected_immediately():
     assert any("trying alternative" in message for message in fake.logs)
 
 
+def test_safe_formation_does_not_receive_host_generated_separation_targets():
+    """A coordinator HOLD must remain HOLD when pairwise clearance is valid."""
+    ego = SimpleNamespace(x=0.0, y=0.0)
+    teammate = SimpleNamespace(x=0.0, y=1.23)
+    fake = SimpleNamespace(
+        robots=[ego, teammate],
+        config=SimpleNamespace(grid_resolution=0.5),
+    )
+    fake.safety_radius_for_robot = lambda robot: 0.35
+    _bind(fake, "multi_dynamic_target_margin", "temporary_separation_target_for_robot")
+
+    assert fake.temporary_separation_target_for_robot(0) is None
+    assert fake.temporary_separation_target_for_robot(1) is None
+
+
+def test_actual_clearance_violation_can_receive_emergency_separation_target():
+    ego = SimpleNamespace(x=0.0, y=0.0)
+    teammate = SimpleNamespace(x=0.0, y=0.5)
+    fake = SimpleNamespace(
+        robots=[ego, teammate],
+        config=SimpleNamespace(grid_resolution=0.5),
+    )
+    fake.safety_radius_for_robot = lambda robot: 0.35
+    _bind(fake, "multi_dynamic_target_margin", "temporary_separation_target_for_robot")
+
+    target = fake.temporary_separation_target_for_robot(0)
+
+    assert target is not None
+    assert target[1] < ego.y
+
+
+def test_coordinator_hold_is_not_replaced_by_host_motion_in_safe_formation():
+    ego = SimpleNamespace(x=0.0, y=0.0)
+    teammate = SimpleNamespace(x=0.0, y=1.23)
+    fake = SimpleNamespace(
+        robots=[ego, teammate],
+        config=SimpleNamespace(
+            exploration_planner="FoV-aware directional frontier",
+            coordinator_type="MARVEL CTDE graph-attention policy",
+            grid_resolution=0.5,
+        ),
+        multi_exploration_targets=[None, None],
+        multi_invalidated_exploration_targets=[[], []],
+        MAX_TARGET_RESELECTION_ATTEMPTS=4,
+        last_goal_selection_reason="",
+    )
+    fake.final_goal_xy = lambda: (9.0, 9.0)
+    fake.safety_radius_for_robot = lambda robot: 0.35
+    fake.publish_multi_exploration_targets = lambda: None
+    def coordinator_hold(**kwargs):
+        fake.last_goal_selection_reason = (
+            "R1: MARVEL checkpoint not found at algorithms/marvel/weights/"
+            "checkpoint.pth [MARVEL CTDE graph-attention policy]"
+        )
+
+    fake.synchronize_multi_frontier_targets = coordinator_hold
+    _bind(
+        fake,
+        "ensure_multi_exploration_target_slots",
+        "multi_dynamic_target_margin",
+        "temporary_separation_target_for_robot",
+        "select_navigation_goal_for_multi_robot",
+    )
+
+    target, reason = fake.select_navigation_goal_for_multi_robot(0, (0.0, 0.0))
+
+    assert target == (0.0, 0.0)
+    assert "no valid frontier assigned" in reason
+    assert "holding position" in reason
+    assert "MARVEL checkpoint not found" in reason
+    assert fake.multi_exploration_targets == [None, None]
+
+
+def test_emergency_separation_never_enters_task_assignment_target_slots():
+    ego = SimpleNamespace(x=0.0, y=0.0)
+    teammate = SimpleNamespace(x=0.0, y=0.5)
+    fake = SimpleNamespace(
+        robots=[ego, teammate],
+        config=SimpleNamespace(
+            exploration_planner="FoV-aware directional frontier",
+            coordinator_type="test coordinator",
+            grid_resolution=0.5,
+        ),
+        multi_exploration_targets=[None, None],
+        multi_invalidated_exploration_targets=[[], []],
+        MAX_TARGET_RESELECTION_ATTEMPTS=4,
+        last_goal_selection_reason="",
+    )
+    fake.final_goal_xy = lambda: (9.0, 9.0)
+    fake.safety_radius_for_robot = lambda robot: 0.35
+    fake.publish_multi_exploration_targets = lambda: None
+    fake.synchronize_multi_frontier_targets = lambda **kwargs: None
+    fake.multi_exploration_target_is_valid = lambda index, target: (True, "valid")
+    _bind(
+        fake,
+        "ensure_multi_exploration_target_slots",
+        "multi_dynamic_target_margin",
+        "temporary_separation_target_for_robot",
+        "select_navigation_goal_for_multi_robot",
+    )
+
+    target, reason = fake.select_navigation_goal_for_multi_robot(0, (0.0, 0.0))
+
+    assert target != (0.0, 0.0)
+    assert "temporary separation target" in reason
+    assert fake.multi_exploration_targets == [None, None]
+
+
 def test_predicted_tracking_collision_uses_safe_rotation_without_retargeting():
     robot = Robot(
         x=0.0,

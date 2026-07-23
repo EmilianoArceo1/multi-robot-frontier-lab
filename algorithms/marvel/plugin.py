@@ -24,6 +24,7 @@ from robotics_interfaces.plugins import (
 )
 
 from algorithms.marvel.runtime import MarvelRuntimeConfiguration
+from algorithms.marvel.backend import MarvelInferenceBackend
 
 
 MARVEL_COORDINATOR = "MARVEL CTDE graph-attention policy"
@@ -51,6 +52,7 @@ class MarvelPlugin:
     def __init__(self) -> None:
         self.runtime = MarvelRuntimeConfiguration.from_environment()
         self._policy = None
+        self._observation_backend = MarvelInferenceBackend()
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:
         readiness_error = self.runtime.readiness_error()
@@ -58,9 +60,9 @@ class MarvelPlugin:
             return self._hold(request, readiness_error)
 
         # Loading validates that the user supplied the authors' expected
-        # PolicyNet checkpoint. The simulator-to-tensor bridge is a separate,
-        # swappable architecture boundary and must be registered explicitly;
-        # never replace the paper policy with an uncited heuristic.
+        # PolicyNet checkpoint.  Observation construction remains a separate
+        # adapter, but the paper-specific implementation is bundled with the
+        # plugin so the simulator's existing belief map works out of the box.
         if self._policy is None:
             try:
                 self._policy = self.runtime.load_policy()
@@ -71,14 +73,17 @@ class MarvelPlugin:
                     f"checkpoint: {exc}",
                 )
 
-        backend = request.shared.get("marvel_observation_backend")
-        if backend is None:
+        backend = request.shared.get(
+            "marvel_observation_backend",
+            self._observation_backend,
+        )
+        try:
+            return backend.assign(request, self._policy)
+        except Exception as exc:
             return self._hold(
                 request,
-                "MARVEL weights loaded; simulator observation backend is not "
-                "registered yet.",
+                f"MARVEL observation backend failed: {exc}",
             )
-        return backend.assign(request, self._policy)
 
     def _hold(self, request: CoordinationRequest, reason: str) -> CoordinationResult:
         requested = set(request.robots_to_assign)

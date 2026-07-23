@@ -1,8 +1,26 @@
 """Regression coverage for dynamically visible configuration fields."""
 
+from types import SimpleNamespace
+
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QGridLayout
 
 from robotics_sim.app.main_window import MainWindow
+from robotics_sim.simulation.engine import SimulationControllerMixin
+from robotics_sim.simulation.config import (
+    CLUSTERING_ALGORITHM_OPTIONS,
+    FRONTIER_ALGORITHM_DETECTOR_OPTIONS,
+    NO_CLUSTERING_ALGORITHM,
+    NO_TASK_ASSIGN_ALGORITHM,
+    REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS,
+    REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS,
+    TASK_ASSIGN_ALGORITHM_OPTIONS,
+    SAFETY_ALGORITHM_OPTIONS,
+    WANG_AMES_BARRIER_CERTIFICATE,
+    SIDE_PANEL_WIDTH,
+    WINDOW_TARGET_HEIGHT,
+    WINDOW_TARGET_WIDTH,
+)
 
 
 _app = QApplication.instance() or QApplication([])
@@ -15,6 +33,107 @@ def _grid_position(widget) -> tuple[int, int, int, int]:
     index = layout.indexOf(widget)
     assert index >= 0
     return layout.getItemPosition(index)
+
+
+def _combo_items(combo) -> list[str]:
+    return [combo.itemText(index) for index in range(combo.count())]
+
+
+def test_window_and_configuration_panel_fit_the_extended_selectors():
+    assert WINDOW_TARGET_WIDTH >= 1440
+    assert WINDOW_TARGET_HEIGHT >= 900
+    assert SIDE_PANEL_WIDTH >= 520
+    assert _window.side_panel_container.width() == SIDE_PANEL_WIDTH
+    assert _window.minimumWidth() >= 1180
+    assert _window.minimumHeight() >= 740
+
+
+def test_combo_wheel_requires_click_and_resets_when_focus_is_lost():
+    combo = _window.safety_algorithm_combo
+    wheel = QEvent(QEvent.Wheel)
+
+    assert _window.eventFilter(combo, wheel) is True
+
+    _window.eventFilter(combo, QEvent(QEvent.MouseButtonPress))
+    assert _window.eventFilter(combo, wheel) is False
+
+    _window.eventFilter(combo, QEvent(QEvent.FocusOut))
+    assert _window.eventFilter(combo, wheel) is True
+
+
+def test_pipeline_algorithm_fields_use_the_new_responsibility_names():
+    assert _window.exploration_planner_field.field_label_base_text == (
+        "Frontier Algorithm Detector"
+    )
+    assert _window.coordinator_field.field_label_base_text == "Task Assign Algorithm"
+    assert _window.exploration_planner_field.field_label.text().startswith(
+        "Frontier Algorithm Detector"
+    )
+    assert _window.coordinator_field.field_label.text() == "Task Assign Algorithm"
+
+
+def test_clustering_stage_lists_the_registered_cited_algorithm():
+    items = _combo_items(_window.clustering_algorithm_combo)
+
+    assert _window.clustering_algorithm_field.field_label_base_text == (
+        "Clustering Algorithm"
+    )
+    assert len(CLUSTERING_ALGORITHM_OPTIONS) == 1
+    assert items == list(CLUSTERING_ALGORITHM_OPTIONS)
+    assert _window.clustering_algorithm_combo.currentIndex() == 0
+    assert _window.read_config().clustering_algorithm == CLUSTERING_ALGORITHM_OPTIONS[0]
+
+
+def test_removed_frontier_algorithms_are_not_selectable():
+    items = _combo_items(_window.exploration_planner_combo)
+
+    assert items == list(FRONTIER_ALGORITHM_DETECTOR_OPTIONS)
+    assert not REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS.intersection(items)
+
+
+def test_implemented_hungarian_task_assign_algorithm_is_selectable():
+    items = _combo_items(_window.coordinator_combo)
+
+    assert TASK_ASSIGN_ALGORITHM_OPTIONS == ("Frontier cluster Hungarian coordinator",)
+    assert items == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
+    assert not REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS.intersection(items)
+    assert _window.coordinator_combo.currentIndex() == 0
+    assert _window.read_config().coordinator_type == TASK_ASSIGN_ALGORITHM_OPTIONS[0]
+
+
+def test_only_cited_safety_algorithm_is_selectable():
+    items = _combo_items(_window.safety_algorithm_combo)
+    assert items == list(SAFETY_ALGORITHM_OPTIONS)
+    assert items == [WANG_AMES_BARRIER_CERTIFICATE]
+    assert _window.read_config().safety_algorithm == WANG_AMES_BARRIER_CERTIFICATE
+
+
+def test_removed_frontier_value_from_legacy_config_falls_back_to_visible_default():
+    legacy = _window.read_config()
+    legacy.exploration_planner = "Nearest frontier"
+
+    _window.apply_config_to_widgets(legacy)
+
+    assert _window.exploration_planner_combo.currentText() in (
+        FRONTIER_ALGORITHM_DETECTOR_OPTIONS
+    )
+    assert _window.exploration_planner_combo.currentText() != "Nearest frontier"
+
+
+def test_multiple_mode_cannot_silently_fall_back_to_a_removed_task_assign_algorithm():
+    messages: list[str] = []
+    statuses: list[str] = []
+    fake = SimpleNamespace(
+        config=SimpleNamespace(coordinator_type=NO_TASK_ASSIGN_ALGORITHM),
+        log_console_message=messages.append,
+        canvas=SimpleNamespace(set_status=statuses.append),
+    )
+
+    SimulationControllerMixin.start_multi_robot_simulation(fake)
+
+    assert messages == statuses
+    assert len(messages) == 1
+    assert "requires a Task Assign Algorithm" in messages[0]
 
 
 def test_vision_model_and_path_simplifier_have_distinct_rows():

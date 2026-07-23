@@ -12,7 +12,15 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSize, QThreadPool, QEasingCurve, QPropertyAnimation
+from PySide6.QtCore import (
+    QEvent,
+    Qt,
+    QTimer,
+    QSize,
+    QThreadPool,
+    QEasingCurve,
+    QPropertyAnimation,
+)
 from PySide6.QtGui import QAction, QColor, QFont, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,6 +85,9 @@ from robotics_sim.app.map_editor import (
 from robotics_sim.simulation.coordination import runtime_profile_for_strategy
 from robotics_sim.simulation.gui_policy import compute_gui_control_policy
 from robotics_sim.simulation.navigation_modes import is_exploration_planner
+from robotics_sim.planning.exploration_planners import (
+    exploration_planner_requires_clustering,
+)
 from robotics_sim.simulation.plugin_loader import PluginLoadError
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
 
@@ -257,6 +268,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
         self.setStyleSheet(self.stylesheet())
         self.build_ui()
+        self._install_combo_wheel_guards()
 
         # Custom-painted children (canvas, every ToggleSwitch, the docked
         # reasoning panel) default to light at construction time regardless
@@ -278,6 +290,26 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.timer.timeout.connect(self.on_simulation_tick)
         self.timer.start(TARGET_FRAME_MS)
 
+    def _install_combo_wheel_guards(self) -> None:
+        """Prevent page scrolling from changing a combo box accidentally."""
+        for combo in self.findChildren(QComboBox):
+            combo.setProperty("wheelActivatedByClick", False)
+            combo.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if isinstance(watched, QComboBox):
+            if event.type() == QEvent.MouseButtonPress:
+                watched.setProperty("wheelActivatedByClick", True)
+            elif event.type() == QEvent.FocusOut:
+                watched.setProperty("wheelActivatedByClick", False)
+            elif (
+                event.type() == QEvent.Wheel
+                and not watched.property("wheelActivatedByClick")
+            ):
+                event.ignore()
+                return True
+        return super().eventFilter(watched, event)
+
     # ========================================================
     # WINDOW SIZE / POSITION
     # ========================================================
@@ -294,11 +326,11 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         width = min(WINDOW_TARGET_WIDTH, available.width() - 70)
         height = min(WINDOW_TARGET_HEIGHT, available.height() - 70)
 
-        width = max(width, 1060)
-        height = max(height, 660)
+        width = max(width, 1200)
+        height = max(height, 760)
 
         self.resize(width, height)
-        self.setMinimumSize(1040, 640)
+        self.setMinimumSize(1180, 740)
 
     def center_on_screen(self):
         screen = QApplication.primaryScreen()
@@ -1669,12 +1701,18 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
 
         uses_grid_path_planner = planner in ("A*", "Dijkstra")
         uses_frontier_exploration = is_exploration_planner(exploration)
+        requires_clustering = exploration_planner_requires_clustering(exploration)
         uses_ipp_lite = exploration == "Informative frontier / IPP-lite"
         is_multi_robot_mode = "Multiple" in self.top_bar.mode_selector.currentText()
         same_config = getattr(self, "same_config_switch", None) is not None and self.same_config_switch.isChecked()
 
         self.path_simplifier_field.setVisible(uses_grid_path_planner)
+        self.clustering_algorithm_field.setVisible(requires_clustering)
+        self.clustering_algorithm_field.setEnabled(
+            bool(CLUSTERING_ALGORITHM_OPTIONS) and not getattr(self, "running", False)
+        )
         self.coordinator_field.setVisible(is_multi_robot_mode and uses_frontier_exploration)
+        self.coordinator_field.setEnabled(bool(TASK_ASSIGN_ALGORITHM_OPTIONS))
         self.exploration_cooldown_field.setVisible(uses_frontier_exploration)
         self.ipp_lambda_field.setVisible(uses_ipp_lite)
         self.apply_algorithm_ownership_gui_policy()
@@ -1721,8 +1759,24 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         if not hasattr(self, "coordinator_combo"):
             return
 
+        selected_task_assign_algorithm = self.coordinator_combo.currentText()
+        if selected_task_assign_algorithm not in TASK_ASSIGN_ALGORITHM_OPTIONS:
+            not_locked = not getattr(self, "running", False)
+            self.exploration_planner_field.setEnabled(not_locked)
+            self.exploration_planner_field.setToolTip(
+                "Frontier detection is configured independently; no task assign "
+                "algorithm is currently available."
+            )
+            if hasattr(self.exploration_planner_field, "field_label"):
+                self.exploration_planner_field.field_label.setText(
+                    self.exploration_planner_field.field_label_base_text
+                )
+            self.planner_combo.setEnabled(not_locked)
+            self.path_simplifier_field.setEnabled(not_locked)
+            return
+
         try:
-            profile = runtime_profile_for_strategy(self.coordinator_combo.currentText())
+            profile = runtime_profile_for_strategy(selected_task_assign_algorithm)
         except PluginLoadError:
             return
 
@@ -1737,7 +1791,11 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.exploration_planner_field.setEnabled(policy.exploration_planner_enabled and not_locked)
         self.exploration_planner_field.setToolTip(policy.exploration_planner_reason)
         if hasattr(self.exploration_planner_field, "field_label"):
-            base_text = getattr(self.exploration_planner_field, "field_label_base_text", "Exploration Planner")
+            base_text = getattr(
+                self.exploration_planner_field,
+                "field_label_base_text",
+                "Frontier Algorithm Detector",
+            )
             label_text = (
                 base_text
                 if policy.exploration_planner_enabled

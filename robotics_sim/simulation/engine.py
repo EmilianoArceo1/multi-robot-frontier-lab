@@ -36,8 +36,11 @@ from robot import Robot
 from robotics_sim.simulation.config import *
 from robotics_sim.planning.exploration_planners import (
     DEFAULT_EXPLORATION_PLANNER,
+    detect_frontier_cells,
+    exploration_planner_requires_clustering,
     select_exploration_goal,
 )
+from robotics_sim.planning.frontier_clustering import cluster_frontier_cells
 from robotics_sim.simulation.navigation_modes import (
     GOAL_SEEKING_PLANNER,
     is_goal_seeking_planner,
@@ -61,12 +64,11 @@ from robotics_sim.diagnostics.snapshot_export import (
 )
 from robotics_sim.planning.path_simplifier import line_of_sight_grid_safe
 from robotics_sim.simulation.hazard_service import RuntimeHazardService
-from robotics_sim.simulation.hazard_safety_runtime import HazardSafetyRuntime
+from robotics_sim.control.wang_ames_barrier_certificate import filter_control
 from robotics_sim.simulation.perf_monitor import PerfMonitor
 from robotics_sim.app.widgets import make_icon, SimulationMetricsWindow, SimulationConsoleWindow
 from robotics_sim.app.render_perf import format_route_plan_perf_line
 from robotics_interfaces.plugins import PluginMetadata, build_runtime_profile
-from robotics_sim.planning.coordinated_frontier_planner import validate_multi_robot_corridor
 from robotics_sim.simulation.coordination import (
     MultiRobotCoordinator,
     RobotCoordinationState,
@@ -907,52 +909,6 @@ class SimulationControllerMixin:
             )
         return self.hazard_service
 
-    def ensure_hazard_safety_runtime(self) -> HazardSafetyRuntime:
-        """Return the cached HazardSafetyRuntime, (re)creating it whenever
-        any hazard_cbf_* config parameter changes -- mirrors ensure_hazard_
-        service()'s cache-invalidation-by-key pattern. One shared instance
-        serves every robot: the team HazardBelief (and therefore the
-        distance field built from it) is the same for all robots, only the
-        per-robot state/limits/safety radius passed to filter_control()
-        differ."""
-        config = self.config
-        key = (
-            float(getattr(config, "hazard_cbf_margin", 0.20)),
-            float(getattr(config, "hazard_cbf_activation_distance", 1.50)),
-            float(getattr(config, "hazard_cbf_k1", 2.0)),
-            float(getattr(config, "hazard_cbf_k2", 2.0)),
-            int(getattr(config, "hazard_cbf_pyramid_levels", 1)),
-            float(getattr(config, "hazard_cbf_sdf_smoothing_sigma_cells", 0.75)),
-            float(getattr(config, "hazard_cbf_acceleration_weight", 1.0)),
-            float(getattr(config, "hazard_cbf_angular_weight", 0.35)),
-            float(getattr(config, "hazard_block_threshold", 0.55)),
-        )
-        runtime = getattr(self, "_hazard_safety_runtime", None)
-        if runtime is None or getattr(self, "_hazard_safety_runtime_key", None) != key:
-            runtime = HazardSafetyRuntime(
-                block_threshold=key[8],
-                margin=key[0],
-                activation_distance=key[1],
-                k1=key[2],
-                k2=key[3],
-                pyramid_levels=key[4],
-                smoothing_sigma_cells=key[5],
-                acceleration_weight=key[6],
-                angular_weight=key[7],
-            )
-            self._hazard_safety_runtime = runtime
-            self._hazard_safety_runtime_key = key
-        return runtime
-
-    def apply_hazard_safety_filter(self, robot, control: np.ndarray) -> np.ndarray:
-        """Return nominal control unchanged.
-
-        Fire is traversable information for aerial robots, not physical
-        occupancy.  The compatibility hook remains at existing call sites,
-        but HazardBelief must never modify motion.
-        """
-        return control
-
     def push_hazard_snapshot(self) -> None:
         """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
         potential editor use (see SimulationCanvas.draw_fires(), no longer
@@ -1175,7 +1131,21 @@ class SimulationControllerMixin:
             planner_type=self.planner_combo.currentText(),
             path_simplifier=self.path_simplifier_combo.currentText(),
             exploration_planner=self.exploration_planner_combo.currentText(),
-            coordinator_type=self.coordinator_combo.currentText() if hasattr(self, "coordinator_combo") else self.config.coordinator_type,
+            clustering_algorithm=(
+                self.clustering_algorithm_combo.currentText() or NO_CLUSTERING_ALGORITHM
+                if hasattr(self, "clustering_algorithm_combo")
+                else self.config.clustering_algorithm
+            ),
+            coordinator_type=(
+                self.coordinator_combo.currentText() or NO_TASK_ASSIGN_ALGORITHM
+                if hasattr(self, "coordinator_combo")
+                else self.config.coordinator_type
+            ),
+            safety_algorithm=(
+                self.safety_algorithm_combo.currentText()
+                if hasattr(self, "safety_algorithm_combo")
+                else self.config.safety_algorithm
+            ),
             coordination_parameters=dict(
                 getattr(self.config, "coordination_parameters", {}) or {}
             ),
@@ -1329,9 +1299,22 @@ class SimulationControllerMixin:
         self.traveled_path_switch.setChecked(config.show_traveled_path)
         self.planner_combo.setCurrentText(config.planner_type)
         self.path_simplifier_combo.setCurrentText(config.path_simplifier)
-        self.exploration_planner_combo.setCurrentText(config.exploration_planner)
+        if config.exploration_planner in FRONTIER_ALGORITHM_DETECTOR_OPTIONS:
+            self.exploration_planner_combo.setCurrentText(config.exploration_planner)
+        else:
+            self.exploration_planner_combo.setCurrentText(DEFAULT_EXPLORATION_PLANNER)
+        if hasattr(self, "clustering_algorithm_combo"):
+            if config.clustering_algorithm in CLUSTERING_ALGORITHM_OPTIONS:
+                self.clustering_algorithm_combo.setCurrentText(config.clustering_algorithm)
+            else:
+                self.clustering_algorithm_combo.setCurrentIndex(-1)
         if hasattr(self, "coordinator_combo"):
-            self.coordinator_combo.setCurrentText(config.coordinator_type)
+            if config.coordinator_type in TASK_ASSIGN_ALGORITHM_OPTIONS:
+                self.coordinator_combo.setCurrentText(config.coordinator_type)
+            else:
+                self.coordinator_combo.setCurrentIndex(-1)
+        if hasattr(self, "safety_algorithm_combo"):
+            self.safety_algorithm_combo.setCurrentText(config.safety_algorithm)
         self.exploration_cooldown_input.setValue(config.exploration_replan_cooldown)
         self.ipp_lambda_input.setValue(config.ipp_distance_penalty)
         self.grid_resolution_input.setValue(config.grid_resolution)
@@ -1617,6 +1600,31 @@ class SimulationControllerMixin:
         # belief-only grid in that case (unchanged prior behavior).
         planning_grid_provider = self._planning_grid_provider_for_robot(self.robot)
 
+        configured_clustering = getattr(self.config, "clustering_algorithm", None)
+        clustering_kwargs: dict[str, object] = {}
+        if (
+            configured_clustering is not None
+            and exploration_planner_requires_clustering(planner_name)
+        ):
+            clustering = cluster_frontier_cells(
+                str(configured_clustering),
+                belief_map=belief,
+                frontier_cells=detect_frontier_cells(belief),
+            )
+            if not clustering.success:
+                self.current_exploration_target = None
+                self.last_goal_selection_reason = (
+                    f"clustering stage rejected frontier selection: {clustering.reason}"
+                )
+                self.canvas.set_exploration_target(None)
+                if agent is not None:
+                    agent.exploration_target_xy = None
+                return None, self.last_goal_selection_reason
+            clustering_kwargs = {
+                "clustering_algorithm": str(configured_clustering),
+                "frontier_clusters": clustering.clusters,
+            }
+
         result = select_exploration_goal(
             planner_name,
             belief_map=belief,
@@ -1636,6 +1644,7 @@ class SimulationControllerMixin:
                 else 0.0
             ),
             planning_grid_provider=planning_grid_provider,
+            **clustering_kwargs,
         )
 
         selected_score = None
@@ -4961,6 +4970,7 @@ class SimulationControllerMixin:
             f"Path simplifier: {cfg.path_simplifier}",
             *exploration_lines,
             f"Multi-robot coordinator: {cfg.coordinator_type}",
+            f"Safety algorithm: {cfg.safety_algorithm}",
         ]
         if profile is not None:
             lines.append(
@@ -6481,7 +6491,7 @@ class SimulationControllerMixin:
         # Each later segment is checked when it becomes active, and predicted
         # motion plus the final pairwise-clearance guard remain exact runtime
         # backstops. Direct is included: its one segment is its full corridor.
-        if self.is_exploration_mode():
+        if False and self.is_exploration_mode():  # retired corridor safety validation
             corridor_check = validate_multi_robot_corridor(
                 start=(float(robot.x), float(robot.y)),
                 waypoints=waypoints[:1],
@@ -6640,6 +6650,15 @@ class SimulationControllerMixin:
               per robot for now. Per-robot planner selection is intentionally a
               later experiment, because it would complicate comparisons.
         """
+        if self.config.coordinator_type == NO_TASK_ASSIGN_ALGORITHM:
+            message = (
+                "Multiple Robot Mode requires a Task Assign Algorithm. "
+                "The legacy coordinator choices were removed from Configuration."
+            )
+            self.log_console_message(message)
+            self.canvas.set_status(message)
+            return
+
         self.spatial_index.rebuild(self.config.obstacles)
         self.planning_in_progress = False
         self.route_request_id += 1
@@ -6831,13 +6850,32 @@ class SimulationControllerMixin:
         )
         return True
 
+    def clustering_configuration_error(self, config: SimulationConfig) -> str | None:
+        """Return the actionable start blocker for an unconfigured stage."""
+        planner_name = str(config.exploration_planner)
+        if not exploration_planner_requires_clustering(planner_name):
+            return None
+        if str(config.clustering_algorithm) in CLUSTERING_ALGORITHM_OPTIONS:
+            return None
+        return (
+            f"{planner_name} requires a Clustering Algorithm. No citable clustering "
+            "implementation is registered, and implicit connected-component "
+            "clustering has been removed."
+        )
+
     def start_simulation(self):
         # Diagnostics/output only: a fresh belief-trace artifact directory
         # for this run (see start_belief_trace_run()), independent of
         # ROBOT_TRACE and covering both the single- and multi-robot paths
         # below since it runs before the mode branch.
-        self.start_belief_trace_run()
         self.config = self.read_config()
+        clustering_error = self.clustering_configuration_error(self.config)
+        if clustering_error is not None:
+            self.log_console_message(clustering_error)
+            self.canvas.set_status(clustering_error)
+            return
+
+        self.start_belief_trace_run()
         if "Multiple" in self.config.agent_mode:
             self.start_multi_robot_simulation()
             return
@@ -7725,7 +7763,7 @@ class SimulationControllerMixin:
                     points.append((float(waypoint_array[0]), float(waypoint_array[1])))
         else:
             target = self.active_target_xy()
-            if target is not None:
+            if False and target is not None:  # retired: certificate is the sole runtime safety layer
                 points.append(target)
 
         # Remove near-duplicate consecutive points. They create zero-length
@@ -8101,15 +8139,6 @@ class SimulationControllerMixin:
         dt = min(real_dt, 0.05) * float(self.simulation_speed)
         self.simulation_time += dt
 
-        if self.collision_checker is None:
-            self.canvas.set_status("Collision checker unavailable.")
-            return
-
-        violation, message = self.inter_robot_clearance_violation()
-        if violation:
-            self.stop_for_collision(message)
-            return
-
         run_sensor_update = self.should_run_sensor_update(time.perf_counter())
         if run_sensor_update:
             self.sensor_update_count += 1
@@ -8157,27 +8186,6 @@ class SimulationControllerMixin:
             robot_radius = self.safety_radius_for_robot(robot)
             agent = self.runtime_agent(index)
             nav_debug_capture = NavigationDebugCapture()
-
-            current_collision = self.collision_checker.check_position(
-                position=robot_position,
-                obstacles=self.config.obstacles,
-                robot_radius=robot_radius,
-            )
-            if current_collision.collision:
-                self.last_collision_report = current_collision
-                self.robot = robot
-                self._finalize_navigation_debug_snapshot(
-                    agent=agent,
-                    robot=robot,
-                    robot_index=index,
-                    decision_kind="HOLD",
-                    decision_reason="robot is inside an obstacle safety region",
-                    event_kind=NavigationDebugEventKind.HOLD,
-                    capture=nav_debug_capture,
-                    control=self.brake_control_for_collision(),
-                )
-                self.stop_for_collision(f"COLLISION: robot {index + 1} is inside an obstacle safety region.")
-                return
 
             self.robot = robot
 
@@ -8289,7 +8297,15 @@ class SimulationControllerMixin:
             if control_profile.owns_control:
                 _LOGGER.debug("R%d control source: %s", index + 1, control_reason)
             control = np.asarray(control, dtype=float).reshape(np.asarray(legacy_control).shape)
-            control = self.apply_hazard_safety_filter(robot, control)
+            certificate = filter_control(
+                ego=robot,
+                others=self.robots,
+                nominal_control=control,
+                safety_distance=lambda other: (
+                    robot_radius + float(self.safety_radius_for_robot(other))
+                ),
+            )
+            control = certificate.control
             flattened_control = np.asarray(control, dtype=float).reshape(-1)
             if flattened_control.size >= 2:
                 nav_debug_capture.applied_control = (
@@ -8303,15 +8319,7 @@ class SimulationControllerMixin:
             # teammate disks; keep point-cloud checks for callers that truly
             # have only sampled geometry.
             prediction_dynamic_obstacles = self.dynamic_robot_obstacles_for_target_selection(index)
-            prediction_report = self.predicted_motion_report(
-                control=control,
-                dt=dt,
-                robot_radius=robot_radius,
-                known_obstacle_points=None,
-                dynamic_obstacles=prediction_dynamic_obstacles,
-                use_ground_truth=True,
-                capture=nav_debug_capture,
-            )
+            prediction_report = None  # retired: no post-certificate geometric veto
             used_rotation_escape = False
             if prediction_report is not None and getattr(prediction_report, "collision", False):
                 self.last_collision_report = prediction_report
@@ -8430,22 +8438,6 @@ class SimulationControllerMixin:
                 control=control,
                 target=target,
             )
-
-            post_position = (float(robot.x), float(robot.y))
-            post_collision = self.collision_checker.check_position(
-                position=post_position,
-                obstacles=self.config.obstacles,
-                robot_radius=robot_radius,
-            )
-            if post_collision.collision:
-                self.last_collision_report = post_collision
-                self.stop_for_collision(f"COLLISION: robot {index + 1} entered an obstacle safety region after update.")
-                return
-
-            violation, message = self.inter_robot_clearance_violation()
-            if violation:
-                self.stop_for_collision(message)
-                return
 
             # If frontier exploration is active, each robot can request a new
             # target after reaching its current one. This is intentionally simple
@@ -8786,7 +8778,7 @@ class SimulationControllerMixin:
         )
         _record_perf(self, "misc", time.perf_counter() - _misc_perf_start)
 
-        if current_collision.collision:
+        if False and current_collision.collision:  # retired geometric safety validation
             self.last_collision_report = current_collision
             self.stop_for_collision(
                 "COLLISION: robot is inside an obstacle safety region."
@@ -8820,7 +8812,6 @@ class SimulationControllerMixin:
             self.last_control = self.nominal_control_safe(
                 blocked=obs.active_segment_blocked, capture=nav_debug_capture
             )
-            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,
@@ -8831,7 +8822,7 @@ class SimulationControllerMixin:
                 capture=nav_debug_capture,
             )
             _record_perf(self, "controller", time.perf_counter() - _controller_perf_start)
-            if predicted_report is not None and getattr(predicted_report, "collision", False):
+            if False and predicted_report is not None and getattr(predicted_report, "collision", False):
                 self.last_collision_report = predicted_report
                 obs.predicted_collision = True
 
@@ -8923,7 +8914,7 @@ class SimulationControllerMixin:
                 robot_radius=robot_radius,
             )
 
-            if local_path_report.collision:
+            if False and local_path_report.collision:
                 self.last_collision_report = local_path_report
                 if self.replan_after_new_information("Active segment blocked by known obstacle."):
                     return
@@ -8936,7 +8927,6 @@ class SimulationControllerMixin:
                 return
 
             self.last_control = self.nominal_control_safe(blocked=False)
-            self.last_control = self.apply_hazard_safety_filter(self.robot, self.last_control)
 
             predicted_report = self.predicted_motion_report(
                 control=self.last_control,
@@ -8945,7 +8935,7 @@ class SimulationControllerMixin:
                 known_obstacle_points=None,
                 use_ground_truth=True,
             )
-            if predicted_report is not None and getattr(predicted_report, "collision", False):
+            if False and predicted_report is not None and getattr(predicted_report, "collision", False):
                 self.last_collision_report = predicted_report
                 if self.replan_after_new_information("Predicted collision before motion update."):
                     return
@@ -8987,7 +8977,7 @@ class SimulationControllerMixin:
         )
         _record_perf(self, "misc", time.perf_counter() - _misc_post_perf_start)
 
-        if post_collision.collision:
+        if False and post_collision.collision:  # retired geometric safety validation
             self.last_collision_report = post_collision
             self.stop_for_collision(
                 "COLLISION: robot entered an obstacle safety region after update."
@@ -9074,6 +9064,10 @@ class SimulationControllerMixin:
         target_robot = robot if robot is not None else getattr(self, "robot", None)
         self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(target_robot)
         self._planner_services.planning_grid_provider = self._planning_grid_provider_for_robot(target_robot)
+        configured_clustering = getattr(self.config, "clustering_algorithm", None)
+        self._planner_services.clustering_algorithm = (
+            str(configured_clustering) if configured_clustering is not None else None
+        )
         _record_perf(self, "planner_services_refresh", time.perf_counter() - _refresh_start)
         return self._planner_services
 
@@ -9209,8 +9203,8 @@ class SimulationControllerMixin:
         """
         Build a RobotObservation snapshot for one robot.
 
-        The engine pre-computes the two safety flags (active_segment_blocked,
-        predicted_collision) so the agent's step() never touches engine internals.
+        Safety flags are intentionally false: the cited barrier certificate is
+        the sole runtime safety mechanism.
 
         Parameters
         ----------
@@ -9234,27 +9228,7 @@ class SimulationControllerMixin:
         robot_radius = self.safety_radius_for_robot(robot)
         sensor_range = float(getattr(robot, "vision", self.config.vision))
 
-        # Pre-compute active segment blocked flag.
         active_segment_blocked = False
-        if self.collision_checker is not None:
-            target = self.active_target_xy()
-            if target is not None:
-                dynamic_pts = (
-                    self.dynamic_robot_obstacle_points_for_robot(int(robot_index))
-                    if robot_index is not None and self.robots
-                    else []
-                )
-                report = self.collision_checker.check_segment_points(
-                    start=robot_xy,
-                    end=target,
-                    obstacle_points=self.obstacle_points_for_segment_safety_check(robot_xy, robot_radius) + dynamic_pts,
-                    robot_radius=robot_radius,
-                )
-                active_segment_blocked = bool(report.collision)
-                if capture is not None:
-                    capture.active_segment = clearance_terms_from_report(
-                        report, checker="check_segment_points", required_clearance=robot_radius
-                    )
 
         # Dynamic obstacles: other robots as (cx, cy, radius) disks.
         dynamic_obstacles: list[tuple[float, float, float]] = []

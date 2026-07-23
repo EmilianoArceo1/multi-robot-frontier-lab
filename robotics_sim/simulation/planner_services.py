@@ -37,9 +37,22 @@ except ImportError:
     _cpw = None  # type: ignore[assignment]
 
 try:
-    from robotics_sim.planning.exploration_planners import select_exploration_goal as _seg
+    from robotics_sim.planning.exploration_planners import (
+        detect_frontier_cells as _detect_frontier_cells,
+        exploration_planner_requires_clustering as _requires_clustering,
+        select_exploration_goal as _seg,
+    )
 except ImportError:
     _seg = None  # type: ignore[assignment]
+    _detect_frontier_cells = None  # type: ignore[assignment]
+    _requires_clustering = None  # type: ignore[assignment]
+
+try:
+    from robotics_sim.planning.frontier_clustering import (
+        cluster_frontier_cells as _cluster_frontier_cells,
+    )
+except ImportError:
+    _cluster_frontier_cells = None  # type: ignore[assignment]
 
 
 Point2D = tuple[float, float]
@@ -110,6 +123,7 @@ class TargetSelectionRequest:
     sensor_range: float
     vision_model: str
     ipp_distance_penalty: float
+    clustering_algorithm: str | None = None
     excluded_targets: tuple[Point2D, ...] = ()
     target_exclusion_radius: float = 0.0
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
@@ -129,10 +143,11 @@ class ParameterPatchValidation:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
 class _FailedResult:
-    success = False
-    target = None
-    reason = "exploration planner package not available"
+    reason: str = "exploration planner package not available"
+    success: bool = False
+    target: Point2D | None = None
     candidates: tuple = ()
 
 
@@ -180,6 +195,9 @@ class PlannerServices:
 
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
     planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None
+    # The engine always writes the configured selection here. None is kept
+    # only for old direct unit callers that predate the explicit stage.
+    clustering_algorithm: str | None = None
 
     # ------------------------------------------------------------------ path
 
@@ -274,6 +292,7 @@ class PlannerServices:
         sensor_range: float,
         vision_model: str,
         ipp_distance_penalty: float,
+        clustering_algorithm: str | None = None,
         excluded_targets: list[Point2D] | None = None,
         target_exclusion_radius: float | None = None,
         is_candidate_reachable: "Callable[[Point2D], bool] | None" = None,
@@ -328,6 +347,11 @@ class PlannerServices:
                 sensor_range=sensor_range,
                 vision_model=vision_model,
                 ipp_distance_penalty=ipp_distance_penalty,
+                clustering_algorithm=(
+                    clustering_algorithm
+                    if clustering_algorithm is not None
+                    else self.clustering_algorithm
+                ),
                 excluded_targets=excluded,
                 target_exclusion_radius=exclusion_radius,
                 is_candidate_reachable=reachability_check,
@@ -340,8 +364,25 @@ class PlannerServices:
         if _seg is None:
             return _FailedResult()
 
-        return _seg(
-            request.planner_name,
+        frontier_clusters = None
+        has_explicit_clustering_stage = request.clustering_algorithm is not None
+        if (
+            has_explicit_clustering_stage
+            and callable(_requires_clustering)
+            and _requires_clustering(request.planner_name)
+        ):
+            if not callable(_detect_frontier_cells) or not callable(_cluster_frontier_cells):
+                return _FailedResult("frontier clustering service is not available")
+            clustering = _cluster_frontier_cells(
+                request.clustering_algorithm,
+                belief_map=request.belief_map,
+                frontier_cells=_detect_frontier_cells(request.belief_map),
+            )
+            if not clustering.success:
+                return _FailedResult(f"clustering stage rejected selection: {clustering.reason}")
+            frontier_clusters = clustering.clusters
+
+        kwargs = dict(
             belief_map=request.belief_map,
             robot_xy=request.robot_xy,
             robot_heading=request.robot_heading,
@@ -356,6 +397,14 @@ class PlannerServices:
             target_exclusion_radius=request.target_exclusion_radius,
             is_candidate_reachable=request.is_candidate_reachable,
             planning_grid_provider=request.planning_grid_provider,
+        )
+        if has_explicit_clustering_stage:
+            kwargs["clustering_algorithm"] = request.clustering_algorithm
+            kwargs["frontier_clusters"] = frontier_clusters
+
+        return _seg(
+            request.planner_name,
+            **kwargs,
         )
 
     # ------------------------------------------------------------------ coordination / control hooks

@@ -215,7 +215,7 @@ def labeled_combo(label: str, combo: QComboBox):
     layout.addWidget(combo)
 
     # Stashed so callers can update the visible label later (e.g. marking
-    # "Exploration Planner" as algorithm-provided/fallback) without needing to
+    # "Frontier Algorithm Detector" as algorithm-provided/fallback) without needing to
     # change this helper's signature or rebuild the widget tree.
     box.field_label = lbl
     box.field_label_base_text = label
@@ -275,12 +275,38 @@ def build_config_panel(window):
     window.path_simplifier_combo.setCurrentText(DEFAULT_PATH_SIMPLIFIER)
 
     window.exploration_planner_combo = QComboBox()
-    window.exploration_planner_combo.addItems(EXPLORATION_PLANNER_OPTIONS)
-    window.exploration_planner_combo.setCurrentText(DEFAULT_EXPLORATION_PLANNER)
+    window.exploration_planner_combo.addItems(FRONTIER_ALGORITHM_DETECTOR_OPTIONS)
+    if DEFAULT_EXPLORATION_PLANNER in FRONTIER_ALGORITHM_DETECTOR_OPTIONS:
+        window.exploration_planner_combo.setCurrentText(DEFAULT_EXPLORATION_PLANNER)
+
+    window.clustering_algorithm_combo = QComboBox()
+    window.clustering_algorithm_combo.addItems(CLUSTERING_ALGORITHM_OPTIONS)
+    window.clustering_algorithm_combo.setPlaceholderText(NO_CLUSTERING_ALGORITHM)
+    if CLUSTERING_ALGORITHM_OPTIONS:
+        window.clustering_algorithm_combo.setCurrentIndex(0)
+    else:
+        window.clustering_algorithm_combo.setCurrentIndex(-1)
+        window.clustering_algorithm_combo.setEnabled(False)
+    window.clustering_algorithm_combo.setToolTip(
+        "Groups the cells produced by the frontier detector. Only algorithms "
+        "implemented from a citable paper are listed; there is no implicit default."
+    )
 
     window.coordinator_combo = QComboBox()
-    window.coordinator_combo.addItems(COORDINATOR_OPTIONS)
-    window.coordinator_combo.setCurrentText(DEFAULT_COORDINATOR)
+    window.coordinator_combo.addItems(TASK_ASSIGN_ALGORITHM_OPTIONS)
+    window.coordinator_combo.setPlaceholderText(NO_TASK_ASSIGN_ALGORITHM)
+    if TASK_ASSIGN_ALGORITHM_OPTIONS:
+        window.coordinator_combo.setCurrentIndex(0)
+    else:
+        window.coordinator_combo.setCurrentIndex(-1)
+        window.coordinator_combo.setEnabled(False)
+
+    window.safety_algorithm_combo = QComboBox()
+    window.safety_algorithm_combo.addItems(SAFETY_ALGORITHM_OPTIONS)
+    window.safety_algorithm_combo.setCurrentText(WANG_AMES_BARRIER_CERTIFICATE)
+    window.safety_algorithm_combo.setToolTip(
+        "Wang, Ames & Egerstedt, IEEE Transactions on Robotics 33(3), 2017."
+    )
 
     window.vision_combo = QComboBox()
     window.vision_combo.addItems([
@@ -438,7 +464,7 @@ def build_config_panel(window):
     )
 
     window.exploration_planner_field = labeled_combo(
-        "Exploration Planner",
+        "Frontier Algorithm Detector",
         window.exploration_planner_combo,
     )
     options_grid.addWidget(
@@ -449,17 +475,35 @@ def build_config_panel(window):
         2,
     )
 
-    window.coordinator_field = labeled_combo(
-        "Algorithm",
-        window.coordinator_combo,
+    window.clustering_algorithm_field = labeled_combo(
+        "Clustering Algorithm",
+        window.clustering_algorithm_combo,
     )
     options_grid.addWidget(
-        window.coordinator_field,
+        window.clustering_algorithm_field,
         11,
         0,
         1,
         2,
     )
+
+    window.coordinator_field = labeled_combo(
+        "Task Assign Algorithm",
+        window.coordinator_combo,
+    )
+    options_grid.addWidget(
+        window.coordinator_field,
+        12,
+        0,
+        1,
+        2,
+    )
+
+    window.safety_algorithm_field = labeled_combo(
+        "Safety Algorithm",
+        window.safety_algorithm_combo,
+    )
+    options_grid.addWidget(window.safety_algorithm_field, 13, 0, 1, 2)
 
     window.exploration_cooldown_input = NumericStepper(
         "Exploration Replan Cooldown (s)",
@@ -471,7 +515,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        12,
+        14,
         0,
         1,
         2,
@@ -487,7 +531,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        12,
+        14,
         0,
         1,
         2,
@@ -509,7 +553,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        13,
+        15,
         0,
         1,
         2,
@@ -525,7 +569,7 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        14,
+        16,
         0,
     )
     window.grid_cell_values_toggle = ToggleSwitch(False)
@@ -538,12 +582,12 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Cell Values", window.grid_cell_values_toggle),
-        15,
+        17,
         0,
     )
     options_grid.addWidget(
         labeled_toggle("Frontier Decisions", window.frontier_decisions_toggle),
-        15,
+        17,
         1,
     )
 
@@ -564,7 +608,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Hazard Map", window.hazard_map_toggle),
-        14,
+        16,
         1,
     )
     window.fire_markers_toggle = ToggleSwitch(False)
@@ -573,7 +617,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Fire Markers", window.fire_markers_toggle),
-        16,
+        18,
         0,
     )
     window.cursor_coordinates_toggle = ToggleSwitch(True)
@@ -582,7 +626,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Mouse Coordinates", window.cursor_coordinates_toggle),
-        16,
+        18,
         1,
     )
 
@@ -901,7 +945,9 @@ def build_config_panel(window):
     window.planner_combo.currentTextChanged.connect(window.update_preview)
     window.path_simplifier_combo.currentTextChanged.connect(window.update_preview)
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
+    window.clustering_algorithm_combo.currentTextChanged.connect(window.update_preview)
     window.coordinator_combo.currentTextChanged.connect(window.update_preview)
+    window.safety_algorithm_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)
     def update_custom_color_visibility(mode: str) -> None:
         visible = str(mode) == "Custom Discovery"
@@ -961,7 +1007,9 @@ def build_config_panel(window):
         window.planner_combo,
         window.path_simplifier_combo,
         window.exploration_planner_combo,
+        window.clustering_algorithm_combo,
         window.coordinator_combo,
+        window.safety_algorithm_combo,
         window.vision_combo,
         window.robot_count_input,
         window.same_config_switch,

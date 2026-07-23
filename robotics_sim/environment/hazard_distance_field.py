@@ -11,7 +11,7 @@ field.
 This module ONLY builds continuous geometry out of an already-observed
 ``HazardBelief`` snapshot (a ``HazardBeliefFrame``). It never reads ground
 truth (``HazardField``/``FireSource``) and performs no CBF/QP math -- see
-``robotics_sim.control.hazard_hocbf_filter`` for that. A hazard the team has
+the active cited safety controller for that. A hazard the team has
 never observed can never appear in the unsafe mask; a hazard the team
 observed earlier and is now outside every robot's field of view stays in
 the mask until the belief itself says otherwise, because both are properties

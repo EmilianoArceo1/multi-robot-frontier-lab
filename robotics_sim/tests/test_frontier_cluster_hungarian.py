@@ -300,6 +300,71 @@ def test_two_far_components_remain_as_two_tasks():
     assert result.debug["reduced_task_count"] == 2
 
 
+def test_dbscan_min_points_classifies_core_border_and_noise():
+    clusters = tuple(
+        _cluster(
+            cluster_id,
+            cells=((x, 0.0),),
+            centroid=(x, 0.0),
+            viewpoints=((x, 0.0),),
+            information_gain=1.0,
+        )
+        for cluster_id, x in (("a", 0.0), ("b", 0.5), ("c", 1.0), ("d", 1.8), ("noise", 5.0))
+    )
+
+    tasks = reduce_frontier_clusters(
+        clusters,
+        grid_size=1.0,
+        merge_radius=1.0,
+        min_points=3,
+        duplicate_tolerance=1e-6,
+    )
+
+    assert len(tasks) == 1
+    assert tasks[0].source_cluster_ids == ("a", "b", "c", "d")
+
+
+def test_paper_rank_equations_are_used_for_information_and_distance():
+    clusters = (
+        _cluster(
+            "big",
+            cells=((0.0, 0.0), (0.0, 0.1), (0.0, 0.2)),
+            centroid=(0.0, 0.0),
+            viewpoints=((0.0, 0.0),),
+            information_gain=1.0,
+        ),
+        _cluster(
+            "small",
+            cells=((10.0, 0.0),),
+            centroid=(10.0, 0.0),
+            viewpoints=((10.0, 0.0),),
+            information_gain=9.0,
+        ),
+    )
+    robots = [_robot(0, -1.0, 0.0), _robot(1, 9.0, 0.0)]
+    common = {
+        "secondary_cluster_grid_size": 1.0,
+        "secondary_cluster_merge_radius": 1.0,
+        "hungarian_obstacle_weight": 0.0,
+    }
+
+    information_request, _ = _build_request(
+        robots=robots,
+        robots_to_assign=(0, 1),
+        clusters=clusters,
+        parameters={**common, "hungarian_information_weight": 1.0, "hungarian_distance_weight": 0.0},
+    )
+    distance_request, _ = _build_request(
+        robots=robots,
+        robots_to_assign=(0, 1),
+        clusters=clusters,
+        parameters={**common, "hungarian_information_weight": 0.0, "hungarian_distance_weight": 1.0},
+    )
+
+    assert create_plugin().assign(information_request).debug["utility_matrix"] == [[1.0, 0.5], [1.0, 0.5]]
+    assert create_plugin().assign(distance_request).debug["utility_matrix"] == [[1.0, 0.5], [0.5, 1.0]]
+
+
 # ---------------------------------------------------------------------------
 # 9. Reordering the service's raw clusters never changes the outcome.
 # ---------------------------------------------------------------------------
@@ -771,6 +836,11 @@ def test_invalid_geometric_parameters_raise_value_error():
 
     with pytest.raises(ValueError):
         reduce_frontier_clusters([cluster], grid_size=1.0, merge_radius=-1.0, duplicate_tolerance=1e-6)
+
+    with pytest.raises(ValueError):
+        reduce_frontier_clusters(
+            [cluster], grid_size=1.0, merge_radius=1.0, min_points=0, duplicate_tolerance=1e-6
+        )
 
 
 def test_plugin_propagates_invalid_weight_parameters_as_value_error():

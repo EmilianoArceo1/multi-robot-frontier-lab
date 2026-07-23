@@ -1,6 +1,4 @@
-"""Global robot-task utility matrix: information + distance + five-line
-obstacle clearance, combined into one deterministic Hungarian-ready score
-per (robot, task) pair.
+"""Paper-faithful robot-task ranking utility for Hungarian allocation.
 
     utility_ij = alpha * information_score_j
                + beta  * distance_score_ij
@@ -69,18 +67,15 @@ def normalize_weights(
     return UtilityWeights(information=information, distance=distance, obstacle=obstacle)
 
 
-def _dense_rank_scores(values_by_key: Mapping[K, float], *, higher_is_better: bool) -> dict[K, float]:
-    """Dense-rank-normalize values to [0.0, 1.0]: the best value maps to
-    1.0, the worst to 0.0, ties share the same score, and a single distinct
-    value (including a single key) maps everyone to 1.0."""
+def _paper_rank_scores(values_by_key: Mapping[K, float], *, higher_is_better: bool) -> dict[K, float]:
+    """Implement Eqs. (2)-(3): fraction of alternatives no better than x."""
     if not values_by_key:
         return {}
-    distinct = sorted(set(values_by_key.values()), reverse=higher_is_better)
-    if len(distinct) <= 1:
-        return {key: 1.0 for key in values_by_key}
-    rank_by_value = {value: rank for rank, value in enumerate(distinct)}
-    max_rank = len(distinct) - 1
-    return {key: 1.0 - (rank_by_value[value] / max_rank) for key, value in values_by_key.items()}
+    values = tuple(values_by_key.values())
+    denominator = float(len(values))
+    if higher_is_better:
+        return {key: sum(value >= other for other in values) / denominator for key, value in values_by_key.items()}
+    return {key: sum(value <= other for other in values) / denominator for key, value in values_by_key.items()}
 
 
 def _distance(a: Point2D, b: Point2D) -> float:
@@ -139,19 +134,19 @@ def build_utility_matrix(
 ) -> tuple[UtilityCell, ...]:
     """Build the full, deterministic robot x task utility matrix.
 
-    Rows are robot_ids in ascending order; columns are task_ids in
-    ascending order. information_score is ranked globally across all
-    tasks (rule: "ranking denso normalizado global entre tareas");
-    distance_score is ranked per robot row, over only the tasks feasible
-    for that robot (infeasible tasks never enter that row's ranking).
+    Rows are robot_ids in ascending order; columns are task_ids in ascending
+    order.  Eq. (2) ranks task size across tasks.  Eq. (3) ranks robot-task
+    distance across robots for each task.  Infeasible pairs do not
+    participate in a task's distance ranking.
     """
     ordered_robot_ids = sorted(robot_ids)
     ordered_tasks = sorted(tasks, key=lambda task: task.task_id)
 
-    information_gain_by_task = {task.task_id: task.information_gain for task in ordered_tasks}
-    information_score_by_task = _dense_rank_scores(information_gain_by_task, higher_is_better=True)
+    size_by_task = {task.task_id: float(len(task.cells)) for task in ordered_tasks}
+    information_score_by_task = _paper_rank_scores(size_by_task, higher_is_better=True)
 
-    cells: list[UtilityCell] = []
+    feasibility_by_pair: dict[tuple[int, str], tuple[bool, str | None, float]] = {}
+    blocked_fraction_by_pair: dict[tuple[int, str], float] = {}
     for robot_id in ordered_robot_ids:
         robot_xy = robot_xy_by_id[robot_id]
         blocked_targets = tuple(blocked_targets_by_robot.get(robot_id, ()))
@@ -162,8 +157,6 @@ def build_utility_matrix(
             else safety_radius
         )
 
-        row_feasibility: dict[str, tuple[bool, str | None, float]] = {}
-        row_blocked_fraction: dict[str, float] = {}
         for task in ordered_tasks:
             feasible, reason, distance = evaluate_feasibility(
                 robot_xy=robot_xy,
@@ -173,8 +166,8 @@ def build_utility_matrix(
                 min_frontier_travel_distance=min_frontier_travel_distance,
                 blocked_target_tolerance=blocked_target_tolerance,
             )
-            row_feasibility[task.task_id] = (feasible, reason, distance)
-            row_blocked_fraction[task.task_id] = (
+            feasibility_by_pair[(robot_id, task.task_id)] = (feasible, reason, distance)
+            blocked_fraction_by_pair[(robot_id, task.task_id)] = (
                 five_line_blocked_fraction(
                     robot_xy=robot_xy,
                     target_xy=task.target,
@@ -186,21 +179,26 @@ def build_utility_matrix(
                 else 0.0
             )
 
-        feasible_distance_by_task = {
-            task.task_id: row_feasibility[task.task_id][2]
-            for task in ordered_tasks
-            if row_feasibility[task.task_id][0]
+    distance_score_by_pair: dict[tuple[int, str], float] = {}
+    for task in ordered_tasks:
+        distances = {
+            robot_id: feasibility_by_pair[(robot_id, task.task_id)][2]
+            for robot_id in ordered_robot_ids
+            if feasibility_by_pair[(robot_id, task.task_id)][0]
         }
-        distance_score_by_task = _dense_rank_scores(feasible_distance_by_task, higher_is_better=False)
+        for robot_id, score in _paper_rank_scores(distances, higher_is_better=False).items():
+            distance_score_by_pair[(robot_id, task.task_id)] = score
 
+    cells: list[UtilityCell] = []
+    for robot_id in ordered_robot_ids:
         for task in ordered_tasks:
-            feasible, reason, distance = row_feasibility[task.task_id]
-            blocked_fraction = row_blocked_fraction[task.task_id]
+            feasible, reason, distance = feasibility_by_pair[(robot_id, task.task_id)]
+            blocked_fraction = blocked_fraction_by_pair[(robot_id, task.task_id)]
             information_score = information_score_by_task.get(task.task_id, 0.0)
 
             if feasible:
                 clearance_score = five_line_clearance_score(blocked_fraction)
-                distance_score = distance_score_by_task.get(task.task_id, 0.0)
+                distance_score = distance_score_by_pair.get((robot_id, task.task_id), 0.0)
                 utility = (
                     weights.information * information_score
                     + weights.distance * distance_score

@@ -298,7 +298,7 @@ def test_hessian_magnitude_grows_as_resolution_refines():
     absolute curvature produces a larger discretized Hessian estimate at
     finer resolutions, since Hessian entries are second finite differences
     with spacing ~resolution -- noise/curvature-estimate magnitude scales
-    roughly like 1/resolution^2. hazard_cbf_sdf_smoothing_sigma_cells is
+    roughly like 1/resolution^2. The legacy smoothing parameter was
     specified in CELL units, so it does not compensate for this in absolute
     (meter) terms. See the audit report for the practical implication on
     QP conditioning at fine resolutions."""

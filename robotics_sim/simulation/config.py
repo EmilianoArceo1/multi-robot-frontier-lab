@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PySide6.QtGui import QColor
+from robotics_sim.control.wang_ames_barrier_certificate import (
+    SAFETY_ALGORITHM_OPTIONS,
+    WANG_AMES_BARRIER_CERTIFICATE,
+)
 
 try:
     from robotics_sim.planning.path_simplifier import (
@@ -59,6 +63,16 @@ except ImportError:
 
 
 try:
+    from robotics_sim.planning.frontier_clustering import (
+        CLUSTERING_ALGORITHM_OPTIONS,
+        NO_CLUSTERING_ALGORITHM,
+    )
+except ImportError:
+    CLUSTERING_ALGORITHM_OPTIONS = ()
+    NO_CLUSTERING_ALGORITHM = "No clustering algorithm available"
+
+
+try:
     from robotics_sim.simulation.coordination import (
         COORDINATOR_OPTIONS,
         DEFAULT_COORDINATOR,
@@ -70,6 +84,43 @@ except ImportError:
         "Synchronized greedy",
     ]
     DEFAULT_COORDINATOR = "Synchronized greedy"
+
+# The configuration UI now exposes the two pipeline responsibilities by their
+# actual roles instead of mixing frontier selection with task allocation.
+# Keep the legacy implementations importable for paper-reproduction tests and
+# archived experiment runners, but do not advertise them as selectable runtime
+# options in the rebuilt pipeline.
+REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS = frozenset(
+    {
+        "Nav2D nearest-frontier wavefront",
+        "Nearest frontier",
+        "Largest frontier",
+        "Utility frontier",
+        "Informative frontier / IPP-lite",
+    }
+)
+FRONTIER_ALGORITHM_DETECTOR_OPTIONS = tuple(
+    option
+    for option in EXPLORATION_PLANNER_OPTIONS
+    if option not in REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS
+)
+
+REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS = frozenset(
+    {
+        "CQLite distributed Q-learning",
+        "FUEL frontier baseline coordinator",
+        "Independent baseline coordinator",
+        "MMPF explore coordinator",
+        "NOIC information coordinator",
+        "Nav2D multi-wavefront coordinator",
+    }
+)
+TASK_ASSIGN_ALGORITHM_OPTIONS = tuple(
+    option
+    for option in COORDINATOR_OPTIONS
+    if option == "Frontier cluster Hungarian coordinator"
+)
+NO_TASK_ASSIGN_ALGORITHM = "No task assign algorithm available"
 
 # ============================================================
 
@@ -150,9 +201,9 @@ def camera_viewport_bounds(
 # LAYOUT
 # ============================================================
 
-SIDE_PANEL_WIDTH = 392
-WINDOW_TARGET_WIDTH = 1180
-WINDOW_TARGET_HEIGHT = 720
+SIDE_PANEL_WIDTH = 520
+WINDOW_TARGET_WIDTH = 1440
+WINDOW_TARGET_HEIGHT = 900
 
 WORLD_X_MIN = -10.0
 WORLD_X_MAX = 10.0
@@ -346,9 +397,15 @@ class SimulationConfig:
     # computes how to reach that target. Goal seeking preserves the old behavior.
     exploration_planner: str = DEFAULT_EXPLORATION_PLANNER
 
+    # Explicit frontier-cell grouping stage. There is intentionally no
+    # connected-component default: selectable implementations must be
+    # registered with paper provenance in planning/frontier_clustering.py.
+    clustering_algorithm: str = NO_CLUSTERING_ALGORITHM
+
     # Multi-robot frontier coordination strategy. This is only used in
     # Multiple Robot Mode when an exploration planner is active.
     coordinator_type: str = DEFAULT_COORDINATOR
+    safety_algorithm: str = WANG_AMES_BARRIER_CERTIFICATE
 
     # Algorithm-specific coordinator settings.  These are intentionally a
     # plain JSON object so paper replicas can pin their published parameters
@@ -396,28 +453,6 @@ class SimulationConfig:
     fire_selection_radius: float = 0.6
     hazard_block_threshold: float = 0.55
 
-    # Observed Hazard OGM-HOCBF safety filter (see
-    # robotics_sim/simulation/hazard_safety_runtime.py). Filters the nominal
-    # control using only OBSERVED hazard belief -- never ground truth -- and
-    # is disabled entirely by hazard_cbf_enabled=False.
-    hazard_cbf_enabled: bool = True
-    hazard_cbf_margin: float = 0.20
-    hazard_cbf_activation_distance: float = 1.50
-    hazard_cbf_k1: float = 2.0
-    hazard_cbf_k2: float = 2.0
-    # Level 0 (finest) alone is the production configuration. Values > 1
-    # remain loadable (1-4, see config_from_sim_payload's clamp) for
-    # research use only -- the CBF audit (see test_hazard_hocbf_filter.py's
-    # multiscale finding tests) found that imposing every pyramid level as
-    # simultaneous hard constraints is measurably MORE conservative and can
-    # make a level-0-feasible state infeasible (~1.4% of activated states in
-    # the audit's sample), for no demonstrated benefit (the coarse level
-    # never corrected the fine level's gradient direction in that sample).
-    # Do not use pyramid_levels > 1 in official experiments/demos.
-    hazard_cbf_pyramid_levels: int = 1
-    hazard_cbf_sdf_smoothing_sigma_cells: float = 0.75
-    hazard_cbf_acceleration_weight: float = 1.0
-    hazard_cbf_angular_weight: float = 0.35
 
     # Simulation camera/view rectangle -- the LOGICAL viewport (also the
     # exploration-metric ROI, see camera_viewport_bounds() below). In editor
@@ -661,15 +696,6 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
             "default_fire_radius": config.default_fire_radius,
             "fire_selection_radius": config.fire_selection_radius,
             "block_threshold": config.hazard_block_threshold,
-            "cbf_enabled": config.hazard_cbf_enabled,
-            "cbf_margin": config.hazard_cbf_margin,
-            "cbf_activation_distance": config.hazard_cbf_activation_distance,
-            "cbf_k1": config.hazard_cbf_k1,
-            "cbf_k2": config.hazard_cbf_k2,
-            "cbf_pyramid_levels": config.hazard_cbf_pyramid_levels,
-            "cbf_sdf_smoothing_sigma_cells": config.hazard_cbf_sdf_smoothing_sigma_cells,
-            "cbf_acceleration_weight": config.hazard_cbf_acceleration_weight,
-            "cbf_angular_weight": config.hazard_cbf_angular_weight,
         },
         "camera": {
             "center_x": config.camera_center_x,
@@ -683,11 +709,13 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
         },
         "exploration": {
             "planner": config.exploration_planner,
+            "clustering_algorithm": config.clustering_algorithm,
             "replan_cooldown": config.exploration_replan_cooldown,
             "ipp_distance_penalty": config.ipp_distance_penalty,
         },
         "coordination": {
             "strategy": config.coordinator_type,
+            "safety_algorithm": config.safety_algorithm,
             "parameters": copy.deepcopy(config.coordination_parameters),
             "replan_interval_s": config.coordination_replan_interval_s,
             "strict_contracts": config.coordination_strict_contracts,
@@ -794,6 +822,12 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     if exploration_planner not in EXPLORATION_PLANNER_OPTIONS:
         exploration_planner = default.exploration_planner
 
+    clustering_algorithm = str(
+        exploration.get("clustering_algorithm", default.clustering_algorithm)
+    )
+    if clustering_algorithm not in CLUSTERING_ALGORITHM_OPTIONS:
+        clustering_algorithm = NO_CLUSTERING_ALGORITHM
+
     coordinator_type = str(
         coordination.get(
             "strategy",
@@ -805,6 +839,10 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     )
     if coordinator_type not in COORDINATOR_OPTIONS:
         coordinator_type = default.coordinator_type
+
+    safety_algorithm = str(coordination.get("safety_algorithm", default.safety_algorithm))
+    if safety_algorithm not in SAFETY_ALGORITHM_OPTIONS:
+        safety_algorithm = WANG_AMES_BARRIER_CERTIFICATE
 
     vision_model = str(sensor.get("type", default.vision_model))
     if vision_model not in VISION_OPTIONS:
@@ -902,7 +940,9 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         planner_type=planner_type,
         path_simplifier=path_simplifier,
         exploration_planner=exploration_planner,
+        clustering_algorithm=clustering_algorithm,
         coordinator_type=coordinator_type,
+        safety_algorithm=safety_algorithm,
         coordination_parameters=coordination_parameters,
         coordination_replan_interval_s=_as_float(
             coordination.get("replan_interval_s", default.coordination_replan_interval_s),
@@ -973,59 +1013,6 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
                     hazard.get("block_threshold", default.hazard_block_threshold),
                     default.hazard_block_threshold,
                 ),
-            ),
-        ),
-        hazard_cbf_enabled=bool(hazard.get("cbf_enabled", default.hazard_cbf_enabled)),
-        hazard_cbf_margin=max(
-            0.0,
-            _as_float(hazard.get("cbf_margin", default.hazard_cbf_margin), default.hazard_cbf_margin),
-        ),
-        hazard_cbf_activation_distance=max(
-            1e-6,
-            _as_float(
-                hazard.get("cbf_activation_distance", default.hazard_cbf_activation_distance),
-                default.hazard_cbf_activation_distance,
-            ),
-        ),
-        hazard_cbf_k1=max(
-            1e-6,
-            _as_float(hazard.get("cbf_k1", default.hazard_cbf_k1), default.hazard_cbf_k1),
-        ),
-        hazard_cbf_k2=max(
-            1e-6,
-            _as_float(hazard.get("cbf_k2", default.hazard_cbf_k2), default.hazard_cbf_k2),
-        ),
-        hazard_cbf_pyramid_levels=max(
-            1,
-            min(
-                4,
-                int(
-                    _as_float(
-                        hazard.get("cbf_pyramid_levels", default.hazard_cbf_pyramid_levels),
-                        default.hazard_cbf_pyramid_levels,
-                    )
-                ),
-            ),
-        ),
-        hazard_cbf_sdf_smoothing_sigma_cells=max(
-            0.0,
-            _as_float(
-                hazard.get("cbf_sdf_smoothing_sigma_cells", default.hazard_cbf_sdf_smoothing_sigma_cells),
-                default.hazard_cbf_sdf_smoothing_sigma_cells,
-            ),
-        ),
-        hazard_cbf_acceleration_weight=max(
-            1e-6,
-            _as_float(
-                hazard.get("cbf_acceleration_weight", default.hazard_cbf_acceleration_weight),
-                default.hazard_cbf_acceleration_weight,
-            ),
-        ),
-        hazard_cbf_angular_weight=max(
-            1e-6,
-            _as_float(
-                hazard.get("cbf_angular_weight", default.hazard_cbf_angular_weight),
-                default.hazard_cbf_angular_weight,
             ),
         ),
         camera_center_x=_as_float(camera.get("center_x", default.camera_center_x), default.camera_center_x),

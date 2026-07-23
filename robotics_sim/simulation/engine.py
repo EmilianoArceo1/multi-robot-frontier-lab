@@ -41,6 +41,7 @@ from robotics_sim.planning.exploration_planners import (
     select_exploration_goal,
 )
 from robotics_sim.planning.frontier_clustering import cluster_frontier_cells
+from robotics_sim.planning.ryu_frontier_graph_bfs import RYU_FRONTIER_GRAPH_BFS
 from robotics_sim.simulation.navigation_modes import (
     GOAL_SEEKING_PLANNER,
     is_goal_seeking_planner,
@@ -1611,7 +1612,11 @@ class SimulationControllerMixin:
                 belief_map=belief,
                 frontier_cells=detect_frontier_cells(belief),
             )
-            if not clustering.success:
+            if not clustering.success and planner_name == RYU_FRONTIER_GRAPH_BFS:
+                clustering_kwargs = {
+                    "clustering_fallback_reason": clustering.reason,
+                }
+            elif not clustering.success:
                 self.current_exploration_target = None
                 self.last_goal_selection_reason = (
                     f"clustering stage rejected frontier selection: {clustering.reason}"
@@ -1620,10 +1625,17 @@ class SimulationControllerMixin:
                 if agent is not None:
                     agent.exploration_target_xy = None
                 return None, self.last_goal_selection_reason
-            clustering_kwargs = {
-                "clustering_algorithm": str(configured_clustering),
-                "frontier_clusters": clustering.clusters,
-            }
+            elif not clustering.clusters and planner_name == RYU_FRONTIER_GRAPH_BFS:
+                clustering_kwargs = {
+                    "clustering_fallback_reason": (
+                        f"{configured_clustering} produced no frontier clusters"
+                    ),
+                }
+            else:
+                clustering_kwargs = {
+                    "clustering_algorithm": str(configured_clustering),
+                    "frontier_clusters": clustering.clusters,
+                }
 
         result = select_exploration_goal(
             planner_name,
@@ -6854,6 +6866,10 @@ class SimulationControllerMixin:
         """Return the actionable start blocker for an unconfigured stage."""
         planner_name = str(config.exploration_planner)
         if not exploration_planner_requires_clustering(planner_name):
+            return None
+        if planner_name == RYU_FRONTIER_GRAPH_BFS:
+            # Ryu's cited 8-connected CCL segmentation is the explicit
+            # fallback when the selected DBSCAN stage is unavailable.
             return None
         if str(config.clustering_algorithm) in CLUSTERING_ALGORITHM_OPTIONS:
             return None

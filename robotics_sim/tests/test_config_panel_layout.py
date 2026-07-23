@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QGridLayout
 
 from robotics_sim.app.main_window import MainWindow
 from robotics_sim.simulation.engine import SimulationControllerMixin
+from robotics_sim.planning.ryu_frontier_graph_bfs import RYU_FRONTIER_GRAPH_BFS
 from robotics_sim.simulation.config import (
     CLUSTERING_ALGORITHM_OPTIONS,
     FRONTIER_ALGORITHM_DETECTOR_OPTIONS,
@@ -89,6 +90,8 @@ def test_removed_frontier_algorithms_are_not_selectable():
 
     assert items == list(FRONTIER_ALGORITHM_DETECTOR_OPTIONS)
     assert not REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS.intersection(items)
+    assert RYU_FRONTIER_GRAPH_BFS in items
+    assert _window.exploration_planner_combo.currentText() == RYU_FRONTIER_GRAPH_BFS
 
 
 def test_implemented_hungarian_task_assign_algorithm_is_selectable():

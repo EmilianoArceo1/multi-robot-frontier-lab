@@ -34,7 +34,12 @@ from robotics_interfaces.proposals import CandidateProposal, ExplorationCandidat
 from robotics_interfaces.results import MetricsEvent, PathPlanningRequest
 
 
-CQLITE_COORDINATOR = "CQLite distributed Q-learning"
+CQLITE_COORDINATOR = "Travel-time Voronoi + CQLite distributed Q-learning"
+CQLITE_CITATION = (
+    "Latif, E.; Parasuraman, R. Communication-Efficient Multi-Robot "
+    "Exploration Using Coverage-Biased Distributed Q-Learning. IEEE RA-L "
+    "9(3), 2622-2629, 2024. https://doi.org/10.1109/LRA.2024.3358095"
+)
 
 # Wire-size proxy used by the native experiments.  One lite message contains
 # robot/state id, x/y frontier coordinates, one Q value, and a small header.
@@ -443,6 +448,10 @@ class CQLitePlugin:
         edge_count = sum(len(value) for value in neighbors.values()) // 2
         debug = {
             "plugin": self.metadata.name,
+            "citation": CQLITE_CITATION,
+            "mapping_architecture": str(
+                request.shared.get("mapping_architecture", "decentralized_slam")
+            ),
             "decision_index": self._decision_index,
             "candidate_source": source,
             "robots_to_assign": list(requested_ids),

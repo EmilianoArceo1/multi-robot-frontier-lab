@@ -90,6 +90,14 @@ from robotics_sim.planning.exploration_planners import (
 )
 from robotics_sim.simulation.plugin_loader import PluginLoadError
 from robotics_sim.simulation.runtime_robot_registry import RuntimeRobotRegistry
+from robotics_sim.simulation.mapping_architecture import (
+    MappingArchitecture,
+    architecture_for_task_assignment,
+    architecture_label,
+)
+from robotics_sim.simulation.algorithm_pipeline_profiles import (
+    task_assignment_pipeline_profile,
+)
 
 try:
     from robotics_sim.environment.collision_checker import CollisionChecker
@@ -1707,15 +1715,25 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         same_config = getattr(self, "same_config_switch", None) is not None and self.same_config_switch.isChecked()
 
         self.path_simplifier_field.setVisible(uses_grid_path_planner)
-        self.clustering_algorithm_field.setVisible(requires_clustering)
+        task_profile = (
+            task_assignment_pipeline_profile(self.coordinator_combo.currentText())
+            if is_multi_robot_mode
+            else None
+        )
+        self.clustering_algorithm_field.setVisible(
+            uses_frontier_exploration
+            and (requires_clustering or task_profile is not None)
+        )
         self.clustering_algorithm_field.setEnabled(
             bool(CLUSTERING_ALGORITHM_OPTIONS) and not getattr(self, "running", False)
         )
         self.coordinator_field.setVisible(is_multi_robot_mode and uses_frontier_exploration)
         self.coordinator_field.setEnabled(bool(TASK_ASSIGN_ALGORITHM_OPTIONS))
+        self.update_mapping_architecture_badge()
         self.exploration_cooldown_field.setVisible(uses_frontier_exploration)
         self.ipp_lambda_field.setVisible(uses_ipp_lite)
         self.apply_algorithm_ownership_gui_policy()
+        self.apply_task_assignment_dependencies()
         coordinator_action = getattr(self, "coordinator_reasoning_panel_action", None)
         if coordinator_action is not None:
             coordinator_action.setVisible(is_multi_robot_mode)
@@ -1746,6 +1764,60 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         if hasattr(self, "dynamics_card"):
             self.dynamics_card.setVisible(not is_multi_robot_mode or same_config)
 
+    def update_mapping_architecture_badge(self) -> None:
+        header = getattr(self, "hero_header", None)
+        if header is None:
+            return
+        multiple = "Multiple" in self.top_bar.mode_selector.currentText()
+        if not multiple:
+            header.set_architecture_badge("", decentralized=False)
+            return
+        architecture = architecture_for_task_assignment(
+            self.coordinator_combo.currentText()
+        )
+        header.set_architecture_badge(
+            architecture_label(architecture),
+            decentralized=architecture is MappingArchitecture.DECENTRALIZED_SLAM,
+        )
+
+    def apply_task_assignment_dependencies(self, *_args) -> None:
+        if not hasattr(self, "coordinator_combo"):
+            return
+        multiple = "Multiple" in self.top_bar.mode_selector.currentText()
+        profile = (
+            task_assignment_pipeline_profile(self.coordinator_combo.currentText())
+            if multiple
+            else None
+        )
+        not_locked = not getattr(self, "running", False)
+        if profile is None:
+            self.clustering_algorithm_field.setEnabled(
+                bool(CLUSTERING_ALGORITHM_OPTIONS) and not_locked
+            )
+            self.exploration_planner_field.setEnabled(not_locked)
+            self.exploration_planner_field.setToolTip(
+                "Frontier detection is configured independently."
+            )
+            if hasattr(self.exploration_planner_field, "field_label"):
+                self.exploration_planner_field.field_label.setText(
+                    self.exploration_planner_field.field_label_base_text
+                )
+            return
+
+        self.clustering_algorithm_combo.setCurrentText(profile.clustering_algorithm)
+        if profile.frontier_detector is not None:
+            self.exploration_planner_combo.setCurrentText(profile.frontier_detector)
+
+        self.clustering_algorithm_field.setEnabled(
+            not profile.lock_clustering and not_locked
+        )
+        self.clustering_algorithm_field.setToolTip(profile.explanation)
+        self.exploration_planner_field.setEnabled(
+            not profile.lock_frontier_detector and not_locked
+        )
+        if profile.lock_frontier_detector:
+            self.exploration_planner_field.setToolTip(profile.explanation)
+
     def apply_algorithm_ownership_gui_policy(self) -> None:
         """
         Grey out (not hide) controls the selected plugin already owns.
@@ -1757,6 +1829,13 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         frontier" looking like the active exploration algorithm.
         """
         if not hasattr(self, "coordinator_combo"):
+            return
+
+        if "Multiple" not in self.top_bar.mode_selector.currentText():
+            not_locked = not getattr(self, "running", False)
+            self.exploration_planner_field.setEnabled(not_locked)
+            self.planner_combo.setEnabled(not_locked)
+            self.path_simplifier_field.setEnabled(not_locked)
             return
 
         selected_task_assign_algorithm = self.coordinator_combo.currentText()

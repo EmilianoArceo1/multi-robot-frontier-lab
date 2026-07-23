@@ -37,6 +37,7 @@ from robotics_sim.simulation.config import *
 from robotics_sim.planning.exploration_planners import (
     DEFAULT_EXPLORATION_PLANNER,
     detect_frontier_cells,
+    detect_frontier_cells_for_planner,
     exploration_planner_requires_clustering,
     select_exploration_goal,
 )
@@ -79,6 +80,14 @@ from robotics_sim.simulation.coordination import (
     select_runtime_path_source,
 )
 from robotics_sim.simulation.plugin_loader import PluginLoadError
+from robotics_sim.simulation.mapping_architecture import (
+    BeliefMapArchitectureStore,
+    MappingArchitecture,
+    architecture_for_task_assignment,
+)
+from robotics_sim.simulation.algorithm_pipeline_profiles import (
+    task_assignment_pipeline_profile,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -798,12 +807,21 @@ class SimulationControllerMixin:
         previous_belief = getattr(self, "belief_map", None)
         next_initial_revision = 0 if previous_belief is None else previous_belief.revision + 1
 
-        self.belief_map = BeliefMap(
+        architecture = (
+            architecture_for_task_assignment(
+                str(getattr(self.config, "coordinator_type", ""))
+            )
+            if "Multiple" in str(getattr(self.config, "agent_mode", ""))
+            else MappingArchitecture.CENTRALIZED
+        )
+        self.belief_map_store = BeliefMapArchitectureStore.create(
+            architecture=architecture,
             bounds=(WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX),
             resolution=max(float(self.config.grid_resolution), 0.10),
             robot_count=max(1, int(robot_count)),
             initial_revision=next_initial_revision,
         )
+        self.belief_map = self.belief_map_store.team_map
         self.explored_free_points = set()
         # Dense, visible obstacle-boundary samples. This is intentionally
         # separate from belief_map.grid OCCUPIED cells; the grid is logical,
@@ -887,6 +905,14 @@ class SimulationControllerMixin:
             count = len(getattr(self, "robots", [])) if getattr(self, "robots", None) else 1
             self.reset_belief_map(robot_count=max(1, count))
         return self.belief_map
+
+    def belief_map_for_robot(self, robot_index: int) -> BeliefMap:
+        """Return a robot-local SLAM map or the centralized team map."""
+        self.ensure_belief_map()
+        store = getattr(self, "belief_map_store", None)
+        if store is None:
+            return self.belief_map
+        return store.map_for_robot(robot_index)
 
     def ensure_hazard_service(self) -> RuntimeHazardService:
         """Return the runtime hazard service aligned with the active belief."""
@@ -1610,7 +1636,11 @@ class SimulationControllerMixin:
             clustering = cluster_frontier_cells(
                 str(configured_clustering),
                 belief_map=belief,
-                frontier_cells=detect_frontier_cells(belief),
+                frontier_cells=detect_frontier_cells_for_planner(
+                    planner_name,
+                    belief=belief,
+                    robot_xy=(float(start_xy[0]), float(start_xy[1])),
+                ),
             )
             if not clustering.success and planner_name == RYU_FRONTIER_GRAPH_BFS:
                 clustering_kwargs = {
@@ -2610,12 +2640,7 @@ class SimulationControllerMixin:
         requesting_robot_index: int,
         force_new_target: bool = False,
     ) -> None:
-        """Assign missing frontier targets using the selected coordinator.
-
-        The map is shared by the team, but each robot must own an independent
-        local target F_i. This method is the bridge between the engine and
-        robotics_sim.simulation.coordination.MultiRobotCoordinator.
-        """
+        """Assign missing frontier targets using the selected coordinator."""
         if self.is_goal_seeking_mode():
             return
 
@@ -2647,10 +2672,17 @@ class SimulationControllerMixin:
         # planner to penalize duplicated sensing.  Passing only the shared map is
         # not enough: it makes teammate-overlap ratios collapse to zero because
         # the planner cannot distinguish who already observed each cell.
-        explored_points_by_robot = [
-            list(self.belief_map.robot_explored_points(index))
-            for index in range(len(self.robots))
-        ]
+        store = getattr(self, "belief_map_store", None)
+        if store is not None and store.decentralized:
+            explored_points_by_robot = [
+                list(store.map_for_robot(index).robot_explored_points(0))
+                for index in range(len(self.robots))
+            ]
+        else:
+            explored_points_by_robot = [
+                list(self.belief_map.robot_explored_points(index))
+                for index in range(len(self.robots))
+            ]
 
         result = coordinator.assign_frontiers(
             planner_name=str(self.config.exploration_planner),
@@ -2671,6 +2703,9 @@ class SimulationControllerMixin:
             goal_tolerance=float(self.config.goal_tolerance),
             coordination_parameters=dict(
                 getattr(self.config, "coordination_parameters", {}) or {}
+            ),
+            mapping_architecture=(
+                store.architecture.value if store is not None else "centralized"
             ),
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
@@ -6865,6 +6900,15 @@ class SimulationControllerMixin:
     def clustering_configuration_error(self, config: SimulationConfig) -> str | None:
         """Return the actionable start blocker for an unconfigured stage."""
         planner_name = str(config.exploration_planner)
+        pipeline_profile = task_assignment_pipeline_profile(
+            str(config.coordinator_type)
+        )
+        if (
+            "Multiple" in str(config.agent_mode)
+            and pipeline_profile is not None
+            and pipeline_profile.clustering_algorithm == NO_CLUSTERING_ALGORITHM
+        ):
+            return None
         if not exploration_planner_requires_clustering(planner_name):
             return None
         if planner_name == RYU_FRONTIER_GRAPH_BFS:
@@ -7576,6 +7620,18 @@ class SimulationControllerMixin:
             robot_index=belief_robot_index,
             time_s=float(getattr(self, "simulation_time", 0.0)),
         )
+        store = getattr(self, "belief_map_store", None)
+        if (
+            store is not None
+            and store.decentralized
+            and robot_index is not None
+        ):
+            local_belief = store.map_for_robot(int(robot_index))
+            local_belief.mark_visible_polygon(
+                polygon,
+                robot_index=0,
+                time_s=float(getattr(self, "simulation_time", 0.0)),
+            )
         self.explored_free_points = belief.explored_points()
 
         # Same sensor update, same polygon: fuse ground-truth hazard into
@@ -7739,6 +7795,14 @@ class SimulationControllerMixin:
                 newly_mapped,
                 time_s=float(getattr(self, "simulation_time", 0.0)),
             )
+            store = getattr(self, "belief_map_store", None)
+            robots = list(getattr(self, "robots", []) or [])
+            active_robot = getattr(self, "robot", None)
+            if store is not None and store.decentralized and active_robot in robots:
+                store.map_for_robot(robots.index(active_robot)).mark_occupied_points(
+                    newly_mapped,
+                    time_s=float(getattr(self, "simulation_time", 0.0)),
+                )
             # A live robot center is always traversable for its own next plan.
             # This does not erase dense obstacle-boundary samples; it only fixes
             # the exact start cell in the logical grid.

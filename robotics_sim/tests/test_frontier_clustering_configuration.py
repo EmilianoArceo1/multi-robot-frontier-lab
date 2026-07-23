@@ -20,6 +20,10 @@ from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.planner_services import PlannerServices
 
 
+CQLITE_TASK_ASSIGNMENT = "Travel-time Voronoi + CQLite distributed Q-learning"
+HUNGARIAN_TASK_ASSIGNMENT = "Frontier cluster Hungarian coordinator"
+
+
 def _belief() -> BeliefMap:
     belief = BeliefMap(bounds=(-2.0, 2.0, -2.0, 2.0), resolution=0.5)
     belief.force_free_point((0.0, 0.0))
@@ -80,6 +84,29 @@ def test_sim_round_trip_records_explicit_absence_without_legacy_fallback():
     assert config_from_sim_payload(payload).clustering_algorithm == (
         NO_CLUSTERING_ALGORITHM
     )
+
+
+def test_multi_robot_task_assignment_normalizes_paper_pipeline_dependencies():
+    cqlite_payload = config_to_sim_payload(
+        SimulationConfig(
+            agent_mode="Multiple Robot Mode",
+            coordinator_type=CQLITE_TASK_ASSIGNMENT,
+            clustering_algorithm=GRIT_DBSCAN_TWO_STAGE,
+        )
+    )
+    cqlite = config_from_sim_payload(cqlite_payload)
+    assert cqlite.clustering_algorithm == NO_CLUSTERING_ALGORITHM
+    assert cqlite.exploration_planner == "Keidar-Kaminka WFD-INC frontier detector"
+
+    hungarian_payload = config_to_sim_payload(
+        SimulationConfig(
+            agent_mode="Multiple Robot Mode",
+            coordinator_type=HUNGARIAN_TASK_ASSIGNMENT,
+            clustering_algorithm=NO_CLUSTERING_ALGORITHM,
+        )
+    )
+    hungarian = config_from_sim_payload(hungarian_payload)
+    assert hungarian.clustering_algorithm == GRIT_DBSCAN_TWO_STAGE
 
 
 def test_fov_start_is_blocked_but_goal_seeking_does_not_need_clustering():

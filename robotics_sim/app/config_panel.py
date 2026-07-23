@@ -238,7 +238,8 @@ def build_config_panel(window):
     main_layout.setSpacing(0)
 
     image_path = find_tamu_image()
-    main_layout.addWidget(HeroHeader(image_path))
+    window.hero_header = HeroHeader(image_path)
+    main_layout.addWidget(window.hero_header)
 
     scroll = QScrollArea()
     scroll.setObjectName("configScroll")
@@ -280,13 +281,11 @@ def build_config_panel(window):
         window.exploration_planner_combo.setCurrentText(DEFAULT_EXPLORATION_PLANNER)
 
     window.clustering_algorithm_combo = QComboBox()
-    window.clustering_algorithm_combo.addItems(CLUSTERING_ALGORITHM_OPTIONS)
+    window.clustering_algorithm_combo.addItems(
+        [NO_CLUSTERING_ALGORITHM, *CLUSTERING_ALGORITHM_OPTIONS]
+    )
     window.clustering_algorithm_combo.setPlaceholderText(NO_CLUSTERING_ALGORITHM)
-    if CLUSTERING_ALGORITHM_OPTIONS:
-        window.clustering_algorithm_combo.setCurrentIndex(0)
-    else:
-        window.clustering_algorithm_combo.setCurrentIndex(-1)
-        window.clustering_algorithm_combo.setEnabled(False)
+    window.clustering_algorithm_combo.setCurrentText(NO_CLUSTERING_ALGORITHM)
     window.clustering_algorithm_combo.setToolTip(
         "Groups the cells produced by the frontier detector. Only algorithms "
         "implemented from a citable paper are listed; there is no implicit default."
@@ -433,20 +432,13 @@ def build_config_panel(window):
         1,
         2,
     )
+    window.path_planner_field = labeled_combo(
+        "Path Planner Service",
+        window.planner_combo,
+    )
     options_grid.addWidget(
-        labeled_combo("Path Planner Service", window.planner_combo),
+        window.path_planner_field,
         7,
-        0,
-        1,
-        2,
-    )
-    window.vision_model_field = labeled_combo(
-        "Vision Model",
-        window.vision_combo,
-    )
-    options_grid.addWidget(
-        window.vision_model_field,
-        8,
         0,
         1,
         2,
@@ -457,19 +449,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        9,
-        0,
-        1,
-        2,
-    )
-
-    window.exploration_planner_field = labeled_combo(
-        "Frontier Algorithm Detector",
-        window.exploration_planner_combo,
-    )
-    options_grid.addWidget(
-        window.exploration_planner_field,
-        10,
+        12,
         0,
         1,
         2,
@@ -481,7 +461,19 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.clustering_algorithm_field,
-        11,
+        8,
+        0,
+        1,
+        2,
+    )
+
+    window.exploration_planner_field = labeled_combo(
+        "Frontier Algorithm Detector",
+        window.exploration_planner_combo,
+    )
+    options_grid.addWidget(
+        window.exploration_planner_field,
+        9,
         0,
         1,
         2,
@@ -493,11 +485,17 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.coordinator_field,
-        12,
+        10,
         0,
         1,
         2,
     )
+
+    window.vision_model_field = labeled_combo(
+        "Vision Model",
+        window.vision_combo,
+    )
+    options_grid.addWidget(window.vision_model_field, 11, 0, 1, 2)
 
     window.safety_algorithm_field = labeled_combo(
         "Safety Algorithm",
@@ -947,6 +945,12 @@ def build_config_panel(window):
     window.exploration_planner_combo.currentTextChanged.connect(window.update_preview)
     window.clustering_algorithm_combo.currentTextChanged.connect(window.update_preview)
     window.coordinator_combo.currentTextChanged.connect(window.update_preview)
+    window.coordinator_combo.currentTextChanged.connect(
+        window.update_mapping_architecture_badge
+    )
+    window.coordinator_combo.currentTextChanged.connect(
+        window.apply_task_assignment_dependencies
+    )
     window.safety_algorithm_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)
     def update_custom_color_visibility(mode: str) -> None:
@@ -1339,4 +1343,3 @@ def build_editor_panel(window):
 
     window.refresh_editor_tool_buttons()
     return panel
-

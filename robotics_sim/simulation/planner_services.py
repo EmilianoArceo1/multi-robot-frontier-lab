@@ -39,12 +39,14 @@ except ImportError:
 try:
     from robotics_sim.planning.exploration_planners import (
         detect_frontier_cells as _detect_frontier_cells,
+        detect_frontier_cells_for_planner as _detect_frontier_cells_for_planner,
         exploration_planner_requires_clustering as _requires_clustering,
         select_exploration_goal as _seg,
     )
 except ImportError:
     _seg = None  # type: ignore[assignment]
     _detect_frontier_cells = None  # type: ignore[assignment]
+    _detect_frontier_cells_for_planner = None  # type: ignore[assignment]
     _requires_clustering = None  # type: ignore[assignment]
 
 try:
@@ -378,10 +380,19 @@ class PlannerServices:
         ):
             if not callable(_detect_frontier_cells) or not callable(_cluster_frontier_cells):
                 return _FailedResult("frontier clustering service is not available")
+            detector = (
+                _detect_frontier_cells_for_planner
+                if callable(_detect_frontier_cells_for_planner)
+                else lambda _name, *, belief, robot_xy: _detect_frontier_cells(belief)
+            )
             clustering = _cluster_frontier_cells(
                 request.clustering_algorithm,
                 belief_map=request.belief_map,
-                frontier_cells=_detect_frontier_cells(request.belief_map),
+                frontier_cells=detector(
+                    request.planner_name,
+                    belief=request.belief_map,
+                    robot_xy=request.robot_xy,
+                ),
             )
             bfs_fallback = request.planner_name == RYU_FRONTIER_GRAPH_BFS
             if not clustering.success and not bfs_fallback:

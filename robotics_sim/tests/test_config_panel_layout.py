@@ -73,16 +73,91 @@ def test_pipeline_algorithm_fields_use_the_new_responsibility_names():
     assert _window.coordinator_field.field_label.text() == "Task Assign Algorithm"
 
 
-def test_clustering_stage_lists_the_registered_cited_algorithm():
+def test_clustering_stage_includes_explicit_none_option():
     items = _combo_items(_window.clustering_algorithm_combo)
 
     assert _window.clustering_algorithm_field.field_label_base_text == (
         "Clustering Algorithm"
     )
     assert len(CLUSTERING_ALGORITHM_OPTIONS) == 1
-    assert items == list(CLUSTERING_ALGORITHM_OPTIONS)
+    assert items == [NO_CLUSTERING_ALGORITHM, *CLUSTERING_ALGORITHM_OPTIONS]
     assert _window.clustering_algorithm_combo.currentIndex() == 0
-    assert _window.read_config().clustering_algorithm == CLUSTERING_ALGORITHM_OPTIONS[0]
+    assert _window.read_config().clustering_algorithm == NO_CLUSTERING_ALGORITHM
+
+
+def test_pipeline_fields_follow_execution_order():
+    planner_row, *_ = _grid_position(_window.path_planner_field)
+    clustering_row, *_ = _grid_position(_window.clustering_algorithm_field)
+    frontier_row, *_ = _grid_position(_window.exploration_planner_field)
+    task_assign_row, *_ = _grid_position(_window.coordinator_field)
+
+    assert planner_row < clustering_row < frontier_row < task_assign_row
+
+
+def test_cqlite_selects_and_locks_its_paper_pipeline_dependencies():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "Travel-time Voronoi + CQLite distributed Q-learning"
+        )
+        _window.update_relevant_parameter_visibility()
+
+        assert _window.clustering_algorithm_combo.currentText() == "None"
+        assert not _window.clustering_algorithm_field.isEnabled()
+        assert _window.exploration_planner_combo.currentText() == (
+            "Keidar-Kaminka WFD-INC frontier detector"
+        )
+        assert not _window.exploration_planner_field.isEnabled()
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
+
+
+def test_hungarian_selects_dbscan_but_leaves_frontier_detector_editable():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "Frontier cluster Hungarian coordinator"
+        )
+        _window.update_relevant_parameter_visibility()
+
+        assert _window.clustering_algorithm_combo.currentText() == (
+            CLUSTERING_ALGORITHM_OPTIONS[0]
+        )
+        assert not _window.clustering_algorithm_field.isEnabled()
+        assert _window.exploration_planner_field.isEnabled()
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
+
+
+def test_single_mode_ignores_hidden_task_assignment_ownership():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "Travel-time Voronoi + CQLite distributed Q-learning"
+        )
+        _window.update_relevant_parameter_visibility()
+        assert not _window.exploration_planner_field.isEnabled()
+
+        _window.top_bar.mode_selector.setCurrentText("Single Robot Mode")
+        _window.update_relevant_parameter_visibility()
+        assert _window.exploration_planner_field.isEnabled()
+        assert _window.exploration_planner_field.field_label.text() == (
+            "Frontier Algorithm Detector"
+        )
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
 
 
 def test_removed_frontier_algorithms_are_not_selectable():
@@ -91,17 +166,50 @@ def test_removed_frontier_algorithms_are_not_selectable():
     assert items == list(FRONTIER_ALGORITHM_DETECTOR_OPTIONS)
     assert not REMOVED_FRONTIER_ALGORITHM_DETECTOR_OPTIONS.intersection(items)
     assert RYU_FRONTIER_GRAPH_BFS in items
-    assert _window.exploration_planner_combo.currentText() == RYU_FRONTIER_GRAPH_BFS
+    assert _window.exploration_planner_combo.currentText() in items
 
 
 def test_implemented_hungarian_task_assign_algorithm_is_selectable():
     items = _combo_items(_window.coordinator_combo)
 
-    assert TASK_ASSIGN_ALGORITHM_OPTIONS == ("Frontier cluster Hungarian coordinator",)
+    assert TASK_ASSIGN_ALGORITHM_OPTIONS == (
+        "Frontier cluster Hungarian coordinator",
+        "Travel-time Voronoi + CQLite distributed Q-learning",
+    )
     assert items == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
     assert not REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS.intersection(items)
     assert _window.coordinator_combo.currentIndex() == 0
     assert _window.read_config().coordinator_type == TASK_ASSIGN_ALGORITHM_OPTIONS[0]
+
+
+def test_architecture_badge_tracks_task_assignment_only_in_multiple_mode():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Single Robot Mode")
+        _window.update_relevant_parameter_visibility()
+        assert _window.hero_header._architecture_label == ""
+
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "Frontier cluster Hungarian coordinator"
+        )
+        _window.update_relevant_parameter_visibility()
+        assert _window.hero_header._architecture_label == "Centralized architecture"
+        assert _window.hero_header._architecture_color.name().upper() == "#2563A6"
+
+        _window.coordinator_combo.setCurrentText(
+            "Travel-time Voronoi + CQLite distributed Q-learning"
+        )
+        assert (
+            _window.hero_header._architecture_label
+            == "SLAM / decentralized architecture"
+        )
+        assert _window.hero_header._architecture_color.name().upper() == "#6D3AA8"
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
 
 
 def test_only_cited_safety_algorithm_is_selectable():

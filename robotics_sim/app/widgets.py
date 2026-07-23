@@ -474,6 +474,13 @@ class HeroHeader(QWidget):
 
         self.image_path = image_path
         self.pixmap = QPixmap(image_path) if image_path else QPixmap()
+        self._architecture_label = ""
+        self._architecture_color = QColor("#2563A6")
+
+    def set_architecture_badge(self, label: str, *, decentralized: bool) -> None:
+        self._architecture_label = str(label)
+        self._architecture_color = QColor("#6D3AA8" if decentralized else "#2563A6")
+        self.update()
 
 
     def paintEvent(self, event):
@@ -616,6 +623,18 @@ class HeroHeader(QWidget):
             Qt.AlignVCenter | Qt.AlignLeft,
             "Validated parameters",
         )
+
+        if self._architecture_label:
+            architecture_rect = QRectF(182, 108, self.width() - 204, 24)
+            architecture_path = QPainterPath()
+            architecture_path.addRoundedRect(architecture_rect, 12, 12)
+            painter.fillPath(architecture_path, self._architecture_color)
+            painter.setPen(QPen(QColor("white")))
+            painter.drawText(
+                architecture_rect.adjusted(10, 0, -6, 0),
+                Qt.AlignVCenter | Qt.AlignLeft,
+                self._architecture_label,
+            )
 
         painter.restore()
 

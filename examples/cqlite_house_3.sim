@@ -60,7 +60,7 @@
   "planner": {"type": "A*", "path_simplifier": "Line of sight grid-safe"},
   "exploration": {"planner": "Informative frontier / IPP-lite", "replan_cooldown": 1.0, "ipp_distance_penalty": 0.0},
   "coordination": {
-    "strategy": "CQLite distributed Q-learning",
+    "strategy": "Travel-time Voronoi + CQLite distributed Q-learning",
     "parameters": {
       "cqlite_alpha": 0.6, "cqlite_gamma": 0.95, "cqlite_step_cost": 2.0,
       "cqlite_overlap_radius": 1.0, "cqlite_communication_range": 50.0,

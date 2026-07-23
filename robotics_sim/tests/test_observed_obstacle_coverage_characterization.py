@@ -396,8 +396,12 @@ def test_all_production_mark_occupied_call_sites_are_the_audited_set():
 
     # Confirmed by this same AST walk (not assumed): belief_map.py's
     # mark_occupied_points() calls self.mark_occupied_cell() exactly once,
-    # engine.py's update_sensed_obstacles() calls belief.mark_occupied_
-    # points() exactly once, and exploration_planners.py's
+        # engine.py's update_sensed_obstacles() calls mark_occupied_points()
+        # twice from the SAME sensor-derived newly_mapped collection: once
+        # for the team rendering/metrics projection and once for the active
+        # robot's independent SLAM map when decentralized mapping is enabled.
+        # Both calls are downstream of point_visible_from_robot(); neither is
+        # a ground-truth occupancy source. exploration_planners.py's
     # _belief_from_kwargs() calls belief.mark_occupied_cell() exactly once
     # (inside a `for point in ...` loop, but that is ONE Call node in the
     # AST -- the loop's per-point repetition happens at runtime, not as
@@ -405,7 +409,7 @@ def test_all_production_mark_occupied_call_sites_are_the_audited_set():
     audited = Counter(
         {
             ("robotics_sim.environment.belief_map", "mark_occupied_points", "mark_occupied_cell"): 1,
-            ("robotics_sim.simulation.engine", "update_sensed_obstacles", "mark_occupied_points"): 1,
+                ("robotics_sim.simulation.engine", "update_sensed_obstacles", "mark_occupied_points"): 2,
             ("robotics_sim.planning.exploration_planners", "_belief_from_kwargs", "mark_occupied_cell"): 1,
         }
     )

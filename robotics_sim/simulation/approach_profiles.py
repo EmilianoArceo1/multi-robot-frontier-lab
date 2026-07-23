@@ -8,6 +8,9 @@ from robotics_sim.simulation.mapping_architecture import MappingArchitecture
 
 
 MARVEL_COORDINATOR = "MARVEL CTDE graph-attention policy"
+MARVEL_SCALED_COORDINATOR = (
+    "MARVEL CTDE graph-attention policy (scaled environment)"
+)
 CQLITE_COORDINATOR = "Travel-time Voronoi + CQLite distributed Q-learning"
 HUNGARIAN_COORDINATOR = "Frontier cluster Hungarian coordinator"
 
@@ -62,6 +65,16 @@ _PROFILES = {
         architecture_color="#4338CA",
         # MARVEL assumes perfect communication and maintains one shared map,
         # even though each actor executes its learned policy independently.
+        mapping_architecture=MappingArchitecture.CENTRALIZED,
+        badges=(
+            ApproachBadge("Paradigm", "Learning-based", "#7C3AED"),
+            ApproachBadge("Decision", "Goal-level", "#0F766E"),
+            ApproachBadge("Communication", "Unconstrained", "#D97706"),
+        ),
+    ),
+    MARVEL_SCALED_COORDINATOR: CoordinationApproachProfile(
+        architecture_label="Decentralized execution (CTDE) - scaled",
+        architecture_color="#0E7490",
         mapping_architecture=MappingArchitecture.CENTRALIZED,
         badges=(
             ApproachBadge("Paradigm", "Learning-based", "#7C3AED"),

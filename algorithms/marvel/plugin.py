@@ -24,10 +24,13 @@ from robotics_interfaces.plugins import (
 )
 
 from algorithms.marvel.runtime import MarvelRuntimeConfiguration
-from algorithms.marvel.backend import MarvelInferenceBackend
+from algorithms.marvel.backend import (
+    MARVEL_COORDINATOR,
+    PAPER_SPATIAL_MODE,
+    MarvelInferenceBackend,
+)
 
 
-MARVEL_COORDINATOR = "MARVEL CTDE graph-attention policy"
 MARVEL_SOURCE = "https://arxiv.org/abs/2502.20217"
 
 
@@ -49,10 +52,21 @@ class MarvelPlugin:
         candidate_input_mode=CandidateInputMode.PLUGIN_INTERNAL,
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        observation_backend: MarvelInferenceBackend | None = None,
+    ) -> None:
         self.runtime = MarvelRuntimeConfiguration.from_environment()
         self._policy = None
-        self._observation_backend = MarvelInferenceBackend()
+        self._observation_backend = (
+            observation_backend
+            if observation_backend is not None
+            else MarvelInferenceBackend(
+                strategy_name=self.metadata.name,
+                spatial_mode=PAPER_SPATIAL_MODE,
+            )
+        )
 
     def assign(self, request: CoordinationRequest) -> CoordinationResult:
         readiness_error = self.runtime.readiness_error()

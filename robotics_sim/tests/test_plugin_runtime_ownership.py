@@ -292,7 +292,7 @@ def test_no_control_keeps_nominal_control():
 
 def test_plugin_control_does_not_bypass_safety_veto_if_testable():
     """A CONTROL-owning plugin only proposes a control; it must not be able
-    to skip the safety veto that runs before the control is actually applied.
+    to skip the selected barrier-certificate filter before actuation.
 
     Full physics is out of scope here (see engine.py's per-robot movement
     loop), so this test proves the guarantee at the two points that actually
@@ -300,9 +300,9 @@ def test_plugin_control_does_not_bypass_safety_veto_if_testable():
       1. select_runtime_control_source() is a pure decision point -- it does
          not mutate its inputs or touch a robot itself.
       2. engine.py's source keeps the call order plugin proposal ->
-         predicted_motion_report() (the veto) -> robot.update() (the
-         actuation), so a future edit that reordered them would fail this
-         test instead of silently letting a plugin bypass safety.
+         filter_control() (the cited CBF) -> robot.update() (the actuation),
+         so a future edit that reordered them would fail this test instead of
+         silently letting a plugin bypass the selected safety algorithm.
     """
     plugin = FakeControlPlugin()
     profile = build_runtime_profile(plugin.metadata)
@@ -320,10 +320,10 @@ def test_plugin_control_does_not_bypass_safety_veto_if_testable():
     assert legacy_control.tolist() == [[0.0], [0.0]]
 
     # Structural guarantee: in the movement loop, whatever select_runtime_
-    # control_source() returns must reach predicted_motion_report() (the
-    # safety veto) strictly before robot.update() (the actuation).
+    # control_source() returns must reach the cited barrier-certificate filter
+    # strictly before robot.update() (the actuation).
     source = inspect.getsource(SimulationControllerMixin)
     call_site = source.index("select_runtime_control_source(")
-    veto_call = source.index("predicted_motion_report(", call_site)
+    veto_call = source.index("filter_control(", call_site)
     update_call = source.index("robot.update(control, dt)", call_site)
     assert call_site < veto_call < update_call

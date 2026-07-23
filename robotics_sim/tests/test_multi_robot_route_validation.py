@@ -248,12 +248,14 @@ def test_hold_no_frontier_only_when_no_candidates_exist(monkeypatch):
     assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_HOLD_NO_FRONTIER
 
 
-def test_route_conflict_does_not_report_no_frontier(monkeypatch):
+def test_robot_safety_zone_conflict_waits_and_releases_transient_blacklist(
+    monkeypatch,
+):
     """A real frontier can have no currently safe departure corridor.
 
-    After bounded alternative-target retries this is HOLD_ROUTE_BLOCKED, not
-    the semantically false HOLD_NO_FRONTIER. CQLite separately guarantees that
-    clearing this failed target is not learned as successful exploration.
+    A teammate's current position can move, so after bounded alternative-target
+    retries this is WAITING_FOR_CORRIDOR. Targets rejected during this transient
+    round must be eligible again once that teammate has left.
     """
     fake = _build_fake_engine(
         planner_type="A*",
@@ -274,11 +276,14 @@ def test_route_conflict_does_not_report_no_frontier(monkeypatch):
     result = fake.assign_route_to_multi_robot(0)
 
     assert result is True
-    assert fake.multi_route_states[0] == SimulationControllerMixin.ROUTE_STATE_HOLD_ROUTE_BLOCKED
+    assert (
+        fake.multi_route_states[0]
+        == SimulationControllerMixin.ROUTE_STATE_WAITING_FOR_CORRIDOR
+    )
     assert fake.multi_route_states[0] != SimulationControllerMixin.ROUTE_STATE_HOLD_NO_FRONTIER
     assert fake.multi_exploration_targets[0] is None
-    assert fake.multi_invalidated_exploration_targets[0] == [(4.0, 0.0)]
-    assert any("HOLD_ROUTE_BLOCKED" in message for message in fake.console_logs)
+    assert fake.multi_invalidated_exploration_targets[0] == []
+    assert any("waiting for corridor" in message for message in fake.console_logs)
 
 
 def test_route_blocked_waits_instead_of_false_no_frontier(monkeypatch):

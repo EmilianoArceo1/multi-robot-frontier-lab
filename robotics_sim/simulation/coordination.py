@@ -146,16 +146,18 @@ class MultiRobotCoordinator:
         self.strategy = self.plugin.metadata.name
         self.runtime_profile: PluginRuntimeProfile = build_runtime_profile(self.plugin.metadata)
         _LOGGER.info(
-            "Algorithm runtime profile: plugin=%s owns_target_generation=%s "
-            "owns_task_allocation=%s owns_path_planning=%s owns_control=%s "
-            "uses_legacy_frontier_service=%s uses_external_path_planner=%s "
+            "Algorithm runtime profile: plugin=%s detects_frontiers=%s "
+            "generates_tasks=%s allocates_tasks=%s plans_paths=%s "
+            "controls_motion=%s uses_external_candidate_pipeline=%s "
+            "uses_external_path_planner=%s "
             "uses_external_motion_controller=%s",
             self.plugin.metadata.name,
-            self.runtime_profile.owns_target_generation,
-            self.runtime_profile.owns_task_allocation,
-            self.runtime_profile.owns_path_planning,
-            self.runtime_profile.owns_control,
-            self.runtime_profile.uses_legacy_frontier_service,
+            self.runtime_profile.detects_frontiers,
+            self.runtime_profile.generates_tasks,
+            self.runtime_profile.allocates_tasks,
+            self.runtime_profile.plans_paths,
+            self.runtime_profile.controls_motion,
+            self.runtime_profile.uses_external_candidate_pipeline,
             self.runtime_profile.uses_external_path_planner,
             self.runtime_profile.uses_external_motion_controller,
         )
@@ -192,6 +194,7 @@ class MultiRobotCoordinator:
         route_points_by_robot: list[list[tuple[float, float]]] | None = None,
         explored_points_by_robot: list[list[tuple[float, float]]] | None = None,
         goal_tolerance: float = 0.25,
+        camera_fov_degrees: float = 70.0,
         coordination_parameters: Mapping[str, Any] | None = None,
         mapping_architecture: str = "centralized",
         time_s: float = 0.0,
@@ -213,13 +216,14 @@ class MultiRobotCoordinator:
             route_points_by_robot=route_points_by_robot,
             explored_points_by_robot=explored_points_by_robot,
             goal_tolerance=goal_tolerance,
+            camera_fov_degrees=camera_fov_degrees,
             coordination_parameters=coordination_parameters,
             mapping_architecture=mapping_architecture,
             time_s=time_s,
         )
-        if self.runtime_profile.owns_target_generation:
+        if not self.runtime_profile.uses_external_candidate_pipeline:
             _LOGGER.debug(
-                "Exploration source: %s; legacy frontier service (fallback only): %r",
+                "Exploration source: %s; inactive host frontier selector: %r",
                 self.plugin.metadata.name,
                 planner_name,
             )
@@ -260,6 +264,7 @@ class MultiRobotCoordinator:
         route_points_by_robot: list[list[tuple[float, float]]] | None,
         explored_points_by_robot: list[list[tuple[float, float]]] | None,
         goal_tolerance: float,
+        camera_fov_degrees: float = 70.0,
         coordination_parameters: Mapping[str, Any] | None = None,
         mapping_architecture: str = "centralized",
         time_s: float = 0.0,
@@ -442,6 +447,7 @@ class MultiRobotCoordinator:
                 "reservation_resolution": max(float(resolution), 1e-6),
                 "grid_resolution": float(resolution),
                 "goal_tolerance": float(goal_tolerance),
+                "marvel_fov_degrees": float(camera_fov_degrees),
                 "safety_radius": default_safety_radius,
                 "min_frontier_travel_distance": min_frontier_travel_distance,
             },

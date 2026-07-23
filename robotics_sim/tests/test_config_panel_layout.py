@@ -175,6 +175,7 @@ def test_implemented_hungarian_task_assign_algorithm_is_selectable():
     assert TASK_ASSIGN_ALGORITHM_OPTIONS == (
         "Frontier cluster Hungarian coordinator",
         "MARVEL CTDE graph-attention policy",
+        "MARVEL CTDE graph-attention policy (scaled environment)",
         "Travel-time Voronoi + CQLite distributed Q-learning",
     )
     assert items == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
@@ -216,6 +217,9 @@ def test_architecture_badge_tracks_task_assignment_only_in_multiple_mode():
 def test_marvel_shows_ctde_and_three_colored_approach_badges():
     previous_mode = _window.top_bar.mode_selector.currentText()
     previous_coordinator = _window.coordinator_combo.currentText()
+    previous_vision_model = _window.vision_combo.currentText()
+    previous_vision = _window.vision_slider.value()
+    previous_fov = _window.camera_fov_input.value()
     try:
         _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
         _window.coordinator_combo.setCurrentText(
@@ -236,8 +240,70 @@ def test_marvel_shows_ctde_and_three_colored_approach_badges():
         assert _window.clustering_algorithm_combo.currentText() == "None"
         assert not _window.clustering_algorithm_field.isEnabled()
         assert not _window.exploration_planner_field.isEnabled()
+        assert _window.vision_combo.currentText() == "Camera / FoV"
+        assert not _window.vision_model_field.isEnabled()
+        assert _window.vision_slider.value() == 10.0
+        assert _window.vision_slider.isEnabled()
+        assert _window.multi_vision_slider.value() == 10.0
+        assert _window.multi_vision_slider.isEnabled()
+        assert all(
+            robot.vision == 10.0 for robot in _window.multi_robot_configs
+        )
+        assert _window.read_config().camera_fov_degrees == 120.0
+
+        _window.vision_slider.setValue(6.0)
+        _window.camera_fov_input.setValue(90.0)
+        _window.update_preview()
+
+        assert _window.vision_slider.value() == 6.0
+        assert _window.camera_fov_input.value() == 90.0
+        adjusted = _window.read_config()
+        assert adjusted.vision == 6.0
+        assert adjusted.camera_fov_degrees == 90.0
     finally:
         _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.vision_combo.setCurrentText(previous_vision_model)
+        _window.vision_slider.setValue(previous_vision)
+        _window.camera_fov_input.setValue(previous_fov)
+        _window.top_bar.mode_selector.setCurrentText(previous_mode)
+        _window.update_relevant_parameter_visibility()
+
+
+def test_scaled_marvel_defaults_to_three_meter_scale_and_remains_adjustable():
+    previous_mode = _window.top_bar.mode_selector.currentText()
+    previous_coordinator = _window.coordinator_combo.currentText()
+    previous_vision_model = _window.vision_combo.currentText()
+    previous_vision = _window.vision_slider.value()
+    previous_fov = _window.camera_fov_input.value()
+    try:
+        _window.top_bar.mode_selector.setCurrentText("Multiple Robot Mode")
+        _window.coordinator_combo.setCurrentText(
+            "MARVEL CTDE graph-attention policy (scaled environment)"
+        )
+        _window.update_relevant_parameter_visibility()
+
+        assert _window.hero_header._architecture_label == (
+            "Decentralized execution (CTDE) - scaled"
+        )
+        assert _window.vision_combo.currentText() == "Camera / FoV"
+        assert not _window.vision_model_field.isEnabled()
+        assert _window.vision_slider.value() == 3.0
+        assert _window.multi_vision_slider.value() == 3.0
+        assert all(robot.vision == 3.0 for robot in _window.multi_robot_configs)
+        assert _window.camera_fov_input.value() == 120.0
+        assert "1.2 m graph nodes" in _window.vision_slider.toolTip()
+
+        _window.vision_slider.setValue(3.5)
+        _window.camera_fov_input.setValue(90.0)
+        adjusted = _window.read_config()
+
+        assert adjusted.vision == 3.5
+        assert adjusted.camera_fov_degrees == 90.0
+    finally:
+        _window.coordinator_combo.setCurrentText(previous_coordinator)
+        _window.vision_combo.setCurrentText(previous_vision_model)
+        _window.vision_slider.setValue(previous_vision)
+        _window.camera_fov_input.setValue(previous_fov)
         _window.top_bar.mode_selector.setCurrentText(previous_mode)
         _window.update_relevant_parameter_visibility()
 

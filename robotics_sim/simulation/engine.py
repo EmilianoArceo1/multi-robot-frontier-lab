@@ -872,6 +872,54 @@ class SimulationControllerMixin:
         self.push_discovered_hazard_frame()
         self._discovered_hazard_render_dirty = False
 
+    def initialize_multi_robot_starting_belief(self) -> None:
+        """Populate the fresh team map before the first coordination request.
+
+        MARVEL's published environment first reveals a panoramic starting
+        region, then chooses graph-aligned robot starts inside it.  Host
+        scenarios provide explicit starts instead, so both MARVEL adapters
+        reproduce an equivalent known starting region with one 360-degree scan
+        at every explicit start before applying the configured camera FoV.
+        """
+
+        robots = list(getattr(self, "robots", ()) or ())
+        if not robots:
+            return
+        profile = task_assignment_pipeline_profile(
+            str(getattr(self.config, "coordinator_type", ""))
+        )
+        if profile is not None and profile.bootstrap_panorama:
+            previous_robot = self.robot
+            previous_fov = float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            )
+            try:
+                self.config.camera_fov_degrees = 360.0
+                for robot_index, robot in enumerate(robots):
+                    self.robot = robot
+                    self.record_explored_area(
+                        force=True,
+                        robot_index=robot_index,
+                    )
+                    self.update_sensed_obstacles(force_status=False)
+                    self.force_robot_pose_free_in_belief(robot_index)
+            finally:
+                self.config.camera_fov_degrees = previous_fov
+                self.robot = previous_robot
+            self.log_console_message(
+                "MARVEL starting-region bootstrap: 360° observation at each "
+                "robot start; "
+                f"runtime camera FoV restored to {previous_fov:.1f}°."
+            )
+
+        for robot_index, robot in enumerate(robots):
+            previous_robot = self.robot
+            self.robot = robot
+            self.record_explored_area(force=True, robot_index=robot_index)
+            self.update_sensed_obstacles(force_status=False)
+            self.force_robot_pose_free_in_belief(robot_index)
+            self.robot = previous_robot
+
     def _publish_explored_area_source_to_canvas(self) -> None:
         """Point the canvas at this run's live belief_map.explored_by_robot
         mask -- the authoritative DISCRETE source rebuild_explored_area_
@@ -1149,6 +1197,7 @@ class SimulationControllerMixin:
             theta=float(self.theta_input.value()),
             v=float(self.v_slider.value()),
             vision=float(self.vision_slider.value()),
+            camera_fov_degrees=float(self.camera_fov_input.value()),
             body_radius=float(self.body_radius_slider.value()),
             safety_radius=max(float(self.safety_radius_slider.value()), float(self.body_radius_slider.value())),
             goal_x=float(self.goal_x_input.value()),
@@ -1349,6 +1398,7 @@ class SimulationControllerMixin:
         self.ipp_lambda_input.setValue(config.ipp_distance_penalty)
         self.grid_resolution_input.setValue(config.grid_resolution)
         self.vision_combo.setCurrentText(config.vision_model)
+        self.camera_fov_input.setValue(config.camera_fov_degrees)
         self.map_visualization_combo.setCurrentText(config.map_visualization)
         self.custom_unexplored_color_button.set_color(config.custom_unexplored_color)
         self.custom_explored_color_button.set_color(config.custom_explored_color)
@@ -2709,6 +2759,9 @@ class SimulationControllerMixin:
             route_points_by_robot=self.multi_active_route_points_by_robot(),
             explored_points_by_robot=explored_points_by_robot,
             goal_tolerance=float(self.config.goal_tolerance),
+            camera_fov_degrees=float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            ),
             coordination_parameters=dict(
                 getattr(self.config, "coordination_parameters", {}) or {}
             ),
@@ -2797,6 +2850,11 @@ class SimulationControllerMixin:
         planner_name = str(self.config.exploration_planner)
         robot_index = int(robot_index)
         self.ensure_multi_exploration_target_slots()
+        hold_states = getattr(self, "_multi_goal_hold_states_by_robot", None)
+        if hold_states is None:
+            self._multi_goal_hold_states_by_robot = {}
+            hold_states = self._multi_goal_hold_states_by_robot
+        hold_states.pop(robot_index, None)
 
         if is_goal_seeking_planner(planner_name):
             if 0 <= robot_index < len(self.multi_exploration_targets):
@@ -2887,6 +2945,21 @@ class SimulationControllerMixin:
         detail = f"; last rejected target: {last_invalid_reason}" if last_invalid_reason else ""
         if coordinator_hold_detail:
             detail += f"; coordinator: {coordinator_hold_detail}"
+        other_target_reserved = any(
+            index != robot_index and target is not None
+            for index, target in enumerate(self.multi_exploration_targets)
+        )
+        # The only endpoint validators above are teammate positions and
+        # teammate frontier reservations. Both can clear without any map
+        # change. Preserve that semantic through the planner's legacy
+        # (success, reason, waypoints) tuple so route setup enters a retryable
+        # WAITING state rather than a permanent no-frontier HOLD.
+        if (
+            last_invalid_reason
+            or other_target_reserved
+            or "unreserved" in coordinator_hold_detail.lower()
+        ):
+            hold_states[robot_index] = self.ROUTE_STATE_WAITING_FOR_CORRIDOR
         return (float(start_xy[0]), float(start_xy[1])), (
             f"R{robot_index + 1}: no valid frontier assigned by "
             f"{self.config.coordinator_type}; holding position{detail}"
@@ -2914,9 +2987,15 @@ class SimulationControllerMixin:
         )
 
         if self.is_exploration_mode() and self.multi_goal_selection_is_hold(start_xy, goal_xy, goal_reason):
+            hold_state = getattr(
+                self,
+                "_multi_goal_hold_states_by_robot",
+                {},
+            ).get(robot_index)
             return dict(
                 __hold__=True,
                 __hold_reason__=goal_reason,
+                __hold_state__=hold_state,
                 planner_type=self.config.planner_type,
                 start_xy=start_xy,
                 goal_xy=start_xy,
@@ -3909,6 +3988,9 @@ class SimulationControllerMixin:
                 if "Camera" in self.config.vision_model
                 else SENSOR_DRAW_RAYS_OMNI
             ),
+            camera_fov_degrees=float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            ),
         )
         frozen = tuple((float(x), float(y)) for x, y in polygon)
         if robot_index is None:
@@ -4175,6 +4257,9 @@ class SimulationControllerMixin:
                     SENSOR_DRAW_RAYS_CAMERA
                     if "Camera" in self.config.vision_model
                     else SENSOR_DRAW_RAYS_OMNI
+                ),
+                camera_fov_degrees=float(
+                    getattr(self.config, "camera_fov_degrees", 70.0)
                 ),
             )
         sensor_polygon_array = np.ascontiguousarray(sensor_polygon, dtype=np.float32)
@@ -5023,10 +5108,10 @@ class SimulationControllerMixin:
         except PluginLoadError:
             profile = None
 
-        if profile is not None and profile.owns_target_generation:
+        if profile is not None and not profile.uses_external_candidate_pipeline:
             exploration_lines = [
                 f"Exploration source: {cfg.coordinator_type}",
-                f"Legacy frontier service (fallback only): {cfg.exploration_planner}",
+                f"Host frontier selector (inactive): {cfg.exploration_planner}",
             ]
         else:
             exploration_lines = [f"Exploration planner: {cfg.exploration_planner}"]
@@ -5043,17 +5128,24 @@ class SimulationControllerMixin:
         if profile is not None:
             lines.append(
                 "Algorithm runtime profile: "
-                f"owns_target_generation={profile.owns_target_generation}, "
-                f"owns_task_allocation={profile.owns_task_allocation}, "
-                f"owns_path_planning={profile.owns_path_planning}, "
-                f"owns_control={profile.owns_control}, "
-                f"uses_legacy_frontier_service={profile.uses_legacy_frontier_service}, "
+                f"detects_frontiers={profile.detects_frontiers}, "
+                f"generates_tasks={profile.generates_tasks}, "
+                f"allocates_tasks={profile.allocates_tasks}, "
+                f"plans_paths={profile.plans_paths}, "
+                f"controls_motion={profile.controls_motion}, "
+                f"uses_external_candidate_pipeline="
+                f"{profile.uses_external_candidate_pipeline}, "
                 f"uses_external_path_planner={profile.uses_external_path_planner}, "
                 f"uses_external_motion_controller={profile.uses_external_motion_controller}"
             )
         lines += [
             f"Vision model: {cfg.vision_model}",
             f"Sensor range: {float(cfg.vision):.2f} m",
+            (
+                f"Camera FoV: {float(getattr(cfg, 'camera_fov_degrees', 70.0)):.1f}°"
+                if "Camera" in str(cfg.vision_model)
+                else "Camera FoV: inactive"
+            ),
             f"Grid resolution: {float(cfg.grid_resolution):.2f} m/cell",
             f"Goal G: ({float(cfg.goal_x):.2f}, {float(cfg.goal_y):.2f})",
             f"Robot body radius: {float(cfg.body_radius):.2f} m",
@@ -6328,12 +6420,37 @@ class SimulationControllerMixin:
         exploration modes, the shared final goal is ignored and each robot gets
         a frontier target instead.
         """
-        return self._assign_route_to_multi_robot_with_corridor_validation(
+        robot_index = int(robot_index)
+        self.ensure_multi_exploration_target_slots()
+        invalidated_before = (
+            list(self.multi_invalidated_exploration_targets[robot_index])
+            if 0 <= robot_index < len(self.multi_invalidated_exploration_targets)
+            else []
+        )
+        result = self._assign_route_to_multi_robot_with_corridor_validation(
             robot_index,
             reason=reason,
             force_new_exploration_target=force_new_exploration_target,
             remaining_corridor_retries=self.MAX_ROUTE_RECOVERY_ATTEMPTS - 1,
         )
+        # Targets rejected only because a teammate currently occupies their
+        # departure corridor are alternatives for this coordination round, not
+        # permanently bad frontiers.  Keep older/static invalidations, but
+        # release the transient additions before the WAITING state retries.
+        # Otherwise a compact formation can blacklist every neighboring MARVEL
+        # graph node at t=0 and starve forever after the teammates have moved.
+        self.ensure_multi_route_state_slots()
+        if (
+            0 <= robot_index < len(self.multi_route_states)
+            and self.multi_route_states[robot_index]
+            == self.ROUTE_STATE_WAITING_FOR_CORRIDOR
+            and 0 <= robot_index
+            < len(self.multi_invalidated_exploration_targets)
+        ):
+            self.multi_invalidated_exploration_targets[robot_index] = (
+                invalidated_before
+            )
+        return result
 
     def compute_grid_safe_fallback_route_for_multi_robot(
         self,
@@ -6448,6 +6565,11 @@ class SimulationControllerMixin:
         )
 
         if (not success or not waypoints) and self.is_exploration_mode():
+            requested_hold_state = getattr(
+                self,
+                "_multi_goal_hold_states_by_robot",
+                {},
+            ).pop(robot_index, None)
             failed_target = (
                 self.multi_exploration_targets[robot_index]
                 if 0 <= robot_index < len(self.multi_exploration_targets) else None
@@ -6481,6 +6603,7 @@ class SimulationControllerMixin:
             held = self.hold_multi_robot_position(
                 robot_index,
                 f"no valid exploration route; {route_reason}",
+                state=requested_hold_state,
             )
             self.robot = old_robot if old_robot in self.robots else (self.robots[0] if self.robots else None)
             return held
@@ -6644,12 +6767,15 @@ class SimulationControllerMixin:
                         remaining_corridor_retries=remaining_corridor_retries - 1,
                     )
 
-                # Candidates exhausted. A conflict with a teammate's active
-                # route is transient (they are moving; the corridor may clear
-                # on its own), so it waits rather than reporting a permanent
-                # hold. Any other corridor conflict is reported as a blocked
-                # route, not as "no frontier" -- a target/frontier did exist.
-                if corridor_check.reason_code == "route_conflict_with_active_route":
+                # Candidates exhausted. Both a teammate's active route and its
+                # current safety disk are transient: the corridor may clear as
+                # soon as that teammate moves. They therefore enter WAITING,
+                # which is retried on the normal exploration cooldown. Static
+                # or reserved-corridor conflicts remain blocked.
+                if corridor_check.reason_code in {
+                    "route_conflict_with_active_route",
+                    "route_conflict_with_robot_safety_zone",
+                }:
                     self.log_console_message(
                         f"R{robot_index + 1}: waiting for corridor instead of HOLD_NO_FRONTIER"
                     )
@@ -6815,13 +6941,7 @@ class SimulationControllerMixin:
         # Initialize the shared map from all robot sensors before assigning
         # routes. This lets frontier exploration and obstacle-aware A*/Dijkstra
         # start from the team observation instead of an empty or stale map.
-        for robot_index, robot in enumerate(self.robots):
-            old_robot = self.robot
-            self.robot = robot
-            self.record_explored_area(force=True, robot_index=robot_index)
-            self.update_sensed_obstacles(force_status=False)
-            self.force_robot_pose_free_in_belief(robot_index)
-            self.robot = old_robot
+        self.initialize_multi_robot_starting_belief()
 
         # Global planner applies to every robot. Each robot still gets its own
         # route because the start pose is different.
@@ -7577,6 +7697,9 @@ class SimulationControllerMixin:
             angle=point_angle,
             robot_theta=float(self.robot.theta),
             vision_model=self.config.vision_model,
+            camera_fov_degrees=float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            ),
         ):
             return False
 
@@ -7717,6 +7840,9 @@ class SimulationControllerMixin:
             vision_model=self.config.vision_model,
             obstacles=self.visible_candidate_obstacles(),
             ray_count=EXPLORED_RAYS_CAMERA if "Camera" in self.config.vision_model else EXPLORED_RAYS_OMNI,
+            camera_fov_degrees=float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            ),
         )
 
         if len(polygon) < 3:

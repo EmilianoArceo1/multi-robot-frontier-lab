@@ -122,6 +122,7 @@ TASK_ASSIGN_ALGORITHM_OPTIONS = tuple(
         "Frontier cluster Hungarian coordinator",
         "Travel-time Voronoi + CQLite distributed Q-learning",
         "MARVEL CTDE graph-attention policy",
+        "MARVEL CTDE graph-attention policy (scaled environment)",
     }
 )
 from robotics_sim.simulation.algorithm_pipeline_profiles import (
@@ -377,6 +378,7 @@ class SimulationConfig:
     theta: float = 0.0
     v: float = 0.0
     vision: float = 2.5
+    camera_fov_degrees: float = 70.0
 
     # Physical robot body. This is the actual visual/physical size of the robot.
     body_radius: float = 0.20
@@ -730,6 +732,7 @@ def config_to_sim_payload(config: SimulationConfig) -> dict:
         "sensor": {
             "type": config.vision_model,
             "range": config.vision,
+            "camera_fov_degrees": config.camera_fov_degrees,
         },
         "multi_robot": {
             "robot_count": int(config.robot_count),
@@ -865,6 +868,12 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
     vision_model = str(sensor.get("type", default.vision_model))
     if vision_model not in VISION_OPTIONS:
         vision_model = default.vision_model
+    if (
+        pipeline_profile is not None
+        and pipeline_profile.lock_vision_model
+        and pipeline_profile.default_vision_model is not None
+    ):
+        vision_model = pipeline_profile.default_vision_model
 
     agent_mode = str(simulation.get("agent_mode", default.agent_mode))
     if agent_mode not in ("Single Robot Mode", "Multiple Robot Mode"):
@@ -922,6 +931,10 @@ def config_from_sim_payload(payload: dict) -> SimulationConfig:
         theta=_as_float(robot.get("theta", default.theta), default.theta),
         v=_as_float(robot.get("v", default.v), default.v),
         vision=_as_float(sensor.get("range", default.vision), default.vision),
+        camera_fov_degrees=_as_float(
+            sensor.get("camera_fov_degrees", default.camera_fov_degrees),
+            default.camera_fov_degrees,
+        ),
         body_radius=_as_float(
             robot.get("body_radius", robot.get("robot_radius", default.body_radius)),
             default.body_radius,
@@ -1283,6 +1296,7 @@ def sensor_visible_polygon_world(
     vision_model: str,
     obstacles: list[tuple[float, float, float, float]],
     ray_count: int | None = None,
+    camera_fov_degrees: float = 70.0,
 ) -> list[tuple[float, float]]:
     """
     Return the visible sensor area as a world-coordinate polygon.
@@ -1307,7 +1321,7 @@ def sensor_visible_polygon_world(
     if "Camera" in vision_model:
         count = ray_count or 121
         count = max(3, int(count))
-        camera_fov = math.radians(70.0)
+        camera_fov = math.radians(float(camera_fov_degrees))
         start_angle = float(theta) - camera_fov / 2.0
         end_angle = float(theta) + camera_fov / 2.0
         angles = [
@@ -1351,6 +1365,7 @@ def angle_is_inside_sensor_model(
     robot_theta: float,
     vision_model: str,
     camera_fov: float = math.radians(70.0),
+    camera_fov_degrees: float | None = None,
 ) -> bool:
     """
     Decide whether a direction belongs to the current sensor model.
@@ -1361,6 +1376,8 @@ def angle_is_inside_sensor_model(
     if "Camera" not in vision_model:
         return True
 
+    if camera_fov_degrees is not None:
+        camera_fov = math.radians(float(camera_fov_degrees))
     return abs(wrapped_angle_error(angle, robot_theta)) <= camera_fov / 2.0
 
 

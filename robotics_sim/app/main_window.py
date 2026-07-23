@@ -1730,6 +1730,9 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.update_mapping_architecture_badge()
         self.exploration_cooldown_field.setVisible(uses_frontier_exploration)
         self.ipp_lambda_field.setVisible(uses_ipp_lite)
+        self.camera_fov_field.setVisible(
+            "Camera" in self.vision_combo.currentText()
+        )
         self.apply_algorithm_ownership_gui_policy()
         self.apply_task_assignment_dependencies()
         coordinator_action = getattr(self, "coordinator_reasoning_panel_action", None)
@@ -1789,6 +1792,44 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             else None
         )
         not_locked = not getattr(self, "running", False)
+        selection_key = (
+            self.coordinator_combo.currentText() if multiple else "<single>"
+        )
+        previous_selection = getattr(
+            self,
+            "_sensing_defaults_applied_for_task_assignment",
+            None,
+        )
+        entering_profile = selection_key != previous_selection
+        self._sensing_defaults_applied_for_task_assignment = selection_key
+
+        if entering_profile and profile is not None:
+            if profile.default_vision_model is not None:
+                self.vision_combo.setCurrentText(profile.default_vision_model)
+            if profile.default_camera_fov_degrees is not None:
+                self.camera_fov_input.setValue(
+                    float(profile.default_camera_fov_degrees)
+                )
+            if profile.default_sensor_range is not None:
+                default_range = float(profile.default_sensor_range)
+                self.vision_slider.setValue(default_range)
+                if hasattr(self, "multi_robot_configs"):
+                    for robot_config in self.multi_robot_configs:
+                        robot_config.vision = default_range
+                if hasattr(self, "multi_vision_slider"):
+                    self.multi_vision_slider.setValue(default_range)
+
+        vision_model_locked = bool(
+            profile is not None and profile.lock_vision_model
+        )
+        self.vision_model_field.setEnabled(
+            not vision_model_locked and not_locked
+        )
+        self.vision_slider.setEnabled(not_locked)
+        self.camera_fov_input.setEnabled(not_locked)
+        if hasattr(self, "multi_vision_slider"):
+            self.multi_vision_slider.setEnabled(not_locked)
+
         if profile is None:
             self.clustering_algorithm_field.setEnabled(
                 bool(CLUSTERING_ALGORITHM_OPTIONS) and not_locked
@@ -1816,6 +1857,24 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         )
         if profile.lock_frontier_detector:
             self.exploration_planner_field.setToolTip(profile.explanation)
+        if profile.default_sensor_range is not None:
+            current_ranges = ", ".join(
+                f"{robot.vision:.2f} m"
+                for robot in getattr(self, "multi_robot_configs", ())
+            )
+            sensing_explanation = (
+                f"{profile.explanation} Selector defaults: "
+                f"{profile.default_vision_model}, "
+                f"{profile.default_sensor_range:.1f} m and "
+                f"{profile.default_camera_fov_degrees:.0f}° FoV. "
+                f"{profile.sensing_note} Range and FoV remain adjustable. "
+                f"Current robot ranges: {current_ranges}."
+            )
+            self.vision_model_field.setToolTip(sensing_explanation)
+            self.vision_slider.setToolTip(sensing_explanation)
+            self.camera_fov_input.setToolTip(sensing_explanation)
+            if hasattr(self, "multi_vision_slider"):
+                self.multi_vision_slider.setToolTip(sensing_explanation)
 
     def apply_algorithm_ownership_gui_policy(self) -> None:
         """

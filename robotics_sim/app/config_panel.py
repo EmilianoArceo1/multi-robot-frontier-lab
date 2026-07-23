@@ -449,7 +449,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         window.path_simplifier_field,
-        12,
+        13,
         0,
         1,
         2,
@@ -497,11 +497,21 @@ def build_config_panel(window):
     )
     options_grid.addWidget(window.vision_model_field, 11, 0, 1, 2)
 
+    window.camera_fov_input = NumericStepper(
+        "Camera FoV (degrees)",
+        window.config.camera_fov_degrees,
+        10.0,
+        360.0,
+        5.0,
+    )
+    window.camera_fov_field = window.camera_fov_input
+    options_grid.addWidget(window.camera_fov_field, 12, 0, 1, 2)
+
     window.safety_algorithm_field = labeled_combo(
         "Safety Algorithm",
         window.safety_algorithm_combo,
     )
-    options_grid.addWidget(window.safety_algorithm_field, 13, 0, 1, 2)
+    options_grid.addWidget(window.safety_algorithm_field, 14, 0, 1, 2)
 
     window.exploration_cooldown_input = NumericStepper(
         "Exploration Replan Cooldown (s)",
@@ -513,7 +523,7 @@ def build_config_panel(window):
     window.exploration_cooldown_field = window.exploration_cooldown_input
     options_grid.addWidget(
         window.exploration_cooldown_field,
-        14,
+        15,
         0,
         1,
         2,
@@ -529,7 +539,7 @@ def build_config_panel(window):
     window.ipp_lambda_field = window.ipp_lambda_input
     options_grid.addWidget(
         window.ipp_lambda_field,
-        14,
+        15,
         0,
         1,
         2,
@@ -551,7 +561,7 @@ def build_config_panel(window):
     window.grid_resolution_field = window.grid_resolution_input
     options_grid.addWidget(
         window.grid_resolution_field,
-        15,
+        16,
         0,
         1,
         2,
@@ -567,7 +577,7 @@ def build_config_panel(window):
     window.grid_overlay_toggle = ToggleSwitch(False)
     options_grid.addWidget(
         labeled_toggle("Show Grid", window.grid_overlay_toggle),
-        16,
+        17,
         0,
     )
     window.grid_cell_values_toggle = ToggleSwitch(False)
@@ -580,12 +590,12 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Cell Values", window.grid_cell_values_toggle),
-        17,
+        18,
         0,
     )
     options_grid.addWidget(
         labeled_toggle("Frontier Decisions", window.frontier_decisions_toggle),
-        17,
+        18,
         1,
     )
 
@@ -606,7 +616,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Hazard Map", window.hazard_map_toggle),
-        16,
+        17,
         1,
     )
     window.fire_markers_toggle = ToggleSwitch(False)
@@ -615,7 +625,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Fire Markers", window.fire_markers_toggle),
-        18,
+        19,
         0,
     )
     window.cursor_coordinates_toggle = ToggleSwitch(True)
@@ -624,7 +634,7 @@ def build_config_panel(window):
     )
     options_grid.addWidget(
         labeled_toggle("Mouse Coordinates", window.cursor_coordinates_toggle),
-        18,
+        19,
         1,
     )
 
@@ -912,6 +922,7 @@ def build_config_panel(window):
         window.accel_gain_input,
         window.exploration_cooldown_input,
         window.ipp_lambda_input,
+        window.camera_fov_input,
         window.grid_resolution_input,
         window.goal_x_input,
         window.goal_y_input,
@@ -1015,6 +1026,7 @@ def build_config_panel(window):
         window.coordinator_combo,
         window.safety_algorithm_combo,
         window.vision_combo,
+        window.camera_fov_input,
         window.robot_count_input,
         window.same_config_switch,
         window.prev_robot_button,

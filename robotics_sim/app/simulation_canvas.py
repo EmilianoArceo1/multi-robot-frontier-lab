@@ -3946,6 +3946,7 @@ class SimulationCanvas(QWidget):
         signature = (
             round(float(vision), 3),
             str(self.config.vision_model),
+            round(float(getattr(self.config, "camera_fov_degrees", 70.0)), 3),
             self.obstacles_cache_signature(),
         )
         pose = (float(x), float(y), float(theta))
@@ -3968,6 +3969,9 @@ class SimulationCanvas(QWidget):
             vision_model=self.config.vision_model,
             obstacles=self.config.obstacles,
             ray_count=SENSOR_DRAW_RAYS_CAMERA if "Camera" in self.config.vision_model else SENSOR_DRAW_RAYS_OMNI,
+            camera_fov_degrees=float(
+                getattr(self.config, "camera_fov_degrees", 70.0)
+            ),
         )
         self._sensor_polygon_caches_by_robot[int(cache_key)] = (pose, signature, polygon)
         return polygon

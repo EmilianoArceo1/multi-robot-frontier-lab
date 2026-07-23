@@ -42,6 +42,9 @@ from robotics_sim.planning.exploration_planners import (
     select_exploration_goal,
 )
 from robotics_sim.planning.frontier_clustering import cluster_frontier_cells
+from robotics_sim.planning.coordinated_frontier_planner import (
+    validate_multi_robot_corridor,
+)
 from robotics_sim.planning.ryu_frontier_graph_bfs import RYU_FRONTIER_GRAPH_BFS
 from robotics_sim.simulation.navigation_modes import (
     GOAL_SEEKING_PLANNER,
@@ -2379,7 +2382,12 @@ class SimulationControllerMixin:
             math.hypot(float(robot.x) - float(other.x), float(robot.y) - float(other.y))
             for other in others
         )
-        if nearest_distance > max(required_clearance * 1.75, 1.0):
+        # This is an emergency overlap recovery, not a host-side exploration
+        # policy.  The previous 1.75x trigger fabricated motion targets for
+        # robots that were already safely separated whenever their selected
+        # task allocator returned HOLD.  Those targets then leaked into
+        # multi_exploration_targets and masqueraded as assigned frontiers.
+        if nearest_distance >= required_clearance - 1e-6:
             return None
 
         centroid_x = sum(float(other.x) for other in others) / len(others)
@@ -2815,7 +2823,13 @@ class SimulationControllerMixin:
             self.invalidate_current_multi_frontier(robot_index, validity_reason)
 
         last_invalid_reason = ""
+        coordinator_hold_detail = ""
         for attempt in range(self.MAX_TARGET_RESELECTION_ATTEMPTS):
+            # synchronize_multi_frontier_targets() replaces this with the
+            # selected plugin's per-robot reason. Clear stale route text first
+            # so a HOLD can report the actual coordinator failure (missing
+            # weights, no candidates, etc.) instead of a generic host message.
+            self.last_goal_selection_reason = ""
             self.synchronize_multi_frontier_targets(
                 requesting_robot_index=robot_index,
                 # force_new_target was already applied above.  Re-applying it
@@ -2828,6 +2842,9 @@ class SimulationControllerMixin:
             if 0 <= robot_index < len(self.multi_exploration_targets):
                 target = self.multi_exploration_targets[robot_index]
             if target is None:
+                coordinator_hold_detail = str(
+                    getattr(self, "last_goal_selection_reason", "") or ""
+                ).strip()
                 break
 
             target = (float(target[0]), float(target[1]))
@@ -2857,8 +2874,10 @@ class SimulationControllerMixin:
         if recovery_target is not None:
             ok, _reason = self.multi_exploration_target_is_valid(robot_index, recovery_target)
             if ok:
-                self.multi_exploration_targets[robot_index] = recovery_target
-                self.publish_multi_exploration_targets()
+                # A local overlap-recovery maneuver is not a frontier and did
+                # not come from Task Assign. Keep it out of the coordinator's
+                # target slots so later replans cannot relabel it as
+                # "keeping assigned frontier F_i".
                 return recovery_target, (
                     f"R{robot_index + 1}: temporary separation target while waiting for frontier"
                 )
@@ -2866,6 +2885,8 @@ class SimulationControllerMixin:
         # Do not fall back to G while an exploration planner is selected.
         # The robot should hold its current position until a unique frontier exists.
         detail = f"; last rejected target: {last_invalid_reason}" if last_invalid_reason else ""
+        if coordinator_hold_detail:
+            detail += f"; coordinator: {coordinator_hold_detail}"
         return (float(start_xy[0]), float(start_xy[1])), (
             f"R{robot_index + 1}: no valid frontier assigned by "
             f"{self.config.coordinator_type}; holding position{detail}"
@@ -6538,7 +6559,7 @@ class SimulationControllerMixin:
         # Each later segment is checked when it becomes active, and predicted
         # motion plus the final pairwise-clearance guard remain exact runtime
         # backstops. Direct is included: its one segment is its full corridor.
-        if False and self.is_exploration_mode():  # retired corridor safety validation
+        if self.is_exploration_mode():
             corridor_check = validate_multi_robot_corridor(
                 start=(float(robot.x), float(robot.y)),
                 waypoints=waypoints[:1],

@@ -15,3 +15,9 @@ policy execution, perfect inter-robot communication, a shared occupancy map,
 36 heading bins, 3 heading candidates, 6 node features, and 128-dimensional
 embeddings. Missing or incompatible weights produce an explicit HOLD; no
 heuristic is silently substituted for the cited policy.
+
+`backend.py` converts the simulator's existing shared belief-map snapshot into
+the graph observation used by the authors: a 4 m viewpoint lattice with 5x5
+neighbour connectivity, free/unknown frontier extraction, relative position,
+utility, guidepost, robot occupancy and informative-heading node features.
+The selected waypoint and heading always come from the loaded PolicyNet logits.

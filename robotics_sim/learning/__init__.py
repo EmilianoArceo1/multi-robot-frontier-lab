@@ -113,6 +113,8 @@ from robotics_sim.learning.decision_steps import (
     EpisodeDecisionStepAllocator,
 )
 from robotics_sim.learning.runtime_capture_service import (
+    CriticStateCaptureSource,
+    GroundTruthCaptureSource,
     RuntimeCoordinationCaptureInput,
     RuntimeCoordinationCaptureResult,
     RuntimeLearningCaptureConsistencyError,
@@ -140,6 +142,7 @@ __all__ = [
     "ContractBundleHashMismatchError",
     "CriticStateBuildInput",
     "CriticStateBuilder",
+    "CriticStateCaptureSource",
     "DecisionCaptureAssembler",
     "DecisionCaptureBatch",
     "DecisionSelectionBatch",
@@ -155,6 +158,7 @@ __all__ = [
     "FeatureSchema",
     "FeatureSchemaMismatchError",
     "GroundTruthBuildInput",
+    "GroundTruthCaptureSource",
     "GroundTruthSnapshotBuilder",
     "InMemoryAsynchronousLearningEpisodeSession",
     "InMemoryLearningEpisodeSession",

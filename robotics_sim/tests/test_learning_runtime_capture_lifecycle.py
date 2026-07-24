@@ -1,7 +1,9 @@
 """Tests for RuntimeLearningCaptureService's lifecycle: start_episode(),
 complete_terminal_robot_decision(), finish_episode(), abort_episode(), and
-set_fire_metrics() -- the state machine around the four composed
-components, without inspecting any of their internals."""
+set_fire_metrics() -- the state machine around the composed components,
+without inspecting any of their internals -- plus one end-to-end smoke test
+covering the full open/replace/close/finish flow with real materialized
+CriticState/GroundTruthSnapshot contracts."""
 
 from __future__ import annotations
 
@@ -16,7 +18,6 @@ from robotics_interfaces.coordination import (
 from robotics_interfaces.learning import (
     CONTRACT_VERSIONS,
     CandidateSetSpec,
-    CriticState,
     EpisodeFireMetrics,
     EpisodeMetadata,
     HoldPolicy,
@@ -33,12 +34,15 @@ from robotics_sim.environment.hazard_belief import HazardBelief
 from robotics_sim.learning import FeatureNormalizationConfig, build_feature_schema_v0
 from robotics_sim.learning.action_catalog import ActionCatalogAssembler
 from robotics_sim.learning.asynchronous_episode import InMemoryAsynchronousLearningEpisodeSession
+from robotics_sim.learning.builders import CriticStateBuilder, GroundTruthSnapshotBuilder
 from robotics_sim.learning.coordination_decision_source import LearningCoordinationDecisionSource
 from robotics_sim.learning.decision_batch import DecisionCaptureAssembler
 from robotics_sim.learning.decision_steps import EpisodeDecisionStepAllocator
 from robotics_sim.learning.observation_batch import ActorObservationBatchAssembler
 from robotics_sim.learning.recorder import ContractBundleHashMismatchError, InMemoryTrajectoryRecorder
 from robotics_sim.learning.runtime_capture_service import (
+    CriticStateCaptureSource,
+    GroundTruthCaptureSource,
     RuntimeCoordinationCaptureInput,
     RuntimeLearningCaptureConsistencyError,
     RuntimeLearningCaptureService,
@@ -109,11 +113,21 @@ def make_metadata(episode_id="ep-lifecycle") -> EpisodeMetadata:
     )
 
 
-def make_critic_state(decision_step=0) -> CriticState:
-    return CriticState(
-        schema_version="0.1.0", decision_step=decision_step, time_s=float(decision_step),
-        global_feature_names=("coverage",), global_features=(0.5,),
-        per_robot_feature_names=(), per_robot_features={},
+def make_critic_source(coverage=0.5) -> CriticStateCaptureSource:
+    return CriticStateCaptureSource(
+        global_feature_names=("coverage",),
+        global_features={"coverage": coverage},
+        per_robot_feature_names=(),
+        per_robot_features={},
+    )
+
+
+def make_ground_truth_source(fire_x=0.0) -> GroundTruthCaptureSource:
+    return GroundTruthCaptureSource(
+        true_robot_poses={},
+        true_occupancy=(),
+        true_fire_locations=((fire_x, fire_x),),
+        global_coverage_fraction=0.0,
     )
 
 
@@ -194,22 +208,23 @@ def make_service(plan_by_robot=None):
         LearningTransitionAssembler(), InMemoryTrajectoryRecorder()
     )
     service = RuntimeLearningCaptureService(
-        decision_source, decision_opener, step_allocator, episode_session
+        decision_source, decision_opener, step_allocator, episode_session,
+        CriticStateBuilder(), GroundTruthSnapshotBuilder(),
     )
     return service, plugin, step_allocator, episode_session
 
 
 def make_capture_input(
-    robot_ids, candidates_by_robot, contexts_by_robot, critic_states_by_robot,
-    closing_outcomes_by_robot=None, time_s=0.0, geometry=None,
+    robot_ids, candidates_by_robot, contexts_by_robot, critic_sources_by_robot,
+    ground_truth_sources_by_robot=None, closing_outcomes_by_robot=None, time_s=0.0, geometry=None,
 ) -> RuntimeCoordinationCaptureInput:
     geometry = geometry or make_geometry()
     return RuntimeCoordinationCaptureInput(
         request=make_request(robot_ids, candidates_by_robot),
         time_s=time_s,
         contexts_by_robot=contexts_by_robot,
-        critic_states_by_robot=critic_states_by_robot,
-        ground_truth_by_robot=None,
+        critic_sources_by_robot=critic_sources_by_robot,
+        ground_truth_sources_by_robot=ground_truth_sources_by_robot,
         closing_outcomes_by_robot=closing_outcomes_by_robot or {},
         grid_geometry=geometry,
         normalization=NORMALIZATION,
@@ -279,7 +294,7 @@ class TestCaptureRequiresStart:
         with pytest.raises(RuntimeLearningCaptureStateError):
             service.capture_coordination_event(
                 make_capture_input(
-                    [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                    [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
                 )
             )
 
@@ -292,7 +307,7 @@ class TestTerminalClose:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         return service
@@ -319,7 +334,7 @@ class TestFinish:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         with pytest.raises(RuntimeLearningCaptureStateError):
@@ -332,7 +347,7 @@ class TestFinish:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         service.complete_terminal_robot_decision(0, make_outcome("ep-lifecycle", 0, 0, terminated=True))
@@ -355,7 +370,7 @@ class TestFinish:
             make_capture_input(
                 [0, 1], {0: (c0,), 1: (c1,)},
                 {0: make_context(0, geometry), 1: make_context(1, geometry, xy=(3.0, 3.0))},
-                {0: make_critic_state(0), 1: make_critic_state(1)},
+                {0: make_critic_source(), 1: make_critic_source()},
             )
         )
         service.complete_terminal_robot_decision(1, make_outcome("ep-lifecycle", 1, 1, terminated=True))
@@ -370,7 +385,7 @@ class TestFinish:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         service.complete_terminal_robot_decision(0, make_outcome("ep-lifecycle", 0, 0, terminated=True))
@@ -388,7 +403,7 @@ class TestFireMetrics:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         metrics = EpisodeFireMetrics(fire_crossing_time_s=1.0, fire_overflight_distance=2.0)
@@ -411,7 +426,7 @@ class TestAbort:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         service.abort_episode()
@@ -439,7 +454,7 @@ class TestAbort:
         c0 = make_candidate()
         service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         service.complete_terminal_robot_decision(0, make_outcome("ep-first", 0, 0, terminated=True))
@@ -448,7 +463,7 @@ class TestAbort:
         service.start_episode(make_metadata(episode_id="ep-second"))
         result = service.capture_coordination_event(
             make_capture_input(
-                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_state(0)}
+                [0], {0: (c0,)}, {0: make_context(0, geometry)}, {0: make_critic_source()}
             )
         )
         assert result.opened_decision.assigned[0].decision_step == 0  # step 0 reused, no collision
@@ -471,3 +486,65 @@ class TestAbort:
 
         service.abort_episode()  # must not raise: allocator alone still needed cleanup
         assert step_allocator.is_active is False
+
+
+class TestSmokeOpenReplaceCloseFinish:
+    """End-to-end smoke test: start_episode -> open robot 0 and robot 1 ->
+    verify steps 0/1 on actor, critic, and ground truth -> replace robot 1
+    with step 2 -> close robot 0 and robot 1 -> finish -> EpisodeRecord
+    ordered 0, 1, 2."""
+
+    def test_full_flow(self):
+        service, plugin, step_allocator, episode_session = make_service(
+            {0: ("ASSIGNED", 0), 1: ("ASSIGNED", 0)}
+        )
+        geometry = make_geometry()
+        service.start_episode(make_metadata(episode_id="ep-smoke"))
+
+        # 2. Open robot 0 and robot 1 in the same event.
+        c0, c1 = make_candidate(target=(2.0, 2.0)), make_candidate(target=(6.0, 6.0))
+        opened_result = service.capture_coordination_event(
+            make_capture_input(
+                [0, 1], {0: (c0,), 1: (c1,)},
+                {0: make_context(0, geometry), 1: make_context(1, geometry, xy=(3.0, 3.0))},
+                {0: make_critic_source(0.1), 1: make_critic_source(0.2)},
+                ground_truth_sources_by_robot={
+                    0: make_ground_truth_source(1.0), 1: make_ground_truth_source(2.0)
+                },
+            )
+        )
+        by_id = {item.robot_id: item for item in opened_result.opened_decision.assigned}
+
+        # 3. Steps 0 and 1 landed on actor (via opened_decision), critic, and
+        # ground truth alike.
+        assert {by_id[0].decision_step, by_id[1].decision_step} == {0, 1}
+
+        # 4. Replace robot 1 with a new decision at step 2.
+        plugin._plan_by_robot = {1: ("ASSIGNED", 0)}
+        c1_next = make_candidate(target=(7.0, 7.0))
+        replace_result = service.capture_coordination_event(
+            make_capture_input(
+                [1], {1: (c1_next,)},
+                {1: make_context(1, geometry, xy=(3.0, 3.0))},
+                {1: make_critic_source(0.3)},
+                ground_truth_sources_by_robot={1: make_ground_truth_source(3.0)},
+                closing_outcomes_by_robot={1: make_outcome("ep-smoke", by_id[1].decision_step, 1)},
+            )
+        )
+        new_item = replace_result.opened_decision.assigned[0]
+        assert new_item.decision_step == 2
+
+        # 5. Close robot 0 and robot 1 (now at step 2).
+        service.complete_terminal_robot_decision(
+            0, make_outcome("ep-smoke", by_id[0].decision_step, 0, terminated=True)
+        )
+        service.complete_terminal_robot_decision(
+            1, make_outcome("ep-smoke", 2, 1, terminated=True)
+        )
+
+        # 6. Finish.
+        record = service.finish_episode()
+
+        # 7. EpisodeRecord ordered 0, 1, 2.
+        assert [t.decision_step for t in record.transitions] == [0, 1, 2]
+        assert {step for step, _ in record.ground_truth_by_step} == {0, 1, 2}

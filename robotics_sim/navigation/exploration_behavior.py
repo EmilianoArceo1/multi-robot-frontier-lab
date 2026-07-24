@@ -70,6 +70,12 @@ class ExplorationBehavior:
         # a perfectly healthy route immediately.
         self._stale_target_xy: tuple[float, float] | None = None
         self._stale_target_since: float | None = None
+        # Mission-event memory. PlannerServices.known_hazards contains only
+        # sources already exposed by the real sensor pipeline. Track the set
+        # seen by this agent so a newly detected fire interrupts the current
+        # frontier route exactly once, instead of waiting until the frontier
+        # is reached or emitting a REQUEST_PLAN every frame.
+        self._known_hazard_positions: set[tuple[float, float]] = set()
 
     # ------------------------------------------------------------------ thresholds
 
@@ -151,6 +157,97 @@ class ExplorationBehavior:
         """True when the first segment of *next_path* requires a sharp turn."""
         return self._turn_angle(agent, next_path) > self.max_smooth_turn_angle_rad
 
+    _HAZARD_PRIORITY_PLANNER: str = "FoV-aware directional frontier"
+    _HAZARD_POSITION_PRECISION: int = 6
+
+    @classmethod
+    def _normalized_known_hazards(
+        cls,
+        planner_services: "PlannerServices",
+    ) -> set[tuple[float, float]]:
+        """Stable source-position keys supplied by the discovered-only service."""
+        hazards: set[tuple[float, float]] = set()
+        for point in getattr(planner_services, "known_hazards", ()) or ():
+            try:
+                hazards.add(
+                    (
+                        round(float(point[0]), cls._HAZARD_POSITION_PRECISION),
+                        round(float(point[1]), cls._HAZARD_POSITION_PRECISION),
+                    )
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
+        return hazards
+
+    def _new_hazard_interrupt(
+        self,
+        agent: "RobotAgent",
+        observation: "RobotObservation",
+        planner_services: "PlannerServices",
+    ) -> NavigationDecision | None:
+        """Interrupt an active frontier route once when a fire is discovered.
+
+        RuntimeHazardService has already decided whether a source was visible;
+        this layer does not inspect ground truth. It only reacts to a newly
+        appearing discovered source by asking the configured FoV/hazard planner
+        for its next target. The planner still owns target choice, reachability,
+        and the later transition back to frontier exploration after the centre
+        is reached.
+        """
+        current_hazards = self._normalized_known_hazards(planner_services)
+        newly_known = current_hazards - self._known_hazard_positions
+
+        # Always synchronize removals too. If a fire disappears and a future
+        # source is created at the same coordinates, it becomes new again.
+        self._known_hazard_positions = current_hazards
+
+        if agent.planner_mode != self._HAZARD_PRIORITY_PLANNER or not newly_known:
+            return None
+
+        next_target = self._pick_next_target(agent, observation, planner_services)
+        if next_target is None:
+            return None
+
+        match_radius = max(
+            float(observation.grid_resolution),
+            2.0 * float(observation.goal_tolerance),
+        )
+        targets_new_hazard = any(
+            math.hypot(next_target[0] - hazard[0], next_target[1] - hazard[1])
+            <= match_radius
+            for hazard in newly_known
+        )
+        if not targets_new_hazard:
+            # The real navigation reachability gate may reject the source. In
+            # that case do not destroy a healthy frontier route; normal
+            # exploration continues and a later planner call may retry it from
+            # a better map/pose.
+            return None
+
+        for assigned in (agent.active_path_goal_xy, agent.pending_target_xy):
+            if assigned is None:
+                continue
+            if math.hypot(
+                float(assigned[0]) - next_target[0],
+                float(assigned[1]) - next_target[1],
+            ) <= match_radius:
+                return None
+
+        agent.invalidate_pending_path(
+            "newly discovered fire superseded prefetched frontier route"
+        )
+        agent.clear_recovery_memory()
+        agent.exploration_exhaustion_confirmed_empty = False
+        return request_plan(
+            next_target,
+            reason=(
+                "new fire footprint entered FoV; interrupting frontier route "
+                "to inspect its centre"
+            ),
+            do_brake=True,
+            force_new_target=True,
+        )
+
     # ------------------------------------------------------------------ main decision
 
     def update(
@@ -196,6 +293,17 @@ class ExplorationBehavior:
             )
             agent.safety_replan_count += 1
             return replan_for_safety(agent.desired_target_from_mode(), reason=reason)
+
+        # ── 1b. Newly detected mission hazard ─────────────────────────────
+        # Sensor fusion and PlannerServices refresh happen before agent.step()
+        # in the runtime, so this can react in the same simulation tick. Safety
+        # remains higher priority; if safety returned above, the hazard remains
+        # unseen by this behavior and is retried on the next tick.
+        hazard_interrupt = self._new_hazard_interrupt(
+            agent, observation, planner_services
+        )
+        if hazard_interrupt is not None:
+            return hazard_interrupt
 
         # ── 2. Pending path ready — should we switch? ─────────────────────
         if agent.pending_path is not None:
@@ -693,6 +801,7 @@ class ExplorationBehavior:
             vision_model=observation.vision_model,
             ipp_distance_penalty=observation.ipp_distance_penalty,
             excluded_targets=excluded,
+            reserved_targets=observation.excluded_targets,
         )
 
         # Diagnostics only (read by engine.py to log [EXHAUSTION_DIAG] at
@@ -752,6 +861,7 @@ class ExplorationBehavior:
             vision_model=observation.vision_model,
             ipp_distance_penalty=observation.ipp_distance_penalty,
             excluded_targets=excluded,
+            reserved_targets=observation.excluded_targets,
         )
 
         agent.last_frontier_selection_reason = str(result.reason)

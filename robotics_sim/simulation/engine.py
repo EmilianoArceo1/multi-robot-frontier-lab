@@ -987,6 +987,13 @@ class SimulationControllerMixin:
             )
         return self.hazard_service
 
+    def known_hazard_positions(self) -> tuple[tuple[float, float], ...]:
+        """Discovered fire-source centres available to target selection."""
+        return tuple(
+            (float(source.position[0]), float(source.position[1]))
+            for source in self.ensure_hazard_service().discovered_sources()
+        )
+
     def push_hazard_snapshot(self) -> None:
         """Push the GROUND-TRUTH hazard field snapshot. Kept for legacy/
         potential editor use (see SimulationCanvas.draw_fires(), no longer
@@ -1672,7 +1679,7 @@ class SimulationControllerMixin:
         # LAZY: same _planning_grid_provider_for_robot() used to refresh
         # PlannerServices.planning_grid_provider (see ensure_planner_
         # services()) -- reused here, not duplicated, and not built eagerly.
-        # Only FoVAwareDirectionalFrontierPlanner.select_goal() ever calls
+        # Only FoVAwareHazardFrontierPlanner.select_goal() ever calls
         # this closure (at most once); every other exploration planner
         # ignores the kwarg entirely, so no planning grid is built at all
         # for those (unnecessary runtime work avoided). None when there is
@@ -1739,6 +1746,11 @@ class SimulationControllerMixin:
                 else 0.0
             ),
             planning_grid_provider=planning_grid_provider,
+            known_hazards=list(
+                self.known_hazard_positions()
+                if callable(getattr(self, "known_hazard_positions", None))
+                else ()
+            ),
             **clustering_kwargs,
         )
 
@@ -5837,6 +5849,12 @@ class SimulationControllerMixin:
         if not restored_belief:
             self._restore_empty_hazard_belief(hazard_service)
 
+        # Fire-source discovery identity is runtime mission state. Rebuild it
+        # from the restored discovered-only HazardBelief so navigation replay
+        # neither remembers fires from the discarded future nor forgets fires
+        # that were already visible at the selected snapshot.
+        hazard_service.refresh_discovered_sources_from_belief()
+
         # Any cached hazard-belief debug frame keyed on the now-discarded
         # future is stale.
         self._nav_debug_hazard_belief_frame_key = None
@@ -9291,6 +9309,12 @@ class SimulationControllerMixin:
         target_robot = robot if robot is not None else getattr(self, "robot", None)
         self._planner_services.is_candidate_reachable = self.make_exploration_reachability_check(target_robot)
         self._planner_services.planning_grid_provider = self._planning_grid_provider_for_robot(target_robot)
+        known_hazard_positions = getattr(self, "known_hazard_positions", None)
+        self._planner_services.known_hazards = (
+            tuple(known_hazard_positions())
+            if callable(known_hazard_positions)
+            else ()
+        )
         configured_clustering = getattr(self.config, "clustering_algorithm", None)
         self._planner_services.clustering_algorithm = (
             str(configured_clustering) if configured_clustering is not None else None

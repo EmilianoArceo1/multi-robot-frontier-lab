@@ -74,6 +74,8 @@ class FrontierCandidate:
     cluster_points: tuple[tuple[float, float], ...] = ()
     cluster_resolution: float = 0.0
     heading_alignment: float = 0.0
+    hazard_gain: float = 0.0
+    kind: str = "frontier"
 
 
 @dataclass(frozen=True)
@@ -798,9 +800,9 @@ def _score_candidate(
     planning_grid,
     robot_xy: tuple[float, float],
     robot_heading: float,
-    current_target: tuple[float, float] | None,
     reserved_targets: list[tuple[float, float]],
-    dynamic_obstacles: list[tuple[float, float, float]],
+    known_hazards: list[tuple[float, float]],
+    hazard_sigma: float,
     sensor_range: float,
     fov_angle: float,
     fov_stride_cells: int,
@@ -808,8 +810,6 @@ def _score_candidate(
     seen_saturation: float,
     max_frontier_size: int,
     target_exclusion_radius: float,
-    robot_radius: float,
-    dynamic_obstacle_margin: float,
     weights: dict[str, float],
 ) -> FrontierCandidate | None:
     start_cell_tuple = belief.world_to_cell(robot_xy, clamp=True)
@@ -882,48 +882,42 @@ def _score_candidate(
     path_cells = [(cell.row, cell.col) for cell in path]
     fov_repeat = _seen_penalty(belief, swept, seen_saturation)
     path_repeat = _seen_penalty(belief, path_cells, seen_saturation)
+    repetition = 0.5 * (fov_repeat + path_repeat)
 
     length_norm = float(result.total_cost) / _grid_diagonal(belief)
     turn_norm = min(1.0, _turn_cost(belief, path, robot_heading) / math.pi)
     align = _alignment(belief, path, robot_heading)
-    direct_distance = _distance(robot_xy, candidate.target)
-    route_efficiency = min(1.0, direct_distance / max(float(result.total_cost), 1e-9))
-    detour_penalty = 1.0 - route_efficiency
-    target_alignment = math.cos(
-        _wrap_angle(_angle_between(robot_xy, candidate.target) - robot_heading)
-    ) if direct_distance > 1e-9 else 1.0
-    backtrack_penalty = max(0.0, -target_alignment)
 
     frontier_norm = (
         math.log1p(candidate.size) / math.log1p(max(1, max_frontier_size))
     )
 
-    switch_penalty = 0.0
-    if current_target is None or _distance(current_target, candidate.target) > belief.resolution:
-        switch_penalty = 1.0
+    sigma_hazard = max(float(hazard_sigma), 1e-6)
+    hazard_gain = sum(
+        math.exp(
+            -(_distance(candidate.target, hazard) ** 2)
+            / (2.0 * sigma_hazard * sigma_hazard)
+        )
+        for hazard in known_hazards
+    )
 
+    # M'(F) represents only task-level interference: another robot already
+    # reserving this target. Dynamic robot bodies remain physical constraints
+    # in the supplied planning grid, but do not leak into this score term.
     multi_penalty = 0.0
     sigma = max(float(target_exclusion_radius), 1e-6)
     for target in reserved_targets:
         d = _distance(candidate.target, target)
         multi_penalty += math.exp(-(d * d) / (sigma * sigma))
 
-    for ox, oy, radius in dynamic_obstacles:
-        safe = max(1e-6, robot_radius + radius + dynamic_obstacle_margin)
-        d = _distance(candidate.target, (ox, oy))
-        multi_penalty += math.exp(-(d * d) / (safe * safe))
-
     score = (
         weights["information"] * information_utility
         + weights["frontier"] * frontier_norm
         + weights["alignment"] * align
+        + weights["hazard"] * hazard_gain
         - weights["length"] * length_norm
-        - weights["fov_repetition"] * fov_repeat
-        - weights["path_repetition"] * path_repeat
+        - weights["repetition"] * repetition
         - weights["turn"] * turn_norm
-        - weights["detour"] * detour_penalty
-        - weights["backtrack"] * backtrack_penalty
-        - weights["switch"] * switch_penalty
         - weights["multi_robot"] * multi_penalty
     )
 
@@ -932,10 +926,11 @@ def _score_candidate(
         f"info={info:.0f}, novelty={novelty:.6f}, terminal_info={terminal_info:.0f}, "
         f"info_utility={information_utility:.6f}, "
         f"frontier_norm={frontier_norm:.6f}, "
+        f"hazard={hazard_gain:.6f}, "
+        f"repetition={repetition:.6f}, "
         f"fov_repeat={fov_repeat:.6f}, path_repeat={path_repeat:.6f}, "
         f"length={result.total_cost:.6f}, length_norm={length_norm:.6f}, turn={turn_norm:.6f}, "
-        f"align={align:.6f}, detour={detour_penalty:.6f}, "
-        f"backtrack={backtrack_penalty:.6f}, switch={switch_penalty:.0f}, "
+        f"align={align:.6f}, "
         f"multi={multi_penalty:.6f}, score={score:.6f}"
     )
 
@@ -949,26 +944,9 @@ def _score_candidate(
         cluster_points=tuple(belief.cell_to_world(cell) for cell in candidate.cluster_cells),
         cluster_resolution=float(belief.resolution),
         heading_alignment=float(align),
+        hazard_gain=float(hazard_gain),
+        kind=candidate.kind,
     )
-
-
-def _prefer_forward_continuation(
-    candidates: list[FrontierCandidate],
-    *,
-    score_margin: float,
-    min_alignment: float,
-) -> tuple[FrontierCandidate, bool]:
-    """Avoid an unnecessary U-turn when a useful forward option is close."""
-    best = max(candidates, key=lambda item: item.score)
-    forward = [
-        item for item in candidates
-        if item.heading_alignment >= min_alignment and item.information_gain > 0.0
-    ]
-    if best.heading_alignment < 0.0 and forward:
-        best_forward = max(forward, key=lambda item: item.score)
-        if best_forward.score >= best.score - score_margin:
-            return best_forward, True
-    return best, False
 
 
 class BaseExplorationPlanner:
@@ -1501,9 +1479,31 @@ class InformativeFrontierPlanner(FrontierExplorationPlanner):
         return max(candidates, key=lambda item: (item.score, item.information_gain, item.size, -item.distance_from_robot))
 
 
-class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
+class FoVAwareHazardFrontierPlanner(BaseExplorationPlanner):
     name = "FoV-aware directional frontier"
     uses_frontier_clustering = True
+
+    def __init__(self) -> None:
+        # Shared mission memory for this planner instance. A hazard becomes
+        # "explored" once any robot reaches its centre within the configured
+        # tolerance. The memory is scoped to the current BeliefMap object, so
+        # resetting the simulation with a fresh belief map also resets the
+        # explored-hazard set without coupling this planner to engine.py.
+        self._explored_hazard_cells_by_belief: dict[
+            int,
+            set[tuple[int, int]],
+        ] = {}
+
+    def _explored_hazard_cells(self, belief: BeliefMap) -> set[tuple[int, int]]:
+        belief_key = id(belief)
+        cells = self._explored_hazard_cells_by_belief.setdefault(belief_key, set())
+
+        # Avoid retaining stale simulation sessions forever in the module-level
+        # planner registry. The active belief map is always preserved.
+        if len(self._explored_hazard_cells_by_belief) > 8:
+            self._explored_hazard_cells_by_belief = {belief_key: cells}
+
+        return cells
 
     def cluster_frontiers(self, belief: BeliefMap) -> list[list[tuple[int, int]]]:
         """Legacy direct-call compatibility for archived FoV tests only."""
@@ -1546,30 +1546,31 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             except (TypeError, ValueError, IndexError):
                 current_target = None
 
-        reserved = _normalize_targets(kwargs.get("excluded_targets"))
+        excluded = _normalize_targets(kwargs.get("excluded_targets"))
+        reserved = _normalize_targets(kwargs.get("reserved_targets"))
         dynamic = _normalize_dynamic_obstacles(kwargs.get("dynamic_obstacles"))
+        known_hazards = _normalize_targets(kwargs.get("known_hazards"))
 
         weights = {
             "information": float(kwargs.get("w_information", 3.0)),
             "frontier": float(kwargs.get("w_frontier", 0.7)),
             "alignment": float(kwargs.get("w_alignment", 1.2)),
+            "hazard": float(kwargs.get("w_hazard", 4.0)),
             "length": float(kwargs.get("w_length", 1.0)),
-            "fov_repetition": float(kwargs.get("w_fov_repetition", 2.2)),
-            "path_repetition": float(kwargs.get("w_path_repetition", 0.8)),
+            "repetition": float(kwargs.get("w_repetition", 2.2)),
             "turn": float(kwargs.get("w_turn", 1.0)),
-            "detour": float(kwargs.get("w_detour", 0.45)),
-            "backtrack": float(kwargs.get("w_backtrack", 0.75)),
-            "switch": float(kwargs.get("w_switch", 0.6)),
             "multi_robot": float(kwargs.get("w_multi_robot", 1.2)),
         }
 
-        hysteresis_margin = float(kwargs.get("hysteresis_margin", 0.15))
-        forward_continuation_margin = float(kwargs.get("forward_continuation_margin", 1.5))
-        min_forward_alignment = float(kwargs.get("min_forward_alignment", 0.5))
-        min_current_information_gain = float(kwargs.get("min_current_information_gain", 1.0))
+        hazard_sigma = float(kwargs.get("sigma_hazard", 4.0))
         max_candidates = max(1, int(kwargs.get("max_fov_candidates", 32)))
         viewpoints_per_cluster = max(1, int(kwargs.get("max_frontier_viewpoints_per_cluster", 5)))
-        max_forward_distance = float(kwargs.get("max_forward_distance", max(sensor_range, 4.0 * belief.resolution)))
+        max_forward_distance = float(
+            kwargs.get(
+                "max_forward_distance",
+                max(sensor_range, 4.0 * belief.resolution),
+            )
+        )
 
         try:
             frontier_clusters = self._clusters_for_call(belief, kwargs)
@@ -1578,7 +1579,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
 
         candidates = _frontier_candidates(
             belief=belief,
-            reserved_targets=reserved,
+            reserved_targets=excluded,
             dynamic_obstacles=dynamic,
             target_exclusion_radius=target_exclusion_radius,
             robot_radius=robot_radius,
@@ -1589,21 +1590,82 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             clusters=frontier_clusters,
         )
 
-        forward = _forward_candidate(
-            belief=belief,
-            robot_xy=robot_xy,
-            robot_heading=robot_heading,
-            max_forward_distance=max_forward_distance,
-        )
-        if forward is not None:
-            candidates.append(forward)
+        # Preserve the directional detector's map-start recovery candidate,
+        # but rank it with the exact same S(F) as everything else. It is
+        # available only while UNKNOWN cells remain and has no hidden
+        # selection override.
+        if np.any(belief.grid == UNKNOWN):
+            forward = _forward_candidate(
+                belief=belief,
+                robot_xy=robot_xy,
+                robot_heading=robot_heading,
+                max_forward_distance=max_forward_distance,
+            )
+            if forward is not None:
+                candidates.append(forward)
 
-        current = _current_candidate(belief, current_target)
-        if current is not None:
-            candidates.append(current)
+        # A Gaussian attraction applied only to frontier cells can stop near a
+        # fire without ever commanding the source itself. Every newly
+        # discovered source therefore becomes a direct target candidate until
+        # the team reaches its centre once. After that, the source is marked as
+        # explored and removed from the hazard objective, allowing normal
+        # frontier exploration to resume. Ground-truth-only fires never reach
+        # this list; the engine supplies only observed sources.
+        located_hazards = [
+            (hazard, cell)
+            for hazard in known_hazards
+            if (cell := belief.world_to_cell(hazard)) is not None
+        ]
+
+        explored_hazard_cells = self._explored_hazard_cells(belief)
+        currently_known_hazard_cells = {cell for _, cell in located_hazards}
+
+        # If a source disappears from the known-hazard set, forget its completed
+        # state. A later fire at the same cell is then treated as a new event.
+        explored_hazard_cells.intersection_update(currently_known_hazard_cells)
+
+        hazard_reached_tolerance = max(
+            1e-6,
+            float(kwargs.get("hazard_reached_tolerance", 0.0)),
+            float(kwargs.get("goal_tolerance", 0.0)),
+            0.5 * float(belief.resolution),
+        )
+
+        for hazard, cell in located_hazards:
+            if _distance(robot_xy, hazard) <= hazard_reached_tolerance:
+                explored_hazard_cells.add(cell)
+
+        pending_hazards = [
+            (hazard, cell)
+            for hazard, cell in located_hazards
+            if cell not in explored_hazard_cells
+        ]
+        pending_hazard_points = [hazard for hazard, _ in pending_hazards]
+        pending_hazard_cells = {cell for _, cell in pending_hazards}
+
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.target_cell not in pending_hazard_cells
+        ]
+        for hazard, cell in pending_hazards:
+            candidates.append(
+                _InternalCandidate(
+                    target_cell=cell,
+                    target=hazard,
+                    size=0,
+                    kind="hazard",
+                    cluster_cells=(),
+                )
+            )
 
         if not candidates:
-            return ExplorationPlannerResult(False, None, "no frontier, forward, or current-target candidates found", ())
+            return ExplorationPlannerResult(
+                False,
+                None,
+                "no frontier, forward-recovery, or discovered-hazard candidates found",
+                (),
+            )
 
         candidates = self._preselect(
             candidates,
@@ -1657,9 +1719,12 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
                 planning_grid=planning_grid.copy(),
                 robot_xy=robot_xy,
                 robot_heading=robot_heading,
-                current_target=current_target,
                 reserved_targets=reserved,
-                dynamic_obstacles=dynamic,
+                # Completed fires must stop attracting the robot. Only pending
+                # sources contribute H(F); once one is reached, scoring falls
+                # back to pure exploration for that source.
+                known_hazards=pending_hazard_points,
+                hazard_sigma=hazard_sigma,
                 sensor_range=sensor_range,
                 fov_angle=fov_angle,
                 fov_stride_cells=fov_stride_cells,
@@ -1667,8 +1732,6 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
                 seen_saturation=seen_saturation,
                 max_frontier_size=max_frontier_size,
                 target_exclusion_radius=target_exclusion_radius,
-                robot_radius=robot_radius,
-                dynamic_obstacle_margin=dynamic_obstacle_margin,
                 weights=weights,
             )
             if item is not None:
@@ -1722,58 +1785,72 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
             reachable_scored = scored
 
         debug_counts = (
-            f"generated={len(candidates)}, excluded_recently_failed={len(reserved)}, "
+            f"generated={len(candidates)}, excluded_targets={len(excluded)}, "
+            f"reserved_by_other_robots={len(reserved)}, "
+            f"known_hazards={len(located_hazards)}, "
+            f"pending_hazards={len(pending_hazards)}, "
+            f"explored_hazards={len(explored_hazard_cells)}, "
             f"filtered_unreachable={filtered_unreachable}"
         )
 
         if not reachable_scored:
-            chosen, directional_probe = _prefer_forward_continuation(
-                scored,
-                score_margin=forward_continuation_margin,
-                min_alignment=min_forward_alignment,
+            # Do not keep probing an already-rejected fire forever. Prefer a
+            # frontier/forward candidate when one exists so the robot keeps
+            # exploring and may later approach the source from another route.
+            probe_pool = [item for item in scored if item.kind != "hazard"] or scored
+            chosen = max(
+                probe_pool,
+                key=lambda item: (item.score, item.hazard_gain, item.size, -item.distance_from_robot),
             )
             return ExplorationPlannerResult(
                 True,
                 chosen.target,
                 (
                     f"{self.name}: all {len(scored)} candidates failed the navigation "
-                    f"reachability precheck; probing "
-                    f"{'forward-continuation' if directional_probe else 'best FoV-ranked'} candidate; "
+                    f"reachability precheck; probing best FoV-ranked candidate by S(F); "
                     f"{chosen.reason}; {debug_counts}, selected={chosen.target}"
                 ),
                 candidates_public,
             )
 
-        best, directional_override = _prefer_forward_continuation(
-            reachable_scored,
-            score_margin=forward_continuation_margin,
-            min_alignment=min_forward_alignment,
+        # A newly detected, reachable fire temporarily takes precedence over
+        # ordinary frontiers. Once its centre is reached, it is recorded in
+        # explored_hazard_cells above and disappears from this pool on the next
+        # planning request; frontier exploration then resumes automatically.
+        reachable_hazards = [
+            item for item in reachable_scored if item.kind == "hazard"
+        ]
+        selection_pool = reachable_hazards or reachable_scored
+
+        chosen = max(
+            selection_pool,
+            key=lambda item: (item.score, item.hazard_gain, item.size, -item.distance_from_robot),
         )
-        current_scored = None
 
-        for item in reachable_scored:
-            if current_target is not None and _distance(item.target, current_target) <= belief.resolution:
-                current_scored = item
-                break
-
-        if (
-            current_scored is not None
-            and current_scored.information_gain >= min_current_information_gain
-            and best.score < current_scored.score + hysteresis_margin
-        ):
-            chosen = current_scored
-            prefix = "kept current target by hysteresis"
-        else:
-            chosen = best
-            prefix = (
-                "selected forward-continuation target instead of avoidable backtrack"
-                if directional_override else "selected best FoV-aware target"
+        if chosen.kind == "hazard":
+            selection_reason = (
+                "selected newly detected hazard centre; frontier exploration "
+                "will resume after this source is reached"
             )
+        elif pending_hazards:
+            selection_reason = (
+                "selected exploration target because no pending hazard centre "
+                "passed reachability"
+            )
+        elif explored_hazard_cells:
+            selection_reason = (
+                "selected exploration target after completed hazard inspection"
+            )
+        else:
+            selection_reason = "selected exploration target"
 
         return ExplorationPlannerResult(
             True,
             chosen.target,
-            f"{self.name}: {prefix}; {chosen.reason}; {debug_counts}, selected={chosen.target}",
+            (
+                f"{self.name}: {selection_reason}; "
+                f"{chosen.reason}; {debug_counts}, selected={chosen.target}"
+            ),
             candidates_public,
         )
 
@@ -1788,7 +1865,7 @@ class FoVAwareDirectionalFrontierPlanner(BaseExplorationPlanner):
         if len(candidates) <= max_candidates:
             return candidates
 
-        special = [c for c in candidates if c.kind in {"current", "forward"}]
+        special = [c for c in candidates if c.kind in {"hazard", "forward"}]
         frontiers = [c for c in candidates if c.kind == "frontier"]
 
         budget = max(0, max_candidates - len(special))
@@ -1854,7 +1931,7 @@ class ExplorationPlannerRegistry:
             LargestFrontierPlanner.name: LargestFrontierPlanner(),
             UtilityFrontierPlanner.name: UtilityFrontierPlanner(),
             InformativeFrontierPlanner.name: InformativeFrontierPlanner(),
-            FoVAwareDirectionalFrontierPlanner.name: FoVAwareDirectionalFrontierPlanner(),
+            FoVAwareHazardFrontierPlanner.name: FoVAwareHazardFrontierPlanner(),
         }
 
     def names(self) -> list[str]:

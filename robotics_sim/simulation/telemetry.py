@@ -425,7 +425,7 @@ class TelemetryLogger:
 
         generated/excluded_recently_failed/filtered_unreachable are parsed
         out of the exploration planner's own debug-count reason string when
-        present (see exploration_planners.py FoVAwareDirectionalFrontierPlanner);
+        present (see exploration_planners.py FoVAwareHazardFrontierPlanner);
         this module never recomputes or changes that scoring logic, it only
         reports whatever numbers were already produced.
         """

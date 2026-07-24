@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from robotics_sim.environment.belief_map import BeliefMap
 from robotics_sim.planning.exploration_planners import (
-    FoVAwareDirectionalFrontierPlanner,
+    FoVAwareHazardFrontierPlanner,
     NearestFrontierPlanner,
     select_exploration_goal,
 )
@@ -110,7 +110,7 @@ def test_each_exploration_planner_can_override_clustering_independently():
 
     default_clusters = NearestFrontierPlanner().cluster_frontiers(belief)
     per_cell_clusters = PerCellNearestPlanner().cluster_frontiers(belief)
-    fov_clusters = FoVAwareDirectionalFrontierPlanner().cluster_frontiers(belief)
+    fov_clusters = FoVAwareHazardFrontierPlanner().cluster_frontiers(belief)
 
     assert len(per_cell_clusters) > len(default_clusters)
     assert {frozenset(cluster) for cluster in fov_clusters} == {

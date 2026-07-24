@@ -243,6 +243,32 @@ def test_fov_variables_are_hoverable_and_explain_the_actual_calculation(monkeypa
     assert "UNKNOWN" in shown[0]
 
 
+def test_fov_hazard_formula_audits_the_replacement_score_exactly():
+    formula, variables, steps, final = frontier_formula_explanation(
+        "FoV-aware directional frontier",
+        {
+            "score": 5.86,
+            "size": 5,
+            "distance": 2.0,
+            "information_gain": 4.0,
+            "reason": (
+                "info_utility=0.8, frontier_norm=1, align=0.5, hazard=0.9, "
+                "length_norm=0.1, repetition=0.2, turn=0.3, multi=0.5, "
+                "score=5.86"
+            ),
+        },
+    )
+
+    assert "+ 4H" in formula
+    assert "2.2R" in formula
+    assert "detour" not in formula
+    assert "backtrack" not in formula
+    assert "target-switch" not in variables
+    assert "Gaussian attraction" in variables
+    assert "hazard: +4.00" in steps
+    assert "CONSISTENT" in final
+
+
 def test_light_theme_styles_panel_scroll_and_content_explicitly():
     panel = FrontierReasoningPanel()
     panel.set_theme_mode(ThemeMode.LIGHT)

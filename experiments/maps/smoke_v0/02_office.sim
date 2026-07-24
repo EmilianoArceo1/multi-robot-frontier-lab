@@ -1,0 +1,201 @@
+{
+  "schema": "robotics_sim_lab.sim",
+  "version": 1,
+  "world": {
+    "x_min": -10.0,
+    "x_max": 10.0,
+    "y_min": -8.0,
+    "y_max": 8.0
+  },
+  "robot": {
+    "x": -8.6,
+    "y": -6.6,
+    "theta": 0.0,
+    "v": 0.0,
+    "body_radius": 0.2,
+    "safety_radius": 0.35,
+    "max_speed": 1.2,
+    "max_acceleration": 2.0,
+    "max_angular_speed": 2.5,
+    "goal_tolerance": 0.25,
+    "acceleration_gain": 0.75
+  },
+  "goal": {
+    "x": 8.0,
+    "y": 6.0
+  },
+  "map": {
+    "obstacles": [
+      [
+        -10.0,
+        -0.5,
+        3.5,
+        0.5
+      ],
+      [
+        -4.5,
+        -0.5,
+        3.0,
+        0.5
+      ],
+      [
+        0.5,
+        -0.5,
+        3.5,
+        0.5
+      ],
+      [
+        6.0,
+        -0.5,
+        4.0,
+        0.5
+      ],
+      [
+        -3.5,
+        0.0,
+        0.5,
+        6.0
+      ],
+      [
+        2.0,
+        0.0,
+        0.5,
+        6.0
+      ],
+      [
+        -10.0,
+        0.0,
+        2.0,
+        8.0
+      ],
+      [
+        7.0,
+        0.0,
+        3.0,
+        8.0
+      ],
+      [
+        -8.0,
+        6.0,
+        15.0,
+        2.0
+      ]
+    ],
+    "grid_resolution": 0.5
+  },
+  "hazard": {
+    "default_fire_intensity": 1.0,
+    "default_fire_radius": 2.0,
+    "fire_selection_radius": 0.6,
+    "block_threshold": 0.55
+  },
+  "camera": {
+    "center_x": 0.0,
+    "center_y": 0.0,
+    "width": 20.0,
+    "height": 16.0
+  },
+  "planner": {
+    "type": "Direct",
+    "path_simplifier": "Direction changes"
+  },
+  "exploration": {
+    "planner": "Ryu frontier-graph BFS exploration",
+    "clustering_algorithm": "None",
+    "replan_cooldown": 1.0,
+    "ipp_distance_penalty": 0.2
+  },
+  "coordination": {
+    "strategy": "NOIC information coordinator",
+    "safety_algorithm": "Wang-Ames-Egerstedt decentralized barrier certificate",
+    "parameters": {},
+    "replan_interval_s": 0.0,
+    "strict_contracts": false
+  },
+  "sensor": {
+    "type": "LiDAR",
+    "range": 2.5,
+    "camera_fov_degrees": 70.0
+  },
+  "multi_robot": {
+    "robot_count": 4,
+    "selected_robot_index": 0,
+    "same_robot_configuration": true,
+    "robots": [
+      {
+        "x": -8.6,
+        "y": -6.6,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      },
+      {
+        "x": -7.4,
+        "y": -6.6,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      },
+      {
+        "x": -8.6,
+        "y": -5.4,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      },
+      {
+        "x": -7.4,
+        "y": -5.4,
+        "theta": 0.0,
+        "v": 0.0,
+        "vision": 2.5,
+        "body_radius": 0.2,
+        "safety_radius": 0.35,
+        "max_speed": 1.2,
+        "max_acceleration": 2.0,
+        "max_angular_speed": 2.5,
+        "goal_tolerance": 0.25,
+        "acceleration_gain": 0.75
+      }
+    ]
+  },
+  "simulation": {
+    "agent_mode": "Multiple Robot Mode",
+    "map_visualization": "Current",
+    "custom_unexplored_color": "#000000",
+    "custom_explored_color": "#F8F9FB",
+    "custom_obstacle_color": "#6A6D75",
+    "custom_explored_opacity": 1.0,
+    "mapped_obstacle_line_width": 0.5,
+    "robot_icon": "Circle",
+    "show_goal_preview": true,
+    "show_path": true,
+    "show_traveled_path": false,
+    "show_vision": true,
+    "show_explored_area": true,
+    "show_obstacles": true,
+    "show_robot_orders": false,
+    "mapping_point_spacing": 0.025
+  }
+}

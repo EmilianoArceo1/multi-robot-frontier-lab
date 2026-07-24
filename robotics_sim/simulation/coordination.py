@@ -105,6 +105,12 @@ def available_coordinator_options() -> list[str]:
     return _discover_coordinator_options()
 
 
+# Generic per-call seam: executes a CoordinationRequest and returns the raw,
+# not-yet-adapted plugin result. Not exported -- assign_frontiers() is the
+# only current caller of this alias.
+_RequestExecutor = Callable[[PluginCoordinationRequest], PluginCoordinationResult]
+
+
 def runtime_profile_for_strategy(strategy: str) -> PluginRuntimeProfile:
     """Look up a plugin's runtime profile by name, without a full coordinator.
 
@@ -198,7 +204,15 @@ class MultiRobotCoordinator:
         coordination_parameters: Mapping[str, Any] | None = None,
         mapping_architecture: str = "centralized",
         time_s: float = 0.0,
+        request_executor: _RequestExecutor | None = None,
     ) -> CoordinationResult:
+        if request_executor is not None and not callable(request_executor):
+            raise TypeError(
+                "request_executor must be a callable "
+                "Callable[[CoordinationRequest], CoordinationResult] or None; "
+                f"got {type(request_executor)!r}"
+            )
+
         request = self._build_plugin_request(
             planner_name=planner_name,
             robot_states=robot_states,
@@ -229,7 +243,17 @@ class MultiRobotCoordinator:
             )
         else:
             _LOGGER.debug("Exploration planner: %r", planner_name)
-        plugin_result = self.plugin.assign(request)
+
+        if request_executor is None:
+            plugin_result = self.plugin.assign(request)
+        else:
+            plugin_result = request_executor(request)
+            if not isinstance(plugin_result, PluginCoordinationResult):
+                raise TypeError(
+                    "request_executor must return CoordinationResult; "
+                    f"got {type(plugin_result)!r}"
+                )
+
         result = self._adapt_plugin_result(plugin_result, robot_count=len(robot_states))
         _LOGGER.debug(
             "coordination result: plugin=%s selected_targets=%s debug=%s",

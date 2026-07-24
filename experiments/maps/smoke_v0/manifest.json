@@ -1,0 +1,160 @@
+{
+  "corpus_id": "smoke_v0",
+  "schema_version": 1,
+  "split": "smoke",
+  "base_robot_count": 4,
+  "shared_scenario_defaults": {
+    "note": "All six maps share these values so cross-map comparisons isolate map geometry, not scenario setup. Values match SimulationConfig's own defaults (robotics_sim/simulation/config.py) -- nothing here was invented.",
+    "world_bounds": { "x_min": -10.0, "x_max": 10.0, "y_min": -8.0, "y_max": 8.0 },
+    "grid_resolution": 0.5,
+    "body_radius": 0.2,
+    "safety_radius": 0.35,
+    "vision": 2.5,
+    "vision_model": "LiDAR",
+    "camera_fov_degrees": 70.0,
+    "robot_start_positions": [
+      { "x": -8.6, "y": -6.6 },
+      { "x": -7.4, "y": -6.6 },
+      { "x": -8.6, "y": -5.4 },
+      { "x": -7.4, "y": -5.4 }
+    ]
+  },
+  "format_notes": [
+    "The .sim schema (robotics_sim/simulation/config.py: config_to_sim_payload/config_from_sim_payload) has no field for fire placement, no seed field, and its 'world' block is written on save but never read back by the loader -- the runtime always rasterizes ground truth against the fixed WORLD_X_MIN/X_MAX/Y_MIN/Y_MAX constants instead. This corpus does not redesign the .sim format: fire_scenarios and geometry_seed live only in this manifest.",
+    "The .sim format's robot/multi_robot blocks do require one scenario's worth of robot start poses to be embedded directly in the .sim file (that is how robotics_sim.simulation.engine spawns robots at runtime, via normalized_robot_start_configs). robot_start_positions is therefore intentionally duplicated between each .sim file and this manifest's shared_scenario_defaults -- not a second, divergent source of truth, just the one the format forces to live in both places. Geometry (bounds, grid_resolution, obstacles) lives only in .sim files, never here."
+  ],
+  "maps": [
+    {
+      "map_id": "smoke_v0_01_open",
+      "filename": "01_open.sim",
+      "family": "open",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -9.0, "y": 7.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -9.0, "y": 6.0 }, { "x": -9.0, "y": 5.0 } ] }
+      ],
+      "tags": ["smoke", "open", "sparse_obstacles"],
+      "expected_properties": {
+        "evaluates": ["spatial_distribution", "coverage", "redundancy"],
+        "description": "Mostly open space with a few small scattered obstacles; no rooms or corridors."
+      }
+    },
+    {
+      "map_id": "smoke_v0_02_office",
+      "filename": "02_office.sim",
+      "family": "office",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -7.0, "y": 5.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -7.0, "y": 4.0 }, { "x": -7.0, "y": 3.0 } ] }
+      ],
+      "tags": ["smoke", "office", "rooms", "doors"],
+      "expected_properties": {
+        "evaluates": ["room_selection", "occlusion", "multiple_frontiers"],
+        "description": "Three sealed rooms opening onto a spine corridor, each through a single 2.0 m door."
+      }
+    },
+    {
+      "map_id": "smoke_v0_03_corridors",
+      "filename": "03_corridors.sim",
+      "family": "corridors",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -3.0, "y": 5.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -3.0, "y": 4.0 }, { "x": -3.0, "y": -7.0 } ] }
+      ],
+      "tags": ["smoke", "corridors", "turns", "dead_end"],
+      "expected_properties": {
+        "evaluates": ["long_routes", "recovery", "local_exploration"],
+        "description": "One winding 3.0 m wide corridor with several right-angle turns and one dead-end branch."
+      }
+    },
+    {
+      "map_id": "smoke_v0_04_loops",
+      "filename": "04_loops.sim",
+      "family": "loops",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -9.0, "y": 7.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -9.0, "y": 6.0 }, { "x": -9.0, "y": 5.0 } ] }
+      ],
+      "tags": ["smoke", "loops", "alternate_routes"],
+      "expected_properties": {
+        "evaluates": ["route_choice", "revisits", "non_myopic_coordination"],
+        "description": "Two large obstacle islands carve at least two independent cyclic routes around the open field."
+      }
+    },
+    {
+      "map_id": "smoke_v0_05_bottleneck",
+      "filename": "05_bottleneck.sim",
+      "family": "bottleneck",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -9.0, "y": 7.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -9.0, "y": 6.0 }, { "x": -9.0, "y": 5.0 } ] }
+      ],
+      "tags": ["smoke", "bottleneck", "chokepoint"],
+      "expected_properties": {
+        "evaluates": ["congestion", "conflicts", "team_distribution"],
+        "description": "Two wide-open regions (west/east) joined by a single 2.0 m chokepoint through a thick central divider."
+      }
+    },
+    {
+      "map_id": "smoke_v0_06_mixed",
+      "filename": "06_mixed.sim",
+      "family": "mixed",
+      "difficulty": "smoke",
+      "geometry_seed": null,
+      "robot_start_positions": [
+        { "x": -8.6, "y": -6.6 },
+        { "x": -7.4, "y": -6.6 },
+        { "x": -8.6, "y": -5.4 },
+        { "x": -7.4, "y": -5.4 }
+      ],
+      "fire_scenarios": [
+        { "scenario_id": "single_fire", "fires": [ { "x": -9.0, "y": 7.0 } ] },
+        { "scenario_id": "double_fire", "fires": [ { "x": -9.0, "y": 6.0 }, { "x": -9.0, "y": 5.0 } ] }
+      ],
+      "tags": ["smoke", "mixed", "irregular"],
+      "expected_properties": {
+        "evaluates": ["initial_generalization", "off_pattern_behavior"],
+        "description": "Irregular combination of a sealed mini-room, a mini-bottleneck divider, and scattered open-field obstacles."
+      }
+    }
+  ]
+}

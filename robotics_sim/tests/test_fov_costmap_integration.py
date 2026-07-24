@@ -73,7 +73,7 @@ from robotics_sim.environment.grid_geometry import GridCell
 from robotics_sim.environment.occupancy_grid import OCCUPIED as OG_OCCUPIED
 from robotics_sim.navigation.exploration_behavior import ExplorationBehavior
 import robotics_sim.planning.exploration_planners as exploration_planners_module
-from robotics_sim.planning.exploration_planners import FoVAwareDirectionalFrontierPlanner
+from robotics_sim.planning.exploration_planners import FoVAwareHazardFrontierPlanner
 from robotics_sim.planning.planning_costmap_builder import PlanningCostmapBuilder
 from robotics_sim.simulation.engine import SimulationControllerMixin
 from robotics_sim.simulation.observation import RobotObservation
@@ -460,22 +460,22 @@ def test_static_observed_obstacle_blocks_same_cell_primary_path_and_planning(mon
 
 
 # ---------------------------------------------------------------------------
-# 5. Hazard parity.
+# 5. Hazard traversability parity.
 # ---------------------------------------------------------------------------
 
 
-def test_hazard_blocks_same_cell_primary_path_and_planning_never_via_obstacle_points(monkeypatch):
+def test_hazard_remains_traversable_in_primary_fov_costmap(monkeypatch):
     fake = _make_fake_engine()
     fake.mapped_obstacle_points = []
     hazard_row, hazard_col = 2, 2
     fake.hazard_service.belief.observe_cells([hazard_row], [hazard_col], [0.9], robot_index=0)
 
     fov_grid = _run_primary_fov_path(fake, monkeypatch)
-    assert fov_grid.get_value(GridCell(hazard_row, hazard_col)) == OG_OCCUPIED
+    assert fov_grid.get_value(GridCell(hazard_row, hazard_col)) != OG_OCCUPIED
 
     radius = fake.safety_radius()
     reference_grid = fake.build_planning_grid_for_robot(fake.robot, robot_radius=radius)
-    assert reference_grid.get_value(GridCell(hazard_row, hazard_col)) == OG_OCCUPIED
+    assert reference_grid.get_value(GridCell(hazard_row, hazard_col)) != OG_OCCUPIED
 
     assert fake.mapped_obstacle_points == []
     assert fake.observed_obstacle_snapshot().points == ()
@@ -561,7 +561,7 @@ def test_direct_call_without_grid_or_provider_uses_legacy_fallback(monkeypatch):
     belief.mark_free_cell((8, 8))
     fallback_calls = _spy_belief_to_planning_grid(monkeypatch)
 
-    FoVAwareDirectionalFrontierPlanner().select_goal(
+    FoVAwareHazardFrontierPlanner().select_goal(
         belief_map=belief, robot_xy=(0.0, 0.0), robot_heading=0.0, robot_radius=ROBOT_RADIUS,
     )
 
@@ -585,12 +585,12 @@ def test_scoring_result_unchanged_between_provider_and_legacy_fallback_when_empt
     for row, col in [(8, 8), (8, 9), (9, 8), (9, 9)]:
         belief.mark_free_cell((row, col))
 
-    result_legacy = FoVAwareDirectionalFrontierPlanner().select_goal(
+    result_legacy = FoVAwareHazardFrontierPlanner().select_goal(
         belief_map=belief, robot_xy=(0.0, 0.0), robot_heading=0.0, robot_radius=ROBOT_RADIUS,
     )  # neither planning_grid nor planning_grid_provider supplied -> legacy fallback
 
     provider = fake._planning_grid_provider_for_robot(fake.robot)
-    result_provider = FoVAwareDirectionalFrontierPlanner().select_goal(
+    result_provider = FoVAwareHazardFrontierPlanner().select_goal(
         belief_map=belief, robot_xy=(0.0, 0.0), robot_heading=0.0, robot_radius=ROBOT_RADIUS,
         planning_grid_provider=provider,
     )

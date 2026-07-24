@@ -53,6 +53,11 @@ class HazardObservationResult:
     newly_blocked_cells: int = 0
     newly_unblocked_cells: int = 0
     blocked_state_changed: bool = False
+    # FireSource entities whose physical footprint became visible for the
+    # first time during this exact observation.  A source is detected when at
+    # least one positive-contribution cell from its radius is inside the real,
+    # occlusion-aware FoV polygon; its centre cell does not need to be visible.
+    newly_discovered_sources: tuple[FireSource, ...] = ()
 
 
 class RuntimeHazardService:
@@ -86,6 +91,11 @@ class RuntimeHazardService:
         self.default_radius = float(default_radius)
         self.selection_radius = max(0.0, float(selection_radius))
         self.block_threshold = float(block_threshold)
+        # Source identity is mission state, not a geometric re-test on every
+        # planner call.  IDs enter this set only through a real sensor
+        # observation (or an explicit snapshot-state rebuild) and are pruned
+        # when the corresponding source disappears.
+        self._discovered_fire_ids: set[int] = set()
 
     @property
     def belief(self) -> HazardBelief:
@@ -109,6 +119,7 @@ class RuntimeHazardService:
         )
         if source is None:
             return HazardChange("no_change", None, self.field.version)
+        self._discovered_fire_ids.discard(int(source.fire_id))
         return HazardChange("removed", source, self.field.version)
 
     def toggle_fire_at(self, position: tuple[float, float]) -> HazardChange:
@@ -124,6 +135,7 @@ class RuntimeHazardService:
         # with nothing left to ever re-observe them against.
         belief_revision_before = self._belief.revision
         self._belief.clear()
+        self._discovered_fire_ids.clear()
         belief_changed = self._belief.revision != belief_revision_before
         # Either layer actually changing counts -- a field that was already
         # empty must not report "no_change" when the belief still had
@@ -137,6 +149,93 @@ class RuntimeHazardService:
 
     def sources(self) -> tuple[FireSource, ...]:
         return self.field.sources()
+
+    def discovered_sources(self) -> tuple[FireSource, ...]:
+        """Return sources detected by at least one real FoV observation.
+
+        Detection is footprint-based, not centre-cell-based.  The set is
+        updated only by :meth:`observe_visible_polygon`, which receives the
+        runtime's already occlusion-resolved sensor polygon.  Therefore a fire
+        remains hidden until some positive part of its physical radius is
+        actually visible, while seeing the edge is sufficient to expose the
+        source centre as a planning target.
+        """
+        sources = self.field.sources()
+        live_ids = {int(source.fire_id) for source in sources}
+        self._discovered_fire_ids.intersection_update(live_ids)
+        return tuple(
+            source
+            for source in sources
+            if int(source.fire_id) in self._discovered_fire_ids
+        )
+
+    def refresh_discovered_sources_from_belief(self) -> tuple[FireSource, ...]:
+        """Rebuild discovery identity after a snapshot restore.
+
+        Normal runtime discovery must go through observe_visible_polygon().
+        Snapshot restore is the one exception: both FireSource state and the
+        previously observed HazardBelief are restored independently, so source
+        identity is reconstructed from cells that are observed, positive, and
+        physically inside each source's radius.
+        """
+        discovered_ids: set[int] = set()
+        for source in self.field.sources():
+            rows, cols = self._source_footprint_indices(source)
+            if rows.size == 0:
+                continue
+            values, observed = self._belief.read_cells(rows, cols)
+            if bool(np.any(observed & (values > 0.0))):
+                discovered_ids.add(int(source.fire_id))
+        self._discovered_fire_ids = discovered_ids
+        return self.discovered_sources()
+
+    def _source_footprint_indices(
+        self,
+        source: FireSource,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Grid cells whose centres receive positive contribution from source."""
+        geometry = self.field.geometry
+        radius = max(float(source.radius), 0.0)
+        if radius <= 0.0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        start = geometry.world_to_grid(
+            float(source.position[0]) - radius,
+            float(source.position[1]) - radius,
+            clamp=True,
+        )
+        end = geometry.world_to_grid(
+            float(source.position[0]) + radius,
+            float(source.position[1]) + radius,
+            clamp=True,
+        )
+        if start is None or end is None:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        row_values = np.arange(
+            max(0, min(start.row, end.row)),
+            min(geometry.height - 1, max(start.row, end.row)) + 1,
+            dtype=np.int64,
+        )
+        col_values = np.arange(
+            max(0, min(start.col, end.col)),
+            min(geometry.width - 1, max(start.col, end.col)) + 1,
+            dtype=np.int64,
+        )
+        if row_values.size == 0 or col_values.size == 0:
+            empty = np.empty(0, dtype=np.int64)
+            return empty, empty
+
+        rows, cols = np.meshgrid(row_values, col_values, indexing="ij")
+        xs = geometry.x_min + (cols.astype(np.float64) + 0.5) * geometry.resolution
+        ys = geometry.y_min + (rows.astype(np.float64) + 0.5) * geometry.resolution
+        inside = np.hypot(
+            xs - float(source.position[0]),
+            ys - float(source.position[1]),
+        ) < radius
+        return rows[inside].astype(np.int64), cols[inside].astype(np.int64)
 
     def blocked_world_points(self) -> tuple[tuple[float, float], ...]:
         """Ground-truth blocked points. Kept for its own legacy contract/
@@ -220,6 +319,31 @@ class RuntimeHazardService:
         ground_truth = self.field.values(copy=False)
         values = ground_truth[rows_arr, cols_arr]
 
+        # Detect source entities from ANY visible positive part of their
+        # footprint.  This uses only cells inside the real polygon above; the
+        # source centre may remain outside the FoV.  Identity is recorded once
+        # so repeated observations do not create a replan storm.
+        xs_visible = (
+            geometry.x_min
+            + (cols_arr.astype(np.float64) + 0.5) * geometry.resolution
+        )
+        ys_visible = (
+            geometry.y_min
+            + (rows_arr.astype(np.float64) + 0.5) * geometry.resolution
+        )
+        newly_discovered_sources: list[FireSource] = []
+        for source in self.field.sources():
+            fire_id = int(source.fire_id)
+            if fire_id in self._discovered_fire_ids:
+                continue
+            distance = np.hypot(
+                xs_visible - float(source.position[0]),
+                ys_visible - float(source.position[1]),
+            )
+            if bool(np.any(distance < float(source.radius))):
+                self._discovered_fire_ids.add(fire_id)
+                newly_discovered_sources.append(source)
+
         # Blocked state BEFORE this observation, for exactly the affected
         # cells -- captured before observe_cells() mutates the belief, so
         # replanning can be gated on an actual threshold CROSSING rather
@@ -252,6 +376,7 @@ class RuntimeHazardService:
             newly_blocked_cells=newly_blocked_cells,
             newly_unblocked_cells=newly_unblocked_cells,
             blocked_state_changed=bool(newly_blocked_cells or newly_unblocked_cells),
+            newly_discovered_sources=tuple(newly_discovered_sources),
         )
 
     def snapshot(self) -> dict:

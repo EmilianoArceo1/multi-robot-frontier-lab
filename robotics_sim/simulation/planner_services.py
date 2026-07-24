@@ -132,9 +132,11 @@ class TargetSelectionRequest:
     ipp_distance_penalty: float
     clustering_algorithm: str | None = None
     excluded_targets: tuple[Point2D, ...] = ()
+    reserved_targets: tuple[Point2D, ...] = ()
     target_exclusion_radius: float = 0.0
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
     planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None
+    known_hazards: tuple[Point2D, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -178,7 +180,7 @@ class PlannerServices:
     planning_grid_provider follows the exact same pattern: an optional
     Callable[[], OccupancyGrid] the engine host may refresh each tick (see
     engine.ensure_planner_services()) so a planner that actually needs a
-    real planning grid (today, only FoVAwareDirectionalFrontierPlanner) can
+    real planning grid (today, only FoVAwareHazardFrontierPlanner) can
     build one lazily -- called at most once per select_goal() invocation,
     and never called at all by planners that never read it. This is
     deliberately a PROVIDER (a callable), not a pre-built grid: building an
@@ -202,6 +204,9 @@ class PlannerServices:
 
     is_candidate_reachable: "Callable[[Point2D], bool] | None" = None
     planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None
+    # Refreshed by the engine from RuntimeHazardService.discovered_sources().
+    # These are discovered source centres, never omniscient ground truth.
+    known_hazards: tuple[Point2D, ...] = ()
     # The engine always writes the configured selection here. None is kept
     # only for old direct unit callers that predate the explicit stage.
     clustering_algorithm: str | None = None
@@ -301,9 +306,11 @@ class PlannerServices:
         ipp_distance_penalty: float,
         clustering_algorithm: str | None = None,
         excluded_targets: list[Point2D] | None = None,
+        reserved_targets: list[Point2D] | tuple[Point2D, ...] | None = None,
         target_exclusion_radius: float | None = None,
         is_candidate_reachable: "Callable[[Point2D], bool] | None" = None,
         planning_grid_provider: "Callable[[], OccupancyGrid] | None" = None,
+        known_hazards: list[Point2D] | tuple[Point2D, ...] | None = None,
     ):
         """
         Select the next exploration frontier target.
@@ -326,10 +333,11 @@ class PlannerServices:
         self.planning_grid_provider. Forwarded to select_exploration_goal()
         as-is; THIS METHOD NEVER CALLS IT. Only a planner that actually
         wants a real planning grid (today, only
-        FoVAwareDirectionalFrontierPlanner) invokes it, at most once, deep
+        FoVAwareHazardFrontierPlanner) invokes it, at most once, deep
         inside select_goal().
         """
         excluded = tuple(excluded_targets or ())
+        reserved = tuple(reserved_targets or ())
         exclusion_radius = (
             float(target_exclusion_radius)
             if target_exclusion_radius is not None
@@ -340,6 +348,9 @@ class PlannerServices:
         )
         grid_provider = (
             planning_grid_provider if planning_grid_provider is not None else self.planning_grid_provider
+        )
+        discovered_hazards = tuple(
+            known_hazards if known_hazards is not None else self.known_hazards
         )
 
         return self.select_exploration_target_request(
@@ -360,9 +371,11 @@ class PlannerServices:
                     else self.clustering_algorithm
                 ),
                 excluded_targets=excluded,
+                reserved_targets=reserved,
                 target_exclusion_radius=exclusion_radius,
                 is_candidate_reachable=reachability_check,
                 planning_grid_provider=grid_provider,
+                known_hazards=discovered_hazards,
             )
         )
 
@@ -419,9 +432,11 @@ class PlannerServices:
             vision_model=request.vision_model,
             ipp_distance_penalty=request.ipp_distance_penalty,
             excluded_targets=list(request.excluded_targets),
+            reserved_targets=list(request.reserved_targets),
             target_exclusion_radius=request.target_exclusion_radius,
             is_candidate_reachable=request.is_candidate_reachable,
             planning_grid_provider=request.planning_grid_provider,
+            known_hazards=list(request.known_hazards),
         )
         if has_explicit_clustering_stage and frontier_clusters is not None:
             kwargs["clustering_algorithm"] = request.clustering_algorithm

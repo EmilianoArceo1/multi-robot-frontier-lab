@@ -63,14 +63,16 @@ _VARIABLE_HELP = {
     "info_utility": "<b>info_utility — utilidad normalizada de descubrimiento</b><br>Combina tres señales: 0.40·novelty durante la ruta + 0.40·terminal_novelty en F + 0.20·gain_norm. novelty es la fracción UNKNOWN del FoV barrido; terminal_novelty es esa fracción desde F; gain_norm limita a 1 la ganancia absoluta. Rango aproximado: 0–1; más alto es mejor.",
     "frontier_norm": "<b>frontier_norm — tamaño normalizado</b><br>log(1 + tamaño del cluster) / log(1 + tamaño del cluster más grande). Rango 0–1. Usa logaritmo para que una frontera enorme no domine por sí sola.",
     "align": "<b>align — alineación inicial</b><br>cos(ángulo del primer tramo de la ruta − orientación actual del robot). 1 significa seguir de frente, 0 un giro de 90°, −1 ir en dirección contraria.",
+    "hazard": "<b>hazard — atracción por incendios</b><br>Suma kernels gaussianos exp(−d²/(2σ²)) desde el candidato hasta cada fuente descubierta. Vale 1 en el centro de una fuente aislada y decae suavemente con la distancia; σ=4 m por defecto.",
     "length_norm": "<b>length_norm — longitud de ruta normalizada</b><br>Coste total de la ruta A* dividido entre la diagonal completa del grid. Hace comparable la distancia entre mapas de tamaños distintos; menor es mejor.",
+    "repetition": "<b>repetition — repetición combinada</b><br>Promedio de fov_repeat y path_repeat. Resume en un solo término R(F) cuánto repite el candidato visión y recorrido ya observados.",
     "fov_repeat": "<b>fov_repeat — repetición del FoV</b><br>Promedio de cuántas veces ya fueron observadas las celdas cubiertas por el FoV a lo largo de la ruta, limitado por seen_saturation. 0 significa visión nueva; valores altos indican volver a mirar lo conocido.",
     "path_repeat": "<b>path_repeat — repetición de ruta</b><br>La misma penalización de observación, pero evaluada sobre las celdas por donde pasa la ruta A*. Penaliza recorrer zonas ya transitadas.",
     "turn": "<b>turn — coste de giro</b><br>Suma el giro desde la orientación actual al primer segmento y los cambios de dirección de toda la ruta; después divide entre π y limita el resultado a 1.",
     "detour": "<b>detour — desvío</b><br>1 − distancia_directa(R,F) / coste_ruta_A*. Vale 0 para una ruta prácticamente recta y aumenta cuando los obstáculos obligan a rodear.",
     "backtrack": "<b>backtrack — retroceso</b><br>max(0, −cos(dirección hacia F − orientación actual)). Solo penaliza candidatos situados detrás del robot.",
     "switch": "<b>switch — cambio de objetivo</b><br>Vale 0 si F coincide con el objetivo actual dentro de una celda; vale 1 si obliga a cambiar de frontier. Reduce oscilaciones entre decisiones.",
-    "multi": "<b>multi — interferencia multi-robot</b><br>Suma penalizaciones gaussianas exp(−d²/σ²) respecto a frontiers reservados y obstáculos dinámicos. Crece cuando otro robot o reserva está cerca de F.",
+    "multi": "<b>multi — interferencia multi-robot M'</b><br>Suma penalizaciones gaussianas exp(−d²/σ²) respecto a objetivos reservados por otros robots. Los cuerpos dinámicos siguen en el costmap de A*, pero no contaminan este término de asignación.",
 }
 
 
@@ -168,31 +170,29 @@ def _raw_frontier_formula_explanation(planner: str, candidate: dict | None) -> t
         )
     if planner == "FoV-aware directional frontier":
         ordered = (
-            "info_utility", "frontier_norm", "align", "length_norm", "fov_repeat",
-            "path_repeat", "turn", "detour", "backtrack", "switch", "multi",
+            "info_utility", "frontier_norm", "align", "hazard", "length_norm",
+            "repetition", "turn", "multi",
         )
         breakdown = "\n".join(
             f"{key} = {values[key]:.3f}" for key in ordered if key in values
         ) or str(candidate.get("reason", "No terms captured"))
         required = (
-            "info_utility", "frontier_norm", "align", "length_norm", "fov_repeat",
-            "path_repeat", "turn", "detour", "backtrack", "switch", "multi",
+            "info_utility", "frontier_norm", "align", "hazard", "length_norm",
+            "repetition", "turn", "multi",
         )
         calculated = None
         if all(key in values for key in required):
             calculated = (
                 3.0 * values["info_utility"] + 0.7 * values["frontier_norm"]
-                + 1.2 * values["align"] - values["length_norm"]
-                - 2.2 * values["fov_repeat"] - 0.8 * values["path_repeat"]
-                - values["turn"] - 0.45 * values["detour"]
-                - 0.75 * values["backtrack"] - 0.6 * values["switch"]
+                + 1.2 * values["align"] + 4.0 * values["hazard"]
+                - values["length_norm"] - 2.2 * values["repetition"]
+                - values["turn"]
                 - 1.2 * values["multi"]
             )
         coefficients = {
             "info_utility": 3.0, "frontier_norm": 0.7, "align": 1.2,
-            "length_norm": -1.0, "fov_repeat": -2.2, "path_repeat": -0.8,
-            "turn": -1.0, "detour": -0.45, "backtrack": -0.75,
-            "switch": -0.6, "multi": -1.2,
+            "hazard": 4.0, "length_norm": -1.0, "repetition": -2.2,
+            "turn": -1.0, "multi": -1.2,
         }
         step_lines = [
             f"{key}: {coefficient:+.2f} × {values[key]:.6f} = {coefficient * values[key]:+.6f}"
@@ -201,7 +201,7 @@ def _raw_frontier_formula_explanation(planner: str, candidate: dict | None) -> t
         if calculated is not None:
             step_lines.append("Sum all signed contributions = " f"{calculated:.6f}")
         return (
-            "<b>S(F)</b> = 3I + 0.7F + 1.2A − L − 2.2R<sub>f</sub> − 0.8R<sub>p</sub> − T − 0.45D − 0.75B − 0.6Sw − 1.2M",
+            "<b>S(F)</b> = 3I + 0.7F + 1.2A + 4H − L − 2.2R − T − 1.2M'",
             _table([(key, f"{values[key]:.6f}") for key in ordered if key in values]),
             _steps(step_lines),
             _result(calculated, score),
@@ -273,12 +273,11 @@ def frontier_formula_explanation(planner: str, candidate: dict | None) -> tuple[
             "info_utility": "normalized discovery utility I",
             "frontier_norm": "normalized frontier size F",
             "align": "heading/frontier alignment A",
+            "hazard": "Gaussian attraction to discovered fires H",
             "length_norm": "normalized route length L",
-            "fov_repeat": "already-seen FoV penalty Rf",
-            "path_repeat": "repeated-path penalty Rp",
-            "turn": "turning penalty T", "detour": "detour penalty D",
-            "backtrack": "backtracking penalty B", "switch": "target-switch penalty Sw",
-            "multi": "multi-robot overlap penalty M",
+            "repetition": "combined FoV/path repetition penalty R",
+            "turn": "turning penalty T",
+            "multi": "reserved-target interference penalty M'",
         }
         variables = _table([
             (_variable_link(key, key), f"{descriptions[key]} = {values[key]:.6f}")
@@ -286,9 +285,8 @@ def frontier_formula_explanation(planner: str, candidate: dict | None) -> tuple[
         ])
         coefficients = {
             "info_utility": 3.0, "frontier_norm": 0.7, "align": 1.2,
-            "length_norm": -1.0, "fov_repeat": -2.2, "path_repeat": -0.8,
-            "turn": -1.0, "detour": -0.45, "backtrack": -0.75,
-            "switch": -0.6, "multi": -1.2,
+            "hazard": 4.0, "length_norm": -1.0, "repetition": -2.2,
+            "turn": -1.0, "multi": -1.2,
         }
         present = [(key, coefficients[key], values[key]) for key in coefficients if key in values]
         calculated = sum(coef * value for _key, coef, value in present) if present else None

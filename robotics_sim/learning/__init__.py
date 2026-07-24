@@ -112,6 +112,14 @@ from robotics_sim.learning.decision_steps import (
     DecisionStepAllocatorStateError,
     EpisodeDecisionStepAllocator,
 )
+from robotics_sim.learning.runtime_capture_service import (
+    RuntimeCoordinationCaptureInput,
+    RuntimeCoordinationCaptureResult,
+    RuntimeLearningCaptureConsistencyError,
+    RuntimeLearningCaptureError,
+    RuntimeLearningCaptureService,
+    RuntimeLearningCaptureStateError,
+)
 
 __all__ = [
     "ActionCatalogAssembler",
@@ -171,7 +179,13 @@ __all__ = [
     "RobotFeatureExtractor",
     "RobotRewardOutcome",
     "RuntimeActorFrame",
+    "RuntimeCoordinationCaptureInput",
+    "RuntimeCoordinationCaptureResult",
     "RuntimeDecisionOpeningInput",
+    "RuntimeLearningCaptureConsistencyError",
+    "RuntimeLearningCaptureError",
+    "RuntimeLearningCaptureService",
+    "RuntimeLearningCaptureStateError",
     "RuntimeLearningDecisionOpener",
     "SessionState",
     "SessionStateError",

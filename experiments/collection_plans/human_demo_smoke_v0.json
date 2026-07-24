@@ -1,0 +1,62 @@
+{
+  "plan_id": "human-demo-smoke-v0",
+  "corpus_id": "smoke_v0",
+  "notes": [
+    "Example collection plan for the smoke_v0 corpus. collector_a/collector_b are",
+    "explicit placeholders, not real personal names -- edit map_id -> collector_id",
+    "assignments freely once the real collector roster is known.",
+    "Each map is assigned to exactly one collector and carries a small, explicit",
+    "list of planned episodes (scenario_id + seed). episode_number is local to",
+    "each map and starts at 1."
+  ],
+  "assignments": [
+    {
+      "map_id": "smoke_v0_01_open",
+      "collector_id": "collector_a",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    },
+    {
+      "map_id": "smoke_v0_02_office",
+      "collector_id": "collector_a",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    },
+    {
+      "map_id": "smoke_v0_03_corridors",
+      "collector_id": "collector_a",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    },
+    {
+      "map_id": "smoke_v0_04_loops",
+      "collector_id": "collector_b",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    },
+    {
+      "map_id": "smoke_v0_05_bottleneck",
+      "collector_id": "collector_b",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    },
+    {
+      "map_id": "smoke_v0_06_mixed",
+      "collector_id": "collector_b",
+      "episodes": [
+        { "episode_number": 1, "scenario_id": "single_fire", "seed": 0 },
+        { "episode_number": 2, "scenario_id": "double_fire", "seed": 1 }
+      ]
+    }
+  ]
+}

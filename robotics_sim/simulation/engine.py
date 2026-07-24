@@ -2781,6 +2781,15 @@ class SimulationControllerMixin:
                 store.architecture.value if store is not None else "centralized"
             ),
             time_s=float(getattr(self, "simulation_time", 0.0)),
+            # Human Demonstration hook: None (the default) leaves every
+            # existing coordinator path byte-for-byte unchanged. When Human
+            # Demonstration mode is active, main_window.py wiring sets this
+            # to HumanDemonstrationRuntime.request_executor, which the
+            # coordinator then calls instead of plugin.assign() -- all of
+            # that orchestration lives in
+            # robotics_sim/simulation/human_demonstration_runtime.py, never
+            # here.
+            request_executor=getattr(self, "human_demo_request_executor", None),
         )
         self.last_coordination_debug = dict(result.debug)
         frontier_panel = getattr(self, "frontier_reasoning_panel", None)

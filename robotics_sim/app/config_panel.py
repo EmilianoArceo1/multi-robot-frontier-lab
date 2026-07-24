@@ -33,6 +33,9 @@ from PySide6.QtWidgets import (
 )
 
 from robotics_sim.simulation.config import *
+from robotics_sim.simulation.human_demonstration_runtime import (
+    HUMAN_DEMONSTRATION_COORDINATOR_LABEL,
+)
 from robotics_sim.app.theme import ThemeMode, dropdown_popup_stylesheet, theme_colors
 from robotics_sim.app.widgets import (
     HeroHeader,
@@ -293,6 +296,9 @@ def build_config_panel(window):
 
     window.coordinator_combo = QComboBox()
     window.coordinator_combo.addItems(TASK_ASSIGN_ALGORITHM_OPTIONS)
+    # Host-side special mode, not a plugin under algorithms/ -- selecting it
+    # never reaches load_coordination_plugin() (see main_window.py wiring).
+    window.coordinator_combo.addItem(HUMAN_DEMONSTRATION_COORDINATOR_LABEL)
     window.coordinator_combo.setPlaceholderText(NO_TASK_ASSIGN_ALGORITHM)
     if TASK_ASSIGN_ALGORITHM_OPTIONS:
         window.coordinator_combo.setCurrentIndex(0)
@@ -961,6 +967,9 @@ def build_config_panel(window):
     )
     window.coordinator_combo.currentTextChanged.connect(
         window.apply_task_assignment_dependencies
+    )
+    window.coordinator_combo.currentTextChanged.connect(
+        window.on_human_demo_mode_combo_changed
     )
     window.safety_algorithm_combo.currentTextChanged.connect(window.update_preview)
     window.vision_combo.currentTextChanged.connect(window.update_preview)

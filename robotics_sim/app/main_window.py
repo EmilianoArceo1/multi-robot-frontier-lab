@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import (
@@ -19,6 +20,7 @@ from PySide6.QtCore import (
     QSize,
     QThreadPool,
     QEasingCurve,
+    QEventLoop,
     QPropertyAnimation,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QPen
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QScrollArea,
@@ -82,7 +85,15 @@ from robotics_sim.app.map_editor import (
     normalize_obstacles,
     remove_obstacle_at,
 )
-from robotics_sim.simulation.coordination import runtime_profile_for_strategy
+from robotics_sim.simulation.coordination import DEFAULT_COORDINATOR, runtime_profile_for_strategy
+from robotics_sim.app.human_demonstration_panel import HumanDemonstrationPanel
+from robotics_sim.simulation.human_demonstration_runtime import (
+    HUMAN_DEMONSTRATION_COORDINATOR_LABEL,
+    HumanDemonstrationHostBindings,
+    HumanDemonstrationRuntimeState,
+    HumanDemonstrationRuntimeStateError,
+    build_default_human_demonstration_runtime,
+)
 from robotics_sim.simulation.gui_policy import compute_gui_control_policy
 from robotics_sim.simulation.navigation_modes import is_exploration_planner
 from robotics_sim.planning.exploration_planners import (
@@ -120,6 +131,18 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.robot_agents = self.runtime_robot_registry.agents
         self.running = False
         self.paused = False
+
+        # Human Demonstration mode (see human_demonstration_runtime.py):
+        # all domain logic lives in self.human_demo_runtime (built lazily,
+        # see _ensure_human_demo_runtime()); this window only wires small
+        # callbacks into it. human_demo_request_executor is read by
+        # engine.py's synchronize_multi_frontier_targets() (default None =
+        # zero behavior change for every other coordinator).
+        self.human_demo_runtime = None
+        self.human_demo_request_executor = None
+        self._human_demo_mode_active = False
+        self._human_demo_panel_visible = False
+        self._human_demo_resume_loop = None
 
         # Navigation debug overlay: off by default, persists across
         # simulation resets (a user preference, not run state) -- mirrors
@@ -386,6 +409,8 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.canvas.editor_obstacle_moved.connect(self.on_editor_obstacle_moved)
         self.canvas.editor_view_changed.connect(self.refresh_editor_status_label)
         self.canvas.fireToggleRequested.connect(self.on_fire_toggle_requested)
+        self.canvas.humanDemoRobotClicked.connect(self.on_human_demo_robot_clicked)
+        self.canvas.humanDemoCandidateClicked.connect(self.on_human_demo_candidate_clicked)
         self._build_canvas_action_bar()
         self._build_navigation_snapshot_bar()
 
@@ -405,6 +430,19 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         self.coordinator_reasoning_panel.closeRequested.connect(
             lambda: self.on_coordinator_reasoning_panel_visibility_toggled(False)
         )
+        self.human_demo_panel = HumanDemonstrationPanel(self)
+        self.human_demo_panel.hide()
+        self.human_demo_panel.closeRequested.connect(
+            lambda: self.on_human_demo_panel_visibility_toggled(False)
+        )
+        self.human_demo_panel.collectorSelected.connect(self.on_human_demo_collector_selected)
+        self.human_demo_panel.mapSelected.connect(self.on_human_demo_map_selected)
+        self.human_demo_panel.episodeSelected.connect(self.on_human_demo_episode_selected)
+        self.human_demo_panel.previousEpisodeRequested.connect(self.on_human_demo_previous_episode)
+        self.human_demo_panel.nextEpisodeRequested.connect(self.on_human_demo_next_episode)
+        self.human_demo_panel.loadEpisodeRequested.connect(self.on_human_demo_load_episode)
+        self.human_demo_panel.finishEpisodeRequested.connect(self.on_human_demo_finish_episode)
+        self.human_demo_panel.abortEpisodeRequested.connect(self.on_human_demo_abort_episode)
         for panel in (self.frontier_reasoning_panel, self.path_reasoning_panel, self.coordinator_reasoning_panel):
             if hasattr(panel, "robotSelected"):
                 panel.robotSelected.connect(self.select_robot_panel)
@@ -1083,6 +1121,7 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         frontier_reasoning = getattr(self, "frontier_reasoning_panel", None)
         path_reasoning = getattr(self, "path_reasoning_panel", None)
         coordinator_reasoning = getattr(self, "coordinator_reasoning_panel", None)
+        human_demo_panel = getattr(self, "human_demo_panel", None)
         if container is None or tabs is None:
             return
 
@@ -1105,6 +1144,9 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
         coordinator_visible = bool(
             getattr(self, "_coordinator_reasoning_panel_visible", False)
             and coordinator_reasoning is not None
+        )
+        human_demo_visible = bool(
+            getattr(self, "_human_demo_panel_visible", False) and human_demo_panel is not None
         )
 
         self._ensure_side_panel_tab(
@@ -1136,6 +1178,12 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             title="Coordinator",
             visible=coordinator_visible,
             preferred_index=4,
+        )
+        self._ensure_side_panel_tab(
+            human_demo_panel,
+            title="Human Demo",
+            visible=human_demo_visible,
+            preferred_index=5,
         )
 
         # A single visible panel does not need a tab bar; hiding it returns the
@@ -1200,6 +1248,15 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
     def read_config(self) -> SimulationConfig:
         """Read GUI configuration and preserve editor camera settings."""
         config = super().read_config()
+        if config.coordinator_type == HUMAN_DEMONSTRATION_COORDINATOR_LABEL:
+            # Human Demonstration is a host-side mode (see config_panel.py's
+            # combo wiring), never a real plugin under algorithms/ --
+            # coordinator_type must keep naming a real, loadable plugin so
+            # MultiRobotCoordinator can still build the normal candidate-
+            # generation services; human_demo_request_executor (see
+            # on_human_demo_mode_combo_changed) is what actually intercepts
+            # the decision before plugin.assign() is ever called.
+            config.coordinator_type = DEFAULT_COORDINATOR
         if hasattr(self, "editor_camera_x_input"):
             config.camera_center_x = float(self.editor_camera_x_input.value())
             config.camera_center_y = float(self.editor_camera_y_input.value())
@@ -1595,6 +1652,366 @@ class MainWindow(SimulationControllerMixin, QMainWindow):
             if tabs is not None and panel is not None and tabs.indexOf(panel) >= 0:
                 tabs.setCurrentWidget(panel)
         QTimer.singleShot(0, self._sync_side_panel_layout)
+
+    # ================================================================
+    # Human Demonstration wiring.
+    #
+    # All domain logic (episode lifecycle, candidate freezing, writing) is
+    # owned by robotics_sim.simulation.human_demonstration_runtime.
+    # HumanDemonstrationRuntime; everything below is small glue: pushing
+    # runtime state into HumanDemonstrationPanel, relaying panel/canvas
+    # signals into runtime calls, and implementing the runtime's injected
+    # host callbacks (HumanDemonstrationHostBindings) using MainWindow's
+    # own real, already-existing simulator API (load_sim_file, add_fire,
+    # toggle_pause, ...). No filesystem writes, no candidate computation,
+    # and no planner calls happen anywhere in this block.
+    # ================================================================
+
+    def on_human_demo_panel_visibility_toggled(self, visible: bool) -> None:
+        visible = bool(visible)
+        self._human_demo_panel_visible = visible
+        self._sync_side_panel_layout()
+        if visible:
+            tabs = getattr(self, "side_panel_tabs", None)
+            panel = getattr(self, "human_demo_panel", None)
+            if tabs is not None and panel is not None and tabs.indexOf(panel) >= 0:
+                tabs.setCurrentWidget(panel)
+        QTimer.singleShot(0, self._sync_side_panel_layout)
+
+    def on_human_demo_mode_combo_changed(self, text: str) -> None:
+        """Wired to coordinator_combo.currentTextChanged (config_panel.py).
+        Selecting HUMAN_DEMONSTRATION_COORDINATOR_LABEL never reaches
+        load_coordination_plugin() -- see read_config() below, which keeps
+        SimulationConfig.coordinator_type pointed at a real plugin so the
+        coordinator's normal candidate-generation infrastructure still
+        builds; only request_executor changes."""
+
+        active = text == HUMAN_DEMONSTRATION_COORDINATOR_LABEL
+        self._human_demo_mode_active = active
+        self.canvas.set_human_demo_mode(active)
+        self.on_human_demo_panel_visibility_toggled(active)
+        if active:
+            runtime = self._ensure_human_demo_runtime()
+            self.human_demo_request_executor = runtime.request_executor
+            self._refresh_human_demo_panel()
+        else:
+            self.human_demo_request_executor = None
+
+    def _ensure_human_demo_runtime(self):
+        runtime = self.human_demo_runtime
+        if runtime is not None:
+            return runtime
+        repo_root = Path(__file__).resolve().parents[2]
+        host = HumanDemonstrationHostBindings(
+            load_sim_file=self._human_demo_load_sim_file,
+            clear_fires=self._human_demo_clear_fires,
+            add_fire=self._human_demo_add_fire,
+            reset_hazard_belief=self._human_demo_reset_hazard_belief,
+            request_pause=self._human_demo_request_pause,
+            wait_for_human_resume=self._human_demo_wait_for_resume,
+            get_simulation_time_s=lambda: float(getattr(self, "simulation_time", 0.0)),
+            get_final_metrics=self._human_demo_get_final_metrics,
+        )
+        runtime = build_default_human_demonstration_runtime(host, repo_root=repo_root)
+        self.human_demo_runtime = runtime
+        return runtime
+
+    # -- HumanDemonstrationHostBindings implementations ------------------
+
+    def _human_demo_load_sim_file(self, path) -> None:
+        # Captured *before* apply_config_to_widgets(): that call sets the
+        # combo to the .sim file's own saved coordinator, which fires
+        # on_human_demo_mode_combo_changed() and flips
+        # self._human_demo_mode_active to False as a side effect -- so the
+        # restore below must not re-read the (already mutated) live flag.
+        was_active = self._human_demo_mode_active
+        config = load_sim_file(str(path))
+        self.reset_simulation()
+        self.apply_config_to_widgets(config)
+        # Human Demonstration mode is host-side session state, not part of
+        # the loaded scenario -- keep the combo (and therefore
+        # request_executor) pinned to it across Load Episode.
+        if was_active:
+            self.coordinator_combo.setCurrentText(HUMAN_DEMONSTRATION_COORDINATOR_LABEL)
+
+    def _human_demo_clear_fires(self) -> None:
+        self.ensure_hazard_service().clear()
+
+    def _human_demo_add_fire(self, x: float, y: float) -> None:
+        self.add_fire(float(x), float(y))
+
+    def _human_demo_reset_hazard_belief(self) -> None:
+        # reset_simulation() (already run by _human_demo_load_sim_file,
+        # before any fire is injected) drops self.hazard_service back to
+        # None, so the next add_fire()/ensure_hazard_service() call already
+        # builds a fresh belief with nothing discovered. This call is a
+        # defensive no-op through the real path, not a second reset
+        # mechanism.
+        self.ensure_hazard_service()
+
+    def _human_demo_request_pause(self) -> None:
+        if not self.paused:
+            self.toggle_pause()
+        self._refresh_human_demo_panel()
+
+    def _human_demo_wait_for_resume(self) -> None:
+        loop = QEventLoop()
+        self._human_demo_resume_loop = loop
+        loop.exec()
+        self._human_demo_resume_loop = None
+
+    def _human_demo_get_final_metrics(self):
+        runtime = self.human_demo_runtime
+        return {
+            "simulation_time_s": float(getattr(self, "simulation_time", 0.0)),
+            "coverage_percent": float(self.estimated_explored_percent()),
+            "free_space_coverage_percent": float(self.estimated_free_space_coverage_percent()),
+            "distance_traveled": float(getattr(self, "total_distance_traveled", 0.0)),
+            "route_request_count": float(getattr(self, "route_request_count", 0)),
+            "route_result_count": float(getattr(self, "route_result_count", 0)),
+            "exploration_replan_count": float(getattr(self, "exploration_replan_count", 0)),
+            "safety_replan_count": float(getattr(self, "safety_replan_count", 0)),
+            "decision_count": float(runtime.decision_count if runtime is not None else 0),
+        }
+
+    # -- panel signal handlers -------------------------------------------
+
+    def on_human_demo_collector_selected(self, collector_id: str) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.select_collector(collector_id)
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user, not swallowed
+            QMessageBox.warning(self, "Human Demonstration", str(exc))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_map_selected(self, map_id: str) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.select_map(map_id)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Human Demonstration", str(exc))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_episode_selected(self, episode_number: int) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.select_episode(int(episode_number))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Human Demonstration", str(exc))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_previous_episode(self) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.previous_episode()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Human Demonstration", str(exc))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_next_episode(self) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.next_episode()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Human Demonstration", str(exc))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_load_episode(self) -> None:
+        runtime = self._ensure_human_demo_runtime()
+        try:
+            runtime.load_episode()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Load Episode failed", str(exc))
+            return
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_finish_episode(self) -> None:
+        runtime = self.human_demo_runtime
+        if runtime is None:
+            return
+        try:
+            layout = runtime.finish_episode()
+        except HumanDemonstrationRuntimeStateError as exc:
+            QMessageBox.warning(self, "Finish Episode", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Finish Episode failed", str(exc))
+            return
+        self.human_demo_panel.set_last_saved_path(str(layout.episode_directory))
+        self._refresh_human_demo_panel()
+
+    def on_human_demo_abort_episode(self) -> None:
+        runtime = self.human_demo_runtime
+        if runtime is None or not runtime.has_active_episode:
+            return
+        runtime.abort_episode()
+        loop = self._human_demo_resume_loop
+        if loop is not None:
+            loop.quit()
+        self._refresh_human_demo_panel()
+
+    # -- canvas click handlers --------------------------------------------
+
+    def on_human_demo_robot_clicked(self, robot_id: int) -> None:
+        runtime = self.human_demo_runtime
+        if runtime is None:
+            return
+        try:
+            runtime.select_robot(int(robot_id))
+        except Exception as exc:  # noqa: BLE001
+            self.canvas.set_status(str(exc))
+            return
+        self.human_demo_panel.set_selected_robot_text(f"R{int(robot_id) + 1}")
+        self._refresh_human_demo_candidate_markers(int(robot_id))
+
+    def on_human_demo_candidate_clicked(self, candidate_id: str) -> None:
+        runtime = self.human_demo_runtime
+        session = runtime.active_session if runtime is not None else None
+        if runtime is None or session is None:
+            return
+        focused_robot_id = session.focused_robot_id
+        if focused_robot_id is None:
+            self.canvas.set_status("Select a robot before choosing a frontier.")
+            return
+        slots = runtime.candidates_for_robot(focused_robot_id)
+        index = next((i for i, slot in enumerate(slots) if slot.candidate_id == candidate_id), None)
+        if index is None:
+            return  # not one of the currently-shown candidates -- ignored, never guessed
+        try:
+            runtime.select_candidate(
+                robot_id=focused_robot_id, candidate_index=index, candidate_id=candidate_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.canvas.set_status(str(exc))
+            return
+        self._refresh_human_demo_panel()
+
+    def _refresh_human_demo_candidate_markers(self, robot_id: int) -> None:
+        runtime = self.human_demo_runtime
+        if runtime is None or runtime.active_session is None:
+            self.canvas.set_human_demo_candidate_markers([])
+            return
+        try:
+            slots = runtime.candidates_for_robot(robot_id)
+        except Exception:  # noqa: BLE001
+            self.canvas.set_human_demo_candidate_markers([])
+            return
+        markers = [
+            (slot.candidate_id, float(slot.candidate.target[0]), float(slot.candidate.target[1]), slot.enabled)
+            for slot in slots
+        ]
+        self.canvas.set_human_demo_candidate_markers(markers)
+
+    # -- render runtime state into the panel ------------------------------
+
+    def _refresh_human_demo_panel(self) -> None:
+        panel = getattr(self, "human_demo_panel", None)
+        runtime = self.human_demo_runtime
+        if panel is None or runtime is None:
+            return
+
+        setup = runtime.setup
+        plan = setup.collection_plan
+        panel.set_collector_options(list(plan.collector_ids), current=setup.collector_id)
+        panel.set_map_options(list(setup.available_map_ids), current=setup.selected_map_id)
+
+        if setup.selected_map_id is not None:
+            total = plan.total_episodes_for_map(setup.selected_map_id)
+            panel.set_episode_options(list(range(1, total + 1)), current=setup.selected_episode_number)
+            if setup.selected_episode_number is not None:
+                episode = plan.episode_for_map(setup.selected_map_id, setup.selected_episode_number)
+                panel.set_scenario_and_seed(episode.scenario_id, episode.seed)
+                panel.set_episode_position_text(runtime.episode_position_text())
+            panel.set_recorded_progress_text(runtime.recorded_progress_text())
+            panel.set_accepted_progress_text(runtime.accepted_progress_text())
+            panel.set_map_complete_text(runtime.map_complete_text())
+        else:
+            panel.set_episode_options([])
+            panel.set_scenario_and_seed("--", 0)
+            panel.set_map_complete_text(None)
+
+        panel.set_episode_active(runtime.has_active_episode)
+        panel.set_load_enabled(
+            not runtime.has_active_episode
+            and setup.selected_map_id is not None
+            and setup.selected_episode_number is not None
+        )
+        panel.set_finish_enabled(
+            runtime.has_active_episode
+            and runtime.state is HumanDemonstrationRuntimeState.RECORDING
+            and runtime.decision_count > 0
+        )
+        panel.set_abort_enabled(runtime.has_active_episode)
+
+        state_labels = {
+            "setup": "Idle",
+            "recording": "Recording",
+            "waiting_for_selection": "Waiting for selection",
+        }
+        panel.set_status_text(state_labels.get(runtime.state.value, runtime.state.value))
+        panel.set_fires_loaded_count(runtime.fires_loaded_count if runtime.has_active_episode else None)
+
+        session = runtime.active_session
+        if session is not None:
+            panel.set_pending_robots_text(", ".join(f"R{r + 1}" for r in session.robot_ids_pending))
+            focused = session.focused_robot_id
+            panel.set_selected_robot_text(f"R{focused + 1}" if focused is not None else None)
+        else:
+            panel.set_pending_robots_text(None)
+            panel.set_selected_robot_text(None)
+
+    # -- Start/Restart overrides ------------------------------------------
+    #
+    # Both override SimulationControllerMixin's versions (Python MRO: this
+    # class's own method wins over the mixin's), calling super() for every
+    # case that is not specific to an active Human Demonstration episode --
+    # so every other coordinator's Start/Restart behavior is byte-for-byte
+    # unchanged.
+
+    def handle_start_pause_button(self) -> None:
+        runtime = self.human_demo_runtime
+        if (
+            runtime is not None
+            and runtime.state is HumanDemonstrationRuntimeState.WAITING_FOR_SELECTION
+            and runtime.active_session is not None
+        ):
+            # This IS Fase 5's "reanudar": the existing Start/Pause control
+            # is the resume trigger while a manual round is open, and only
+            # while every pending robot already has a selection.
+            if not runtime.active_session.ready_to_apply:
+                self.canvas.set_status(
+                    "Select a candidate for every pending robot before resuming."
+                )
+                return
+            runtime.resume()
+            self._refresh_human_demo_panel()
+            loop = self._human_demo_resume_loop
+            if loop is not None:
+                loop.quit()
+            return
+        super().handle_start_pause_button()
+
+    def restart_simulation(self) -> None:
+        runtime = self.human_demo_runtime
+        if runtime is not None and runtime.has_active_episode:
+            reply = QMessageBox.question(
+                self,
+                "Restart Simulation",
+                "A Human Demonstration episode is currently being recorded. "
+                "Restarting aborts it -- no partial episode is ever saved, "
+                "and data from before/after the restart is never mixed. "
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            runtime.abort_episode()
+            loop = self._human_demo_resume_loop
+            if loop is not None:
+                loop.quit()
+            self._refresh_human_demo_panel()
+        super().restart_simulation()
 
     def on_hazard_map_toggled(self, enabled: bool) -> None:
         """Toggle the full ground-truth hazard DEBUG overlay -- ADDS the

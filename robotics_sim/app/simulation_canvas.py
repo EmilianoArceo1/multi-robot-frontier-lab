@@ -312,6 +312,13 @@ class SimulationCanvas(QWidget):
     # add or remove a fire (main_window.py checks proximity to existing
     # fires and decides).
     fireToggleRequested = Signal(float, float)
+    # Human Demonstration mode only (see set_human_demo_mode()): a live,
+    # running robot was clicked (carries robot_id, not a preview index).
+    humanDemoRobotClicked = Signal(int)
+    # Human Demonstration mode only: one of the frozen candidate frontier
+    # markers currently shown via set_human_demo_candidate_markers() was
+    # clicked (carries candidate_id -- never a coordinate).
+    humanDemoCandidateClicked = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -327,6 +334,15 @@ class SimulationCanvas(QWidget):
         self.robots: list = []
         self.config = SimulationConfig()
         self.path_points: list[tuple[float, float]] = []
+
+        # Human Demonstration mode (see set_human_demo_mode()): while
+        # active, clicks are routed to humanDemoRobotClicked/
+        # humanDemoCandidateClicked instead of goalClicked/
+        # fireToggleRequested. Markers are (candidate_id, world_x,
+        # world_y, enabled) tuples for the currently-focused robot only --
+        # never regenerated here, only ever set by the host.
+        self._human_demo_mode_active = False
+        self._human_demo_candidate_markers: tuple[tuple[str, float, float, bool], ...] = ()
         self.multi_path_points: list[list[tuple[float, float]]] = []
         self.multi_last_controls: list[np.ndarray] = []
         self.planned_path_points: list[tuple[float, float]] = []
@@ -1623,6 +1639,88 @@ class SimulationCanvas(QWidget):
 
         return None
 
+    _HUMAN_DEMO_CANDIDATE_CLICK_TOLERANCE_PX = 14.0
+
+    def set_human_demo_mode(self, active: bool) -> None:
+        """Toggle click routing between the normal goal/fire flow and
+        Human Demonstration's robot/candidate selection flow."""
+
+        self._human_demo_mode_active = bool(active)
+        if not self._human_demo_mode_active:
+            self._human_demo_candidate_markers = ()
+        self.update()
+
+    def set_human_demo_candidate_markers(
+        self, markers: list[tuple[str, float, float, bool]]
+    ) -> None:
+        """Set the frozen candidate markers to render/hit-test for the
+        currently-focused robot. Never computed here -- always supplied
+        by the host from the already-frozen candidate pool."""
+
+        self._human_demo_candidate_markers = tuple(
+            (str(candidate_id), float(x), float(y), bool(enabled))
+            for candidate_id, x, y, enabled in markers
+        )
+        self.update()
+
+    def runtime_robot_index_at_screen_position(self, sx: float, sy: float) -> int | None:
+        """Hit-test the *live, running* robots (unlike
+        robot_index_at_screen_position(), which only ever sees pre-run
+        preview robots). Used by Human Demonstration's robot-selection
+        click flow; the returned index is exactly the ``robot_id`` used in
+        CoordinationRequest (see engine.multi_robot_coordination_states():
+        robot_id is the 0-based position in self.robots)."""
+
+        px_per_meter = self.pixels_per_meter()
+        body_px = max(7.0, float(self.config.body_radius) * px_per_meter)
+        hit_radius = max(13.0, body_px + 5.0)
+
+        for index in range(len(self.robots) - 1, -1, -1):
+            robot = self.robots[index]
+            rx, ry = self.world_to_screen(float(robot.x), float(robot.y))
+            if math.hypot(float(sx) - rx, float(sy) - ry) <= hit_radius:
+                return index
+        return None
+
+    def human_demo_candidate_marker_at_screen_position(self, sx: float, sy: float) -> str | None:
+        """Hit-test the frozen candidate markers with an explicit pixel
+        tolerance. Returns the candidate_id, never a coordinate, and never
+        matches a disabled candidate."""
+
+        best_id: str | None = None
+        best_distance = self._HUMAN_DEMO_CANDIDATE_CLICK_TOLERANCE_PX
+        for candidate_id, wx, wy, enabled in self._human_demo_candidate_markers:
+            if not enabled:
+                continue
+            mx, my = self.world_to_screen(wx, wy)
+            distance = math.hypot(float(sx) - mx, float(sy) - my)
+            if distance <= best_distance:
+                best_distance = distance
+                best_id = candidate_id
+        return best_id
+
+    def draw_human_demo_candidate_markers(self, painter: QPainter) -> None:
+        """Draw the frozen candidate frontier markers for Human
+        Demonstration mode. Purely presentational -- the marker list comes
+        entirely from set_human_demo_candidate_markers(); nothing here
+        computes or regenerates a candidate."""
+
+        if not self._human_demo_mode_active or not self._human_demo_candidate_markers:
+            return
+
+        painter.save()
+        enabled_pen = QPen(QColor(255, 176, 32), 2.5)
+        enabled_brush = QBrush(QColor(255, 176, 32, 90))
+        disabled_pen = QPen(QColor(150, 150, 150), 1.5)
+        disabled_brush = QBrush(QColor(150, 150, 150, 60))
+        radius_px = 9.0
+        for _candidate_id, wx, wy, enabled in self._human_demo_candidate_markers:
+            sx, sy = self.world_to_screen(wx, wy)
+            painter.setPen(enabled_pen if enabled else disabled_pen)
+            painter.setBrush(enabled_brush if enabled else disabled_brush)
+            painter.drawEllipse(QRectF(sx - radius_px, sy - radius_px, radius_px * 2, radius_px * 2))
+        painter.restore()
+
     def set_editor_mode(self, enabled: bool) -> None:
         self.editor_mode = bool(enabled)
         self.editor_drag_start = None
@@ -1927,6 +2025,22 @@ class SimulationCanvas(QWidget):
                     if index >= 0:
                         self.robotSelected.emit(index)
                     self.setCursor(Qt.ClosedHandCursor)
+                    return
+
+                if self._human_demo_mode_active:
+                    # Robot click first: hit-test the live, running robots.
+                    # Frontier-marker click only when no robot was hit --
+                    # both use their own explicit pixel tolerance, never an
+                    # arbitrary/closest-point fallback.
+                    robot_index = self.runtime_robot_index_at_screen_position(pos.x(), pos.y())
+                    if robot_index is not None:
+                        self.humanDemoRobotClicked.emit(robot_index)
+                        return
+                    candidate_id = self.human_demo_candidate_marker_at_screen_position(
+                        pos.x(), pos.y()
+                    )
+                    if candidate_id is not None:
+                        self.humanDemoCandidateClicked.emit(candidate_id)
                     return
 
                 x, y = self.screen_to_world(pos.x(), pos.y())
@@ -2929,6 +3043,7 @@ class SimulationCanvas(QWidget):
         # source filter, no shared cache (see draw_fire_markers()'s own
         # docstring).
         self.draw_fire_markers(painter)
+        self.draw_human_demo_candidate_markers(painter)
         self.draw_ipp_reference_overlay(painter)
         self._render_layer_ms["map_layer"] = (time.perf_counter() - _map_layer_start) * 1000.0
 

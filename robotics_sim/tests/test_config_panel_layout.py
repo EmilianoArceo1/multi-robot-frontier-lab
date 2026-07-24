@@ -7,6 +7,9 @@ from PySide6.QtWidgets import QApplication, QGridLayout
 
 from robotics_sim.app.main_window import MainWindow
 from robotics_sim.simulation.engine import SimulationControllerMixin
+from robotics_sim.simulation.human_demonstration_runtime import (
+    HUMAN_DEMONSTRATION_COORDINATOR_LABEL,
+)
 from robotics_sim.planning.ryu_frontier_graph_bfs import RYU_FRONTIER_GRAPH_BFS
 from robotics_sim.simulation.config import (
     CLUSTERING_ALGORITHM_OPTIONS,
@@ -178,7 +181,12 @@ def test_implemented_hungarian_task_assign_algorithm_is_selectable():
         "MARVEL CTDE graph-attention policy (scaled environment)",
         "Travel-time Voronoi + CQLite distributed Q-learning",
     )
-    assert items == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
+    # Human Demonstration (manual) is a host-side mode appended after the
+    # real plugin options, never a plugin itself (see config_panel.py /
+    # human_demonstration_runtime.py) -- it is intentionally the one extra
+    # item here.
+    assert items[:-1] == list(TASK_ASSIGN_ALGORITHM_OPTIONS)
+    assert items[-1] == HUMAN_DEMONSTRATION_COORDINATOR_LABEL
     assert not REMOVED_TASK_ASSIGN_ALGORITHM_OPTIONS.intersection(items)
     assert _window.coordinator_combo.currentIndex() == 0
     assert _window.read_config().coordinator_type == TASK_ASSIGN_ALGORITHM_OPTIONS[0]
